@@ -1,0 +1,87 @@
+# Full stack: IB Gateway + dashboard (+ optional Discord bot).
+#
+#   1. Copy .env.example to .env and set IB_GATEWAY_USER / IB_GATEWAY_PASSWORD
+#      (paper credentials; keep them out of git).
+#   2. docker compose up -d --build
+#   3. Dashboard: http://127.0.0.1:8787
+#   4. Optional Discord: docker compose --profile discord up -d
+#
+# Inside the compose network the app talks to ib-gateway:4002 (paper socat).
+# Paper API on the host remains 127.0.0.1:4002. TRADING_MODE controls which
+# Gateway port is active. restart: unless-stopped brings containers back after
+# a reboot or crash. AUTO_RESTART_TIME is IBKR's daily soft restart.
+
+services:
+  ib-gateway:
+    image: ghcr.io/gnzsnz/ib-gateway:stable
+    container_name: orb-ib-gateway
+    restart: unless-stopped
+    environment:
+      TWS_USERID: ${IB_GATEWAY_USER}
+      TWS_PASSWORD: ${IB_GATEWAY_PASSWORD}
+      TRADING_MODE: paper            # paper | live
+      READ_ONLY_API: "no"            # "yes" to forbid order placement entirely
+      TWS_ACCEPT_INCOMING: accept
+      TIME_ZONE: Europe/London
+      TZ: Europe/London
+      TWOFA_TIMEOUT_ACTION: restart
+      AUTO_RESTART_TIME: "11:59 PM"
+      RELOGIN_AFTER_TWOFA_TIMEOUT: "yes"
+      EXISTING_SESSION_DETECTED_ACTION: primary
+    ports:
+      - "127.0.0.1:4002:4004"        # paper API (host 4002 -> container socat 4004)
+      - "127.0.0.1:4001:4003"        # live API
+    volumes:
+      - ib-settings:/home/ibgateway/tws_settings
+
+  dashboard:
+    build: .
+    image: options-orb-mcp:latest
+    container_name: orb-dashboard
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      IBKR_HOST: ib-gateway
+      IBKR_PORT: "4002"
+      DASHBOARD_HOST: 0.0.0.0
+      DASHBOARD_PORT: "8787"
+      DISCORD_DASHBOARD_URL: http://dashboard:8787
+      DB_PATH: data/trades.db
+    ports:
+      - "8787:8787"
+    volumes:
+      - orb-data:/app/data
+    depends_on:
+      - ib-gateway
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/', timeout=4)",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  discord:
+    build: .
+    image: options-orb-mcp:latest
+    container_name: orb-discord
+    restart: unless-stopped
+    profiles: ["discord"]
+    env_file:
+      - .env
+    environment:
+      DISCORD_DASHBOARD_URL: http://dashboard:8787
+    command: ["discord"]
+    depends_on:
+      dashboard:
+        condition: service_healthy
+
+volumes:
+  ib-settings:
+  orb-data:

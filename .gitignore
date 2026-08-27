@@ -1,0 +1,40 @@
+# Environment / secrets
+.env
+*.env
+!.env.example
+*.der
+_peer.der
+
+# Machine-local MCP registration (scripts.setup writes this)
+.cursor/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.uv/
+uv.lock.bak
+
+# Data / artifacts
+data/*.db
+data/*.sqlite
+data/backtests/
+data/nightly/
+data/history/*.csv
+*.log
+
+# Tooling
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

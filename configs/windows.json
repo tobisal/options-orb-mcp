@@ -1,0 +1,30 @@
+{
+  "_comment": "Per-window ORB parameters. Times are in US/Eastern (US options clock). GMT equivalents in summer (EDT=GMT-4): Asia 00:00-06:00, London 07:00-12:30, New York 13:30-20:00. In winter (EST=GMT-5) add one hour.",
+  "asia": {
+    "window_open": "20:00",
+    "window_close": "02:00",
+    "opening_range_minutes": 60,
+    "breakout_buffer_atr": 0.10,
+    "min_strength": 0.15,
+    "target_r": 1.5,
+    "stop_r": 1.0
+  },
+  "london": {
+    "window_open": "03:00",
+    "window_close": "08:30",
+    "opening_range_minutes": 45,
+    "breakout_buffer_atr": 0.10,
+    "min_strength": 0.20,
+    "target_r": 1.5,
+    "stop_r": 1.0
+  },
+  "new_york": {
+    "window_open": "09:30",
+    "window_close": "16:00",
+    "opening_range_minutes": 30,
+    "breakout_buffer_atr": 0.10,
+    "min_strength": 0.25,
+    "target_r": 1.5,
+    "stop_r": 1.0
+  }
+}

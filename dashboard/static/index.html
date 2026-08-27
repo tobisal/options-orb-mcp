@@ -1,0 +1,853 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Options ORB - Trading Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #0b0f17;
+    --panel: #141b27;
+    --panel-2: #1b2534;
+    --border: #243044;
+    --text: #e6edf3;
+    --muted: #8b98a9;
+    --accent: #4f8cff;
+    --green: #3fb950;
+    --red: #f85149;
+    --amber: #d29922;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 16px; padding: 14px 22px;
+    border-bottom: 1px solid var(--border); background: var(--panel); position: sticky; top: 0; z-index: 5;
+  }
+  header h1 { font-size: 16px; margin: 0; letter-spacing: .3px; }
+  header .sub { color: var(--muted); font-size: 12px; }
+  .spacer { flex: 1; }
+  .badge { padding: 4px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; border: 1px solid var(--border); }
+  .badge.paper { background: rgba(79,140,255,.12); color: var(--accent); border-color: rgba(79,140,255,.4); }
+  .badge.live  { background: rgba(248,81,73,.12); color: var(--red); border-color: rgba(248,81,73,.5); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 6px; }
+  .dot.on { background: var(--green); } .dot.off { background: var(--muted); }
+  main { padding: 22px; max-width: 1280px; margin: 0 auto; }
+  .grid { display: grid; gap: 16px; }
+  .cards { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); margin-bottom: 20px; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 16px; }
+  .card .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .5px; }
+  .card .value { font-size: 24px; font-weight: 700; margin-top: 6px; }
+  .card .value.small { font-size: 18px; }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 18px; margin-bottom: 20px; }
+  .panel h2 { font-size: 14px; margin: 0 0 14px; color: var(--text); display:flex; align-items:center; gap:10px; }
+  .panel h2 .hint { color: var(--muted); font-weight: 400; font-size: 12px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: .4px; }
+  tbody tr:hover { background: var(--panel-2); }
+  .pos { color: var(--green); } .neg { color: var(--red); } .mut { color: var(--muted); }
+  .pill { padding: 2px 8px; border-radius: 6px; font-size: 11px; font-weight: 600; border: 1px solid var(--border); }
+  .pill.long { color: var(--green); border-color: rgba(63,185,80,.4); background: rgba(63,185,80,.08); }
+  .pill.short { color: var(--red); border-color: rgba(248,81,73,.4); background: rgba(248,81,73,.08); }
+  .pill.neutral { color: var(--muted); }
+  .pill.open { color: var(--accent); border-color: rgba(79,140,255,.4); background: rgba(79,140,255,.08); }
+  .pill.closed { color: var(--muted); }
+  .cols2 { grid-template-columns: 1fr 1fr; }
+  .cols3 { grid-template-columns: repeat(3, 1fr); }
+  @media (max-width: 860px) { .cols2, .cols3 { grid-template-columns: 1fr; } }
+  button, select {
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; padding: 7px 12px; font-size: 13px; cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: rgba(79,140,255,.15); border-color: rgba(79,140,255,.5); color: var(--accent); font-weight: 600; }
+  input[type=number] {
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 5px 8px; font-size: 13px; margin-left: 6px;
+  }
+  details summary { list-style: revert; }
+  .playbtn { font-weight: 700; font-size: 14px; padding: 9px 16px; }
+  .playbtn.idle { background: rgba(63,185,80,.15); border-color: rgba(63,185,80,.5); color: var(--green); }
+  .playbtn.run { background: rgba(248,81,73,.15); border-color: rgba(248,81,73,.5); color: var(--red); }
+  .autolog { max-height: 240px; overflow-y: auto; border: 1px solid var(--border); border-radius: 8px; background: var(--panel-2); }
+  .autolog .row { padding: 5px 10px; border-bottom: 1px solid var(--border); display: flex; gap: 12px; font-size: 12px; }
+  .autolog .row:last-child { border-bottom: none; }
+  .autolog .ts { color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .log-trade { color: var(--green); } .log-warn { color: var(--amber); } .log-error { color: var(--red); }
+  .log-muted { color: var(--muted); } .log-start { color: var(--accent); } .log-stop { color: var(--muted); }
+  .pulse { animation: pulse 1.6s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .45; } }
+  .best-row { background: rgba(63,185,80,.08); }
+  .tag { padding: 2px 8px; border-radius: 6px; font-size: 11px; border: 1px solid var(--border); color: var(--muted); }
+  .tag.oos { color: var(--amber); border-color: rgba(210,153,34,.4); background: rgba(210,153,34,.08); }
+  .toolbar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  label.check { display: inline-flex; gap: 6px; align-items: center; color: var(--muted); cursor: pointer; }
+  .empty { color: var(--muted); padding: 12px 0; font-style: italic; }
+  .sig { border: 1px solid var(--border); border-radius: 10px; padding: 14px; background: var(--panel-2); }
+  .sig .w { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; }
+  .sig .d { font-size: 20px; font-weight: 700; margin: 6px 0; }
+  .bar { height: 6px; border-radius: 3px; background: var(--border); overflow: hidden; margin-top: 8px; }
+  .bar > span { display:block; height:100%; background: var(--accent); }
+  .foot { color: var(--muted); font-size: 12px; text-align: center; padding: 10px 0 30px; }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>Options ORB - Trading Dashboard</h1>
+    <div class="sub" id="serverTime">-</div>
+  </div>
+  <div class="spacer"></div>
+  <span id="ibkr" class="sub"><span class="dot off"></span>IBKR</span>
+  <span id="envBadge" class="badge paper">PAPER</span>
+</header>
+
+<main>
+  <div class="grid cards" id="cards"></div>
+
+  <div class="panel" id="autoPanel">
+    <h2>Auto-trading <span class="hint">runs the ORB entry loop automatically &middot; paper / simulated only</span></h2>
+    <div class="toolbar" style="margin-bottom:12px">
+      <button id="autoToggle" class="playbtn idle">&#9654; Start auto-trading</button>
+      <span id="autoState" class="badge paper">stopped</span>
+      <select id="autoSymbol" title="Symbol"></select>
+      <select id="autoWindow" title="Session window">
+        <option value="auto">Active window</option>
+        <option value="new_york">New York</option>
+        <option value="london">London</option>
+        <option value="asia">Asia</option>
+      </select>
+      <label class="check">Every
+        <select id="autoInterval">
+          <option value="30">30s</option>
+          <option value="60" selected>60s</option>
+          <option value="120">2 min</option>
+          <option value="300">5 min</option>
+        </select>
+      </label>
+      <label class="check"><input type="checkbox" id="autoDemo" /> Demo data (offline)</label>
+      <span class="sub" id="autoStats"></span>
+    </div>
+    <div class="autolog" id="autoLog"><div class="row"><span class="mut">No activity yet. Press start to run the loop.</span></div></div>
+    <div class="sub mut" style="margin-top:8px" id="autoHours">Enters up to 3 trades per session window (max 9 per day across Asia / London / New York). Entries use the parameter set you choose below. All times GMT.</div>
+    <div class="sub mut" id="autoParams"></div>
+    <div class="toolbar" style="margin-top:8px">
+      <button id="autoDefaults" type="button">Use defaults</button>
+      <span class="sub mut">Clears your chosen set for this symbol and falls back to windows.json</span>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Live ticker <span class="hint">5-minute bars &middot; times GMT</span><span id="tickerLast" style="margin-left:auto"></span></h2>
+    <div class="toolbar" style="margin-bottom:14px">
+      <select id="tickerSymbol"></select>
+      <select id="tickerHours" title="Lookback">
+        <option value="6">6 hours</option>
+        <option value="24" selected>1 day</option>
+        <option value="120">5 days</option>
+      </select>
+      <label class="check"><input type="checkbox" id="tickerDemo" /> Demo data (offline, no IBKR)</label>
+      <span class="sub" id="tickerNote"></span>
+    </div>
+    <canvas id="tickerChart" height="110"></canvas>
+    <div class="empty" id="tickerEmpty" style="display:none">No bars yet.</div>
+  </div>
+
+  <div class="panel">
+    <h2>Equity curve <span class="hint">paper equity: closed P&amp;L plus the live open mark</span></h2>
+    <canvas id="equityChart" height="90"></canvas>
+    <div class="empty" id="equityEmpty" style="display:none">No closed trades yet.</div>
+  </div>
+
+  <div class="panel">
+    <h2>Live signals <span class="hint">current ORB read per session window &middot; times GMT</span></h2>
+    <div class="toolbar" style="margin-bottom:14px">
+      <select id="sigSymbol"></select>
+      <label class="check"><input type="checkbox" id="sigDemo" /> Demo data (offline, no IBKR)</label>
+      <button id="sigBtn">Refresh signals</button>
+      <span class="sub" id="sigNote"></span>
+    </div>
+    <div class="grid cols3" id="signals"></div>
+  </div>
+
+  <div class="panel">
+    <h2>Backtesting &amp; simulation <span class="hint">run the ORB spread strategy over historical data and see the simulated result</span></h2>
+    <div class="toolbar" style="margin-bottom:12px">
+      <select id="btSymbol"></select>
+      <select id="btWindow">
+        <option value="new_york">New York</option>
+        <option value="london">London</option>
+        <option value="asia">Asia</option>
+      </select>
+      <label class="check">Lookback
+        <select id="btLookback">
+          <option value="15">15 days</option>
+          <option value="30" selected>30 days</option>
+          <option value="60">60 days</option>
+          <option value="90">90 days</option>
+          <option value="365">1 year</option>
+        </select>
+      </label>
+      <label class="check"><input type="checkbox" id="btDemo" /> Demo data (offline, no IBKR)</label>
+      <button id="btRun" class="primary">Run backtest</button>
+      <button id="btOpt">Optimise</button>
+      <span class="sub" id="btNote"></span>
+    </div>
+    <details style="margin-bottom:14px">
+      <summary class="sub" style="cursor:pointer">Advanced parameters</summary>
+      <div class="toolbar" style="margin-top:12px">
+        <label class="sub">Opening range (min)<input id="pOrm" type="number" value="30" style="width:64px"></label>
+        <label class="sub">Buffer (ATR)<input id="pBuf" type="number" step="0.05" value="0.10" style="width:64px"></label>
+        <label class="sub">Min strength<input id="pStr" type="number" step="0.05" value="0.25" style="width:64px"></label>
+        <label class="sub">Target R<input id="pTr" type="number" step="0.1" value="1.5" style="width:64px"></label>
+        <label class="sub">Stop R<input id="pSr" type="number" step="0.1" value="1.0" style="width:64px"></label>
+        <label class="sub">IV<input id="pIv" type="number" step="0.05" value="0.25" style="width:64px"></label>
+        <label class="sub">DTE<input id="pDte" type="number" value="7" style="width:64px"></label>
+        <label class="sub">Cost/trade<input id="pCost" type="number" step="0.5" value="0" style="width:64px"></label>
+        <button id="useParamsBtn" class="primary" type="button">Use these for trading</button>
+      </div>
+    </details>
+    <div id="btMetrics" class="grid cards" style="margin-bottom:6px"></div>
+    <canvas id="simChart" height="90" style="display:none"></canvas>
+    <div id="btResult"></div>
+  </div>
+
+  <div class="panel">
+    <h2>Optimisations made <span class="hint">saved optimiser runs and the best parameters they found</span></h2>
+    <div id="optHistory"></div>
+  </div>
+
+  <div class="grid cols2">
+    <div class="panel">
+      <h2>Performance by session window</h2>
+      <div id="byWindow"></div>
+    </div>
+    <div class="panel">
+      <h2>Performance by strategy</h2>
+      <div id="byStrategy"></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Open positions <span class="hint">mark-to-market on the last 5-min close &middot; refreshes with the page</span></h2>
+    <div id="positions"></div>
+  </div>
+
+  <div class="panel">
+    <h2>Trade history <span class="hint">every trade, the strategy used, and its outcome</span></h2>
+    <div id="trades"></div>
+  </div>
+
+  <div class="foot">Read-only view. Auto-refreshes every 8s. Trades are placed by the execution agent, not here.</div>
+</main>
+
+<script>
+let CCY = "GBP";
+let equityChart = null;
+let tickerChart = null;
+
+const fmt = (n) => (n === null || n === undefined) ? "-" : new Intl.NumberFormat("en-GB", {maximumFractionDigits: 2}).format(n);
+const money = (n) => (n === null || n === undefined) ? "-" : CCY + " " + fmt(n);
+const pct = (n) => (n === null || n === undefined) ? "-" : (n * 100).toFixed(0) + "%";
+const cls = (n) => n > 0 ? "pos" : (n < 0 ? "neg" : "mut");
+const sign = (n) => (n > 0 ? "+" : "") + fmt(n);
+
+function parseUtc(iso) {
+  if (!iso) return null;
+  const s = String(iso);
+  const d = new Date(/Z$|[+-]\d{2}:?\d{2}$/.test(s) ? s : s + "Z");
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+function pad2(n) { return String(n).padStart(2, "0"); }
+function fmtGmt(iso) {
+  const d = parseUtc(iso);
+  if (!d) return "-";
+  return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth()+1)}-${pad2(d.getUTCDate())} ${pad2(d.getUTCHours())}:${pad2(d.getUTCMinutes())} GMT`;
+}
+function fmtGmtClock(iso) {
+  const d = parseUtc(iso);
+  if (!d) return "-";
+  return `${pad2(d.getUTCHours())}:${pad2(d.getUTCMinutes())}:${pad2(d.getUTCSeconds())} GMT`;
+}
+
+async function getJSON(url) {
+  const r = await fetch(url);
+  return await r.json();
+}
+
+function fmtStrategy(st) {
+  if (!st || !st.params) return "";
+  const p = st.params;
+  const src = st.source === "selected" ? "selected" : "defaults";
+  return `${src} OR ${p.opening_range_minutes}m buf ${fmt(p.breakout_buffer_atr)} str ${fmt(p.min_strength)} TR ${fmt(p.target_r)}`;
+}
+
+function renderStrategyLine(byWindow) {
+  const el = document.getElementById("autoParams");
+  if (!el) return;
+  const by = byWindow || {};
+  const parts = Object.entries(by).map(([w, st]) => `${(w || "").replace(/_/g, " ")}: ${fmtStrategy(st)}`);
+  el.textContent = parts.length ? ("Trading params: " + parts.join(" · ")) : "";
+}
+
+function dirPill(d) {
+  const c = d === "long" ? "long" : (d === "short" ? "short" : "neutral");
+  return `<span class="pill ${c}">${d}</span>`;
+}
+
+async function loadSummary() {
+  const s = await getJSON("/api/summary");
+  CCY = s.account_currency || "GBP";
+  document.getElementById("serverTime").textContent = "Updated " + fmtGmtClock(s.server_time || new Date().toISOString());
+  const hours = document.getElementById("autoHours");
+  if (hours && s.session_hours_gmt) {
+    hours.textContent = "Session hours: " + s.session_hours_gmt + ". Up to 3 trades per window (max 9/day). Entries use the set you choose, or the nightly 23:30 GMT optimiser pick. Exits are managed separately.";
+  }
+  renderStrategyLine(s.strategy_by_window);
+
+  const env = document.getElementById("envBadge");
+  env.textContent = s.environment;
+  env.className = "badge " + (s.environment === "LIVE" ? "live" : "paper");
+
+  const ibkr = document.getElementById("ibkr");
+  ibkr.innerHTML = `<span class="dot ${s.ibkr_connected ? "on" : "off"}"></span>IBKR ${s.ibkr_connected ? "connected" : "offline"}`;
+
+  const isPaper = s.environment !== "LIVE";
+  const equity = isPaper
+    ? (s.paper_equity ?? s.starting_capital)
+    : (s.ibkr && s.ibkr.NetLiquidation ? s.ibkr.NetLiquidation : s.starting_capital);
+  const daily = isPaper ? (s.daily_pnl ?? s.daily_realised_pnl) : s.daily_realised_pnl;
+  const cards = [
+    { label: "Account", value: money(equity), cls: cls((equity || 0) - (s.starting_capital || 0)), sub: isPaper ? "paper · start + realised + open mark" : (s.ibkr_connected ? "IBKR net liq" : "starting capital") },
+    { label: "Daily P&L", value: sign(daily), cls: cls(daily), sub: isPaper ? ("today " + sign(s.daily_realised_pnl) + " closed · " + sign(s.open_unrealized_pnl) + " open") : ("realised · limit " + money(s.daily_loss_limit)) },
+    { label: "Open P&L", value: s.open_unrealized_pnl == null ? "-" : sign(s.open_unrealized_pnl), cls: cls(s.open_unrealized_pnl || 0), sub: "unrealised mark" },
+    { label: "Risk / trade", value: money(s.risk_budget_per_trade), sub: s.max_risk_per_trade_pct + "% of capital" },
+    { label: "Open positions", value: s.open_positions + " / " + s.max_open_positions, sub: (s.max_open_positions_per_window || 3) + " per window" },
+    { label: "Kill switch", value: s.daily_kill_switch_tripped ? "TRIPPED" : "OK", cls: s.daily_kill_switch_tripped ? "neg" : "pos" },
+  ];
+  if (s.live_requested_but_unconfirmed) {
+    cards.push({ label: "Warning", value: "Live unconfirmed", cls: "neg", sub: "interlock missing" });
+  }
+  document.getElementById("cards").innerHTML = cards.map(c => `
+    <div class="card">
+      <div class="label">${c.label}</div>
+      <div class="value small ${c.cls || ""}">${c.value}</div>
+      <div class="label" style="text-transform:none;margin-top:6px">${c.sub || ""}</div>
+    </div>`).join("");
+
+  // Populate symbol selectors once.
+  const symbols = ["SPY", "QQQ", "IWM", "AAPL"];
+  for (const id of ["sigSymbol", "btSymbol", "autoSymbol", "tickerSymbol"]) {
+    const sel = document.getElementById(id);
+    if (sel && !sel.dataset.init) {
+      sel.innerHTML = symbols.map(x => `<option ${x === s.default_symbol ? "selected" : ""}>${x}</option>`).join("");
+      sel.dataset.init = "1";
+    }
+  }
+}
+
+function tickerLabel(iso, hours) {
+  const d = parseUtc(iso);
+  if (!d) return "";
+  const hm = `${pad2(d.getUTCHours())}:${pad2(d.getUTCMinutes())}`;
+  if (Number(hours) > 24) return `${pad2(d.getUTCDate())}/${pad2(d.getUTCMonth()+1)} ${hm}`;
+  return hm;
+}
+
+async function loadTicker() {
+  const sym = document.getElementById("tickerSymbol").value || "SPY";
+  const hours = document.getElementById("tickerHours").value;
+  const demo = document.getElementById("tickerDemo").checked;
+  const note = document.getElementById("tickerNote");
+  const empty = document.getElementById("tickerEmpty");
+  const canvas = document.getElementById("tickerChart");
+  try {
+    const d = await getJSON(`/api/ticker?symbol=${encodeURIComponent(sym)}&hours=${hours}&use_synthetic=${demo}`);
+    if (d.error) {
+      note.textContent = d.error;
+      empty.style.display = "block";
+      canvas.style.display = "none";
+      document.getElementById("tickerLast").textContent = "";
+      return;
+    }
+    const bars = d.bars || [];
+    if (!bars.length) {
+      empty.style.display = "block";
+      canvas.style.display = "none";
+      note.textContent = "";
+      return;
+    }
+    empty.style.display = "none";
+    canvas.style.display = "block";
+    const last = d.last || {};
+    const chg = last.change || 0;
+    document.getElementById("tickerLast").innerHTML =
+      `<span class="${cls(chg)}">${sym} ${fmt(last.close)}</span> <span class="sub ${cls(chg)}">${chg > 0 ? "+" : ""}${fmt(chg)}</span>`;
+    const or = d.range;
+    note.textContent = `source: ${d.data_source} · ${bars.length} bars` +
+      (or ? ` · OR overlay ${(or.window||"").replace(/_/g," ")} ${fmt(or.low)}-${fmt(or.high)}` : "") +
+      (d.warning ? ` (${d.warning})` : "");
+
+    const labels = bars.map(b => tickerLabel(b.t, hours));
+    const closes = bars.map(b => b.c);
+    const highs = bars.map(b => b.h);
+    const lows = bars.map(b => b.l);
+    const lineColor = chg >= 0 ? "#3fb950" : "#f85149";
+    const datasets = [
+      { label: "High", data: highs, borderColor: "rgba(139,152,169,.25)", backgroundColor: "rgba(79,140,255,.08)", fill: false, pointRadius: 0, borderWidth: 1, tension: 0 },
+      { label: "Low", data: lows, borderColor: "rgba(139,152,169,.25)", backgroundColor: "rgba(79,140,255,.10)", fill: "-1", pointRadius: 0, borderWidth: 1, tension: 0 },
+      { label: "Close", data: closes, borderColor: lineColor, backgroundColor: "transparent", fill: false, pointRadius: 0, borderWidth: 2, tension: 0.1 },
+    ];
+    if (or && or.high > 0) {
+      datasets.push({ label: "OR high", data: bars.map(() => or.high), borderColor: "#d29922", borderDash: [5, 4], pointRadius: 0, borderWidth: 1, fill: false });
+      datasets.push({ label: "OR low", data: bars.map(() => or.low), borderColor: "#d29922", borderDash: [5, 4], pointRadius: 0, borderWidth: 1, fill: false });
+    }
+    const opts = {
+      plugins: { legend: { display: false } },
+      animation: false,
+      scales: {
+        x: { ticks: { color: "#8b98a9", maxTicksLimit: 10, maxRotation: 0 }, grid: { color: "#243044" } },
+        y: { ticks: { color: "#8b98a9" }, grid: { color: "#243044" } }
+      }
+    };
+    if (tickerChart) {
+      tickerChart.data.labels = labels;
+      tickerChart.data.datasets = datasets;
+      tickerChart.update();
+    } else {
+      tickerChart = new Chart(canvas, { type: "line", data: { labels, datasets }, options: opts });
+    }
+  } catch (e) {
+    note.textContent = "error: " + e;
+  }
+}
+
+async function loadPerformance() {
+  const p = await getJSON("/api/performance");
+  const empty = document.getElementById("equityEmpty");
+  const canvas = document.getElementById("equityChart");
+  if (p.closed_trades === 0 && !(p.equity_curve && p.equity_curve.length > 1)) {
+    empty.style.display = "block"; canvas.style.display = "none";
+  } else {
+    empty.style.display = "none"; canvas.style.display = "block";
+    const labels = p.equity_curve.map((_, i) => i);
+    const data = p.equity_curve.map(pt => pt.equity);
+    if (equityChart) { equityChart.data.labels = labels; equityChart.data.datasets[0].data = data; equityChart.update(); }
+    else {
+      equityChart = new Chart(canvas, {
+        type: "line",
+        data: { labels, datasets: [{ label: "Equity", data, borderColor: "#4f8cff", backgroundColor: "rgba(79,140,255,.12)", fill: true, tension: .25, pointRadius: 0, borderWidth: 2 }] },
+        options: { plugins: { legend: { display: false } }, scales: { x: { display: false }, y: { ticks: { color: "#8b98a9" }, grid: { color: "#243044" } } } }
+      });
+    }
+  }
+  document.getElementById("byWindow").innerHTML = metricsTable(p.by_window);
+  document.getElementById("byStrategy").innerHTML = metricsTable(p.by_strategy);
+}
+
+function metricsTable(obj) {
+  const keys = Object.keys(obj || {});
+  if (!keys.length) return `<div class="empty">No closed trades yet.</div>`;
+  const rows = keys.map(k => {
+    const m = obj[k];
+    return `<tr>
+      <td>${k.replace(/_/g, " ")}</td>
+      <td>${m.trades}</td>
+      <td>${pct(m.win_rate)}</td>
+      <td class="${cls(m.expectancy)}">${sign(m.expectancy)}</td>
+      <td>${m.profit_factor === 999 || m.profit_factor > 900 ? "inf" : fmt(m.profit_factor)}</td>
+      <td class="${cls(m.total_pnl)}">${sign(m.total_pnl)}</td>
+    </tr>`;
+  }).join("");
+  return `<table><thead><tr><th>Group</th><th>Trades</th><th>Win%</th><th>Expectancy</th><th>Profit factor</th><th>Total P&L</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+function tpLabel(t) {
+  if (t.progress_to_tp == null) return "-";
+  const pctDone = Math.round(t.progress_to_tp * 100);
+  if (pctDone >= 100) return "at TP";
+  if (pctDone <= 0) return "at SL";
+  return pctDone + "% to TP";
+}
+
+async function loadPositions() {
+  const d = await getJSON("/api/positions");
+  let html = "";
+  if (!d.open_trades.length) html += `<div class="empty">No open journal positions.</div>`;
+  else {
+    const total = d.open_unrealized_pnl;
+    html += `<div class="sub mut" style="margin-bottom:8px">Open mark-to-market ${total == null ? "-" : sign(total)} across ${d.count} trade${d.count === 1 ? "" : "s"}.</div>`;
+    html += `<table><thead><tr><th>ID</th><th>Symbol</th><th>Window</th><th>Strategy</th><th>Dir</th><th>Qty</th><th>Entry</th><th>Mark</th><th>Live P&L</th><th>vs TP</th><th>Max loss</th><th>Env</th></tr></thead><tbody>`;
+    html += d.open_trades.map(t => `<tr>
+      <td>${t.id}</td><td>${t.symbol}</td><td>${t.window}</td>
+      <td>${t.spread_type.replace(/_/g, " ")}</td><td>${dirPill(t.direction)}</td>
+      <td>${t.contracts}</td><td>${fmt(t.entry_price)}</td>
+      <td>${t.mark == null ? "-" : fmt(t.mark)}</td>
+      <td class="${t.unrealized_pnl == null ? "mut" : cls(t.unrealized_pnl)}">${t.unrealized_pnl == null ? "-" : sign(t.unrealized_pnl)}</td>
+      <td class="mut">${tpLabel(t)}</td>
+      <td class="neg">${money(t.max_loss)}</td>
+      <td class="mut">${t.environment}</td></tr>`).join("");
+    html += `</tbody></table>`;
+  }
+  if (d.ibkr_connected && d.ibkr_positions.length) {
+    html += `<h2 style="margin-top:18px">Live IBKR positions</h2><table><thead><tr><th>Symbol</th><th>Type</th><th>Right</th><th>Strike</th><th>Expiry</th><th>Qty</th><th>Avg cost</th></tr></thead><tbody>`;
+    html += d.ibkr_positions.map(p => `<tr><td>${p.symbol}</td><td>${p.secType}</td><td>${p.right||""}</td><td>${p.strike||""}</td><td>${p.expiry||""}</td><td>${p.position}</td><td>${fmt(p.avgCost)}</td></tr>`).join("");
+    html += `</tbody></table>`;
+  } else if (!d.ibkr_connected) {
+    html += `<div class="empty" style="margin-top:12px">IBKR offline - live positions unavailable.</div>`;
+  }
+  document.getElementById("positions").innerHTML = html;
+}
+
+async function loadTrades() {
+  const d = await getJSON("/api/trades?limit=500");
+  if (!d.trades.length) { document.getElementById("trades").innerHTML = `<div class="empty">No trades recorded yet. Run the execution agent (or the demo).</div>`; return; }
+  const rows = d.trades.map(t => {
+    const live = t.status === "open" && t.unrealized_pnl != null;
+    const pnl = live ? t.unrealized_pnl : t.pnl;
+    const pnlText = pnl == null ? "-" : (sign(pnl) + (live ? " live" : ""));
+    return `<tr>
+    <td class="mut">${fmtGmt(t.created_at)}</td>
+    <td>${t.symbol}</td>
+    <td>${t.window}</td>
+    <td><span class="pill">${t.regime}</span></td>
+    <td>${t.spread_type.replace(/_/g, " ")}</td>
+    <td>${dirPill(t.direction)}</td>
+    <td>${t.contracts}</td>
+    <td>${fmt(t.entry_price)}</td>
+    <td class="neg">${money(t.max_loss)}</td>
+    <td><span class="pill ${t.status}">${t.status}</span></td>
+    <td class="${pnl == null ? "mut" : cls(pnl)}">${pnlText}</td>
+    <td class="mut">${t.environment}</td>
+  </tr>`;
+  }).join("");
+  document.getElementById("trades").innerHTML =
+    `<table><thead><tr><th>Time (GMT)</th><th>Symbol</th><th>Window</th><th>Regime</th><th>Strategy</th><th>Dir</th><th>Qty</th><th>Entry</th><th>Max loss</th><th>Status</th><th>P&L</th><th>Env</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+async function loadSignals() {
+  const sym = document.getElementById("sigSymbol").value;
+  const demo = document.getElementById("sigDemo").checked;
+  document.getElementById("sigNote").textContent = "loading...";
+  const d = await getJSON(`/api/signals?symbol=${sym}&use_synthetic=${demo}`);
+  if (d.error) { document.getElementById("signals").innerHTML = `<div class="empty">${d.error}</div>`; document.getElementById("sigNote").textContent = ""; return; }
+  document.getElementById("sigNote").textContent = `source: ${d.data_source}` + (d.warning ? " (" + d.warning + ")" : "");
+  document.getElementById("signals").innerHTML = d.signals.map(s => {
+    const strength = Math.min(s.strength || 0, 1) * 100;
+    const dcls = s.direction === "long" ? "pos" : (s.direction === "short" ? "neg" : "mut");
+    return `<div class="sig">
+      <div class="w">${s.window.replace(/_/g, " ")}</div>
+      <div class="d ${dcls}">${s.breakout ? s.direction.toUpperCase() : "no breakout"}</div>
+      <div class="sub">regime: <span class="pill">${s.regime}</span> &nbsp; strength: ${fmt(s.strength)}</div>
+      <div class="sub mut">range ${fmt(s.range_low)}-${fmt(s.range_high)} &middot; last ${fmt(s.last_price)} &middot; ${fmtGmt(s.as_of)}</div>
+      <div class="sub mut">${s.strategy ? fmtStrategy(s.strategy) : ""}</div>
+      <div class="bar"><span style="width:${strength}%"></span></div>
+    </div>`;
+  }).join("");
+}
+
+// --- backtesting / simulation ---------------------------------------------
+let simChart = null;
+const PF = (v) => (v === 999 || v > 900) ? "inf" : fmt(v);
+
+function backtestQuery() {
+  const p = new URLSearchParams({
+    symbol: document.getElementById("btSymbol").value,
+    window: document.getElementById("btWindow").value,
+    lookback_days: document.getElementById("btLookback").value,
+    demo: document.getElementById("btDemo").checked,
+    opening_range_minutes: document.getElementById("pOrm").value,
+    breakout_buffer_atr: document.getElementById("pBuf").value,
+    min_strength: document.getElementById("pStr").value,
+    target_r: document.getElementById("pTr").value,
+    stop_r: document.getElementById("pSr").value,
+    iv: document.getElementById("pIv").value,
+    dte: document.getElementById("pDte").value,
+    cost_per_trade: document.getElementById("pCost").value,
+  });
+  return p.toString();
+}
+
+function metricCard(label, value, klass, sub) {
+  return `<div class="card"><div class="label">${label}</div>
+    <div class="value small ${klass || ""}">${value}</div>
+    <div class="label" style="text-transform:none;margin-top:6px">${sub || ""}</div></div>`;
+}
+
+function renderBacktestMetrics(j) {
+  const m = j.metrics || {};
+  const mc = m.monte_carlo || {};
+  const cards = [
+    metricCard("Simulated trades", j.num_trades, "", `${j.bars_analysed} bars, ${j.lookback_days}d`),
+    metricCard("Win rate", pct(m.win_rate), cls(m.win_rate - 0.5), `${m.wins||0}W / ${m.losses||0}L`),
+    metricCard("Expectancy", sign(m.expectancy), cls(m.expectancy), "per trade"),
+    metricCard("Profit factor", PF(m.profit_factor), cls((m.profit_factor||0) - 1), "gross win / loss"),
+    metricCard("Total P&L", sign(m.total_pnl), cls(m.total_pnl), "simulated"),
+    metricCard("Max drawdown", money(m.max_drawdown), "neg", pct(m.max_drawdown_pct)),
+    metricCard("Sharpe", fmt(m.sharpe), cls(m.sharpe), "per-trade"),
+    metricCard("Score", fmt(j.score), cls(j.score), "balanced rank"),
+    metricCard("MC prob. profit", pct(mc.prob_profit), cls((mc.prob_profit||0) - 0.5), `p05 ${sign(mc.final_pnl_p05||0)}`),
+  ];
+  document.getElementById("btMetrics").innerHTML = cards.join("");
+}
+
+function renderSimChart(curve) {
+  const canvas = document.getElementById("simChart");
+  canvas.style.display = "block";
+  const labels = curve.map(pt => pt.i);
+  const data = curve.map(pt => pt.equity);
+  const up = data[data.length - 1] >= 0;
+  const color = up ? "#3fb950" : "#f85149";
+  if (simChart) {
+    simChart.data.labels = labels;
+    simChart.data.datasets[0].data = data;
+    simChart.data.datasets[0].borderColor = color;
+    simChart.update();
+  } else {
+    simChart = new Chart(canvas, {
+      type: "line",
+      data: { labels, datasets: [{ label: "Simulated equity", data, borderColor: color, backgroundColor: "rgba(79,140,255,.10)", fill: true, tension: .2, pointRadius: 0, borderWidth: 2 }] },
+      options: { plugins: { legend: { display: false } }, scales: { x: { display: false }, y: { ticks: { color: "#8b98a9" }, grid: { color: "#243044" } } } }
+    });
+  }
+}
+
+function renderSimTrades(trades) {
+  if (!trades || !trades.length) { document.getElementById("btResult").innerHTML = `<div class="empty">No qualifying breakouts in this period. Try a longer lookback or looser parameters.</div>`; return; }
+  const rows = trades.map((t, i) => `<tr>
+    <td class="mut">${i + 1}</td>
+    <td class="mut">${t.session || "-"}</td>
+    <td>${(t.spread_type||"").replace(/_/g, " ")}</td>
+    <td>${dirPill(t.direction)}</td>
+    <td><span class="pill">${t.regime}</span></td>
+    <td>${fmt(t.entry_value)}</td>
+    <td>${fmt(t.exit_value)}</td>
+    <td class="pos">${fmt(t.tp)}</td>
+    <td class="neg">${fmt(t.sl)}</td>
+    <td class="mut">${(t.exit_reason||"").replace(/_/g, " ")}</td>
+    <td class="${cls(t.pnl)}">${sign(t.pnl)}</td>
+  </tr>`).join("");
+  document.getElementById("btResult").innerHTML =
+    `<h2 style="margin-top:18px;font-size:13px">Simulated trades <span class="hint">${trades.length} trades</span></h2>
+     <div style="overflow-x:auto"><table><thead><tr><th>#</th><th>Session</th><th>Strategy</th><th>Dir</th><th>Regime</th><th>Entry</th><th>Exit</th><th>TP</th><th>SL</th><th>Exit reason</th><th>P&L</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+}
+
+async function runBacktest() {
+  const note = document.getElementById("btNote");
+  note.textContent = "running backtest...";
+  try {
+    const j = await getJSON("/api/backtest?" + backtestQuery());
+    if (j.error) { note.textContent = ""; document.getElementById("btResult").innerHTML = `<div class="empty">${j.error}${j.hint ? " - " + j.hint : ""}</div>`; return; }
+    note.textContent = `source: ${j.data_source}${j.warning ? " (" + j.warning + ")" : ""}`;
+    renderBacktestMetrics(j);
+    renderSimChart(j.equity_curve || []);
+    renderSimTrades(j.trades || []);
+  } catch (e) { note.textContent = "error: " + e; }
+}
+
+function fillAdvancedParams(b) {
+  if (b.dataset.orm) document.getElementById("pOrm").value = b.dataset.orm;
+  if (b.dataset.buf) document.getElementById("pBuf").value = b.dataset.buf;
+  if (b.dataset.str) document.getElementById("pStr").value = b.dataset.str;
+  if (b.dataset.tr && b.dataset.tr !== "undefined") document.getElementById("pTr").value = b.dataset.tr;
+  if (b.dataset.sr && b.dataset.sr !== "undefined") document.getElementById("pSr").value = b.dataset.sr;
+}
+
+async function selectForTrading(opts) {
+  const p = new URLSearchParams(opts);
+  const r = await postJSON("/api/strategy/select?" + p.toString());
+  if (r.error || r.ok === false) {
+    alert(r.error || "Could not select that parameter set.");
+    return r;
+  }
+  if (r.strategy_by_window) renderStrategyLine(r.strategy_by_window);
+  await Promise.all([loadSummary(), loadOptimisations(), loadSignals()]);
+  return r;
+}
+
+async function useFormForTrading() {
+  const r = await selectForTrading({
+    symbol: document.getElementById("btSymbol").value,
+    window: document.getElementById("btWindow").value,
+    opening_range_minutes: document.getElementById("pOrm").value,
+    breakout_buffer_atr: document.getElementById("pBuf").value,
+    min_strength: document.getElementById("pStr").value,
+    target_r: document.getElementById("pTr").value,
+    stop_r: document.getElementById("pSr").value,
+  });
+  if (r && r.ok) document.getElementById("btNote").textContent = `now trading ${r.symbol} ${r.window} with the chosen parameters`;
+}
+
+async function useDefaultsForTrading() {
+  const symbol = document.getElementById("autoSymbol").value;
+  const r = await postJSON("/api/strategy/clear?symbol=" + encodeURIComponent(symbol));
+  if (r.error) { alert(r.error); return; }
+  if (r.strategy_by_window) renderStrategyLine(r.strategy_by_window);
+  await Promise.all([loadSummary(), loadOptimisations(), loadSignals()]);
+}
+
+async function runOptimise() {
+  const note = document.getElementById("btNote");
+  note.textContent = "optimising (grid search, may take a few seconds)...";
+  try {
+    const j = await getJSON("/api/optimise?" + backtestQuery() + "&top_n=8");
+    if (j.error) { note.textContent = ""; document.getElementById("btResult").innerHTML = `<div class="empty">${j.error}${j.hint ? " - " + j.hint : ""}</div>`; return; }
+    const distinct = j.distinct_outcomes ?? j.top.length;
+    note.textContent = `tested ${j.combinations_tested} combinations (${distinct} distinct outcomes) on ${j.data_source} data`;
+    document.getElementById("btMetrics").innerHTML = "";
+    document.getElementById("simChart").style.display = "none";
+    const rows = j.top.map((r, i) => {
+      const m = r.metrics || {};
+      const p = r.params || {};
+      return `<tr class="${i === 0 ? "best-row" : ""}">
+        <td>${i === 0 ? "<b>#1 best</b>" : "#" + (i + 1)}</td>
+        <td class="${cls(r.score)}">${fmt(r.score)}</td>
+        <td>${p.opening_range_minutes}m</td>
+        <td>${fmt(p.breakout_buffer_atr)}</td>
+        <td>${fmt(p.min_strength)}</td>
+        <td>${m.trades}</td>
+        <td>${pct(m.win_rate)}</td>
+        <td class="${cls(m.expectancy)}">${sign(m.expectancy)}</td>
+        <td>${PF(m.profit_factor)}</td>
+        <td class="${cls(m.max_drawdown)}">${money(m.max_drawdown)}</td>
+        <td class="${cls(m.total_pnl)}">${sign(m.total_pnl)}</td>
+        <td><button data-orm="${p.opening_range_minutes}" data-buf="${p.breakout_buffer_atr}" data-str="${p.min_strength}" data-tr="${p.target_r}" data-sr="${p.stop_r}" data-id="${i === 0 && j.persisted_id ? j.persisted_id : ""}" class="applyBtn">Use for trading</button></td>
+      </tr>`;
+    }).join("");
+    document.getElementById("btResult").innerHTML =
+      `<h2 style="margin-top:18px;font-size:13px">Optimiser ranking <span class="hint">${j.top.length} distinct of ${j.combinations_tested} combinations tested, best saved to history. Click Use for trading to apply that set to live entries for this symbol/window.</span></h2>
+       <div style="overflow-x:auto"><table><thead><tr><th>Rank</th><th>Score</th><th>Open range</th><th>Buffer ATR</th><th>Min str.</th><th>Trades</th><th>Win%</th><th>Expectancy</th><th>PF</th><th>Max DD</th><th>Total P&L</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`;
+    document.querySelectorAll(".applyBtn").forEach(b => b.addEventListener("click", async () => {
+      fillAdvancedParams(b);
+      const opts = {
+        symbol: document.getElementById("btSymbol").value,
+        window: document.getElementById("btWindow").value,
+        opening_range_minutes: b.dataset.orm,
+        breakout_buffer_atr: b.dataset.buf,
+        min_strength: b.dataset.str,
+      };
+      if (b.dataset.tr && b.dataset.tr !== "undefined") opts.target_r = b.dataset.tr;
+      if (b.dataset.sr && b.dataset.sr !== "undefined") opts.stop_r = b.dataset.sr;
+      if (b.dataset.id) opts.backtest_id = b.dataset.id;
+      await selectForTrading(opts);
+    }));
+    loadOptimisations();
+  } catch (e) { note.textContent = "error: " + e; }
+}
+
+async function loadOptimisations() {
+  const d = await getJSON("/api/optimisations?limit=50");
+  if (!d.runs || !d.runs.length) { document.getElementById("optHistory").innerHTML = `<div class="empty">No optimisations saved yet. Click "Optimise" above to run one.</div>`; return; }
+  const rows = d.runs.map(r => {
+    const m = r.metrics || {};
+    const p = r.params || {};
+    const paramStr = p.grid ? `grid x${p.folds || "?"} folds` :
+      `OR ${p.opening_range_minutes}m, buf ${fmt(p.breakout_buffer_atr)}, str ${fmt(p.min_strength)}, TR ${fmt(p.target_r)}`;
+    const useBtn = p.grid ? "" : `<button data-id="${r.id}" class="histUseBtn">Use for trading</button>`;
+    return `<tr class="${r.is_active ? "best-row" : ""}">
+      <td class="mut">${fmtGmt(r.created_at)}</td>
+      <td>${r.label}${r.is_out_of_sample ? ' <span class="tag oos">OOS</span>' : ""}${r.is_active ? ' <span class="tag oos">active</span>' : ""}</td>
+      <td>${r.symbol}</td>
+      <td>${(r.window||"").replace(/_/g, " ")}</td>
+      <td class="mut">${paramStr}</td>
+      <td>${m.trades ?? "-"}</td>
+      <td>${m.win_rate !== undefined ? pct(m.win_rate) : "-"}</td>
+      <td class="${cls(m.expectancy)}">${m.expectancy !== undefined ? sign(m.expectancy) : "-"}</td>
+      <td class="${cls(m.total_pnl)}">${m.total_pnl !== undefined ? sign(m.total_pnl) : "-"}</td>
+      <td>${useBtn}</td>
+    </tr>`;
+  }).join("");
+  document.getElementById("optHistory").innerHTML =
+    `<div style="overflow-x:auto"><table><thead><tr><th>Time (GMT)</th><th>Run</th><th>Symbol</th><th>Window</th><th>Best params</th><th>Trades</th><th>Win%</th><th>Expectancy</th><th>Total P&L</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`;
+  document.querySelectorAll(".histUseBtn").forEach(b => b.addEventListener("click", () => {
+    selectForTrading({ backtest_id: b.dataset.id });
+  }));
+}
+
+// --- auto-trading ----------------------------------------------------------
+let autoRunning = false;
+
+function renderAuto(s) {
+  autoRunning = !!s.running;
+  const btn = document.getElementById("autoToggle");
+  btn.innerHTML = autoRunning ? "&#9632; Stop auto-trading" : "&#9654; Start auto-trading";
+  btn.className = "playbtn " + (autoRunning ? "run" : "idle");
+
+  const state = document.getElementById("autoState");
+  state.textContent = autoRunning ? "running" : "stopped";
+  state.className = "badge " + (autoRunning ? "live pulse" : "paper");
+
+  // Lock config controls while running.
+  ["autoSymbol", "autoWindow", "autoInterval", "autoDemo"].forEach(id => {
+    document.getElementById(id).disabled = autoRunning;
+  });
+
+  document.getElementById("autoStats").textContent = autoRunning
+    ? `cycles ${s.cycles} · placed ${s.trades_placed}` + (s.last_cycle_at ? ` · last ${fmtGmtClock(s.last_cycle_at)}` : "")
+    : (s.trades_placed ? `last run placed ${s.trades_placed}` : "");
+  if (s.strategy_by_window) renderStrategyLine(s.strategy_by_window);
+
+  const log = s.log || [];
+  const el = document.getElementById("autoLog");
+  if (!log.length) { el.innerHTML = `<div class="row"><span class="mut">No activity yet. Press start to run the loop.</span></div>`; return; }
+  el.innerHTML = log.map(e => `<div class="row">
+    <span class="ts">${fmtGmtClock(e.t)}</span>
+    <span class="log-${e.level || "muted"}">${e.msg}</span>
+  </div>`).join("");
+}
+
+async function loadAuto() {
+  try { renderAuto(await getJSON("/api/autotrade/status")); }
+  catch (e) { console.error(e); }
+}
+
+async function toggleAuto() {
+  const btn = document.getElementById("autoToggle");
+  btn.disabled = true;
+  try {
+    if (autoRunning) {
+      renderAuto(await postJSON("/api/autotrade/stop"));
+    } else {
+      const p = new URLSearchParams({
+        symbol: document.getElementById("autoSymbol").value,
+        window: document.getElementById("autoWindow").value,
+        interval: document.getElementById("autoInterval").value,
+        demo: document.getElementById("autoDemo").checked,
+      });
+      const r = await postJSON("/api/autotrade/start?" + p.toString());
+      if (r.error) alert(r.error);
+      renderAuto(r);
+    }
+  } catch (e) { console.error(e); }
+  finally { btn.disabled = false; }
+}
+
+async function postJSON(url) {
+  const r = await fetch(url, { method: "POST" });
+  return await r.json();
+}
+
+async function refreshAll() {
+  try { await loadSummary(); await Promise.all([loadPerformance(), loadPositions(), loadTrades(), loadAuto(), loadTicker()]); }
+  catch (e) { console.error(e); }
+}
+
+document.getElementById("sigBtn").addEventListener("click", loadSignals);
+document.getElementById("btRun").addEventListener("click", runBacktest);
+document.getElementById("btOpt").addEventListener("click", runOptimise);
+document.getElementById("autoToggle").addEventListener("click", toggleAuto);
+document.getElementById("useParamsBtn").addEventListener("click", useFormForTrading);
+document.getElementById("autoDefaults").addEventListener("click", useDefaultsForTrading);
+document.getElementById("tickerSymbol").addEventListener("change", loadTicker);
+document.getElementById("tickerHours").addEventListener("change", loadTicker);
+document.getElementById("tickerDemo").addEventListener("change", loadTicker);
+refreshAll();
+loadOptimisations();
+setInterval(refreshAll, 8000);
+</script>
+</body>
+</html>
