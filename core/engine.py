@@ -213,7 +213,7 @@ async def place_trade_plan(
         placement: dict[str, Any] = {"simulated": True, "order_ref": order_ref}
     else:
         try:
-            async with IBKRClient() as ib:
+            async with IBKRClient(readonly=False) as ib:
                 placement = await ib.place_spread_order(
                     symbol,
                     plan.long_leg,
@@ -312,7 +312,7 @@ async def settle_session_exits(
     client = ib
     try:
         if client is None:
-            client = IBKRClient()
+            client = IBKRClient(readonly=False)
             await client.connect()
             owned_client = True
         for trade in ibkr_due:

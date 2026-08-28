@@ -178,6 +178,21 @@ def save_cached_bars(symbol: str, bars: list[Bar], bar_size: str = "5 mins") -> 
     return path
 
 
+def _cached_bars_or_tail(symbol: str, duration: str, bar_size: str) -> list[Bar] | None:
+    """Use on-disk history even when it does not fully cover ``duration``.
+
+    A copied ``data/history/*.csv`` is often a few days stale relative to
+    ``utcnow()``. Prefer showing that series over an empty ticker.
+    """
+    bars = load_cached_bars(symbol, bar_size)
+    if not bars:
+        return None
+    days = max(_duration_days(duration), 1)
+    cutoff = utcnow() - timedelta(days=days)
+    subset = [b for b in bars if as_naive_utc(b.ts) >= cutoff]
+    return subset or bars[-500:]
+
+
 def cached_bars_for_lookback(
     symbol: str, days: int, bar_size: str = "5 mins"
 ) -> list[Bar] | None:
@@ -325,6 +340,9 @@ async def fetch_bars_with_fallback(
         bars = await fetch_bars(symbol, duration=duration, bar_size=bar_size)
         return bars, "ibkr", None
     except IBKRUnavailable as exc:
+        cached = _cached_bars_or_tail(symbol, duration, bar_size)
+        if cached:
+            return cached, "cache", f"IBKR unavailable, using local history cache: {exc}"
         if not allow_synthetic_fallback:
             raise
         bars = generate_synthetic_bars(days=synthetic_days, seed=synthetic_seed)

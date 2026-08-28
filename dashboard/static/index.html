@@ -274,9 +274,19 @@ function fmtGmtClock(iso) {
   return `${pad2(d.getUTCHours())}:${pad2(d.getUTCMinutes())}:${pad2(d.getUTCSeconds())} GMT`;
 }
 
-async function getJSON(url) {
-  const r = await fetch(url);
-  return await r.json();
+async function getJSON(url, ms) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), ms || 12000);
+  try {
+    const r = await fetch(url, { signal: ctrl.signal });
+    const data = await r.json();
+    if (!r.ok && data && data.error) return data;
+    return data;
+  } catch (e) {
+    return { error: (e && e.name === "AbortError") ? "request timed out" : String(e) };
+  } finally {
+    clearTimeout(t);
+  }
 }
 
 function fmtStrategy(st) {
@@ -301,6 +311,7 @@ function dirPill(d) {
 
 async function loadSummary() {
   const s = await getJSON("/api/summary");
+  if (!s || s.error || !s.environment) return;
   CCY = s.account_currency || "GBP";
   document.getElementById("serverTime").textContent = "Updated " + fmtGmtClock(s.server_time || new Date().toISOString());
   const hours = document.getElementById("autoHours");
@@ -414,6 +425,10 @@ async function loadTicker() {
         y: { ticks: { color: "#8b98a9" }, grid: { color: "#243044" } }
       }
     };
+    if (typeof Chart === "undefined") {
+      note.textContent = (note.textContent || "") + " (charts: Chart.js CDN blocked)";
+      return;
+    }
     if (tickerChart) {
       tickerChart.data.labels = labels;
       tickerChart.data.datasets = datasets;
@@ -428,6 +443,7 @@ async function loadTicker() {
 
 async function loadPerformance() {
   const p = await getJSON("/api/performance");
+  if (!p || p.error) return;
   const empty = document.getElementById("equityEmpty");
   const canvas = document.getElementById("equityChart");
   if (p.closed_trades === 0 && !(p.equity_curve && p.equity_curve.length > 1)) {
@@ -436,13 +452,15 @@ async function loadPerformance() {
     empty.style.display = "none"; canvas.style.display = "block";
     const labels = p.equity_curve.map((_, i) => i);
     const data = p.equity_curve.map(pt => pt.equity);
-    if (equityChart) { equityChart.data.labels = labels; equityChart.data.datasets[0].data = data; equityChart.update(); }
-    else {
-      equityChart = new Chart(canvas, {
-        type: "line",
-        data: { labels, datasets: [{ label: "Equity", data, borderColor: "#4f8cff", backgroundColor: "rgba(79,140,255,.12)", fill: true, tension: .25, pointRadius: 0, borderWidth: 2 }] },
-        options: { plugins: { legend: { display: false } }, scales: { x: { display: false }, y: { ticks: { color: "#8b98a9" }, grid: { color: "#243044" } } } }
-      });
+    if (typeof Chart !== "undefined") {
+      if (equityChart) { equityChart.data.labels = labels; equityChart.data.datasets[0].data = data; equityChart.update(); }
+      else {
+        equityChart = new Chart(canvas, {
+          type: "line",
+          data: { labels, datasets: [{ label: "Equity", data, borderColor: "#4f8cff", backgroundColor: "rgba(79,140,255,.12)", fill: true, tension: .25, pointRadius: 0, borderWidth: 2 }] },
+          options: { plugins: { legend: { display: false } }, scales: { x: { display: false }, y: { ticks: { color: "#8b98a9" }, grid: { color: "#243044" } } } }
+        });
+      }
     }
   }
   document.getElementById("byWindow").innerHTML = metricsTable(p.by_window);
@@ -476,13 +494,15 @@ function tpLabel(t) {
 
 async function loadPositions() {
   const d = await getJSON("/api/positions");
+  if (!d || d.error) return;
+  const openTrades = d.open_trades || [];
   let html = "";
-  if (!d.open_trades.length) html += `<div class="empty">No open journal positions.</div>`;
+  if (!openTrades.length) html += `<div class="empty">No open journal positions.</div>`;
   else {
     const total = d.open_unrealized_pnl;
     html += `<div class="sub mut" style="margin-bottom:8px">Open mark-to-market ${total == null ? "-" : sign(total)} across ${d.count} trade${d.count === 1 ? "" : "s"}.</div>`;
     html += `<table><thead><tr><th>ID</th><th>Symbol</th><th>Window</th><th>Strategy</th><th>Dir</th><th>Qty</th><th>Entry</th><th>Mark</th><th>Live P&L</th><th>vs TP</th><th>Max loss</th><th>Env</th></tr></thead><tbody>`;
-    html += d.open_trades.map(t => `<tr>
+    html += openTrades.map(t => `<tr>
       <td>${t.id}</td><td>${t.symbol}</td><td>${t.window}</td>
       <td>${t.spread_type.replace(/_/g, " ")}</td><td>${dirPill(t.direction)}</td>
       <td>${t.contracts}</td><td>${fmt(t.entry_price)}</td>
@@ -493,7 +513,7 @@ async function loadPositions() {
       <td class="mut">${t.environment}</td></tr>`).join("");
     html += `</tbody></table>`;
   }
-  if (d.ibkr_connected && d.ibkr_positions.length) {
+  if (d.ibkr_connected && (d.ibkr_positions || []).length) {
     html += `<h2 style="margin-top:18px">Live IBKR positions</h2><table><thead><tr><th>Symbol</th><th>Type</th><th>Right</th><th>Strike</th><th>Expiry</th><th>Qty</th><th>Avg cost</th></tr></thead><tbody>`;
     html += d.ibkr_positions.map(p => `<tr><td>${p.symbol}</td><td>${p.secType}</td><td>${p.right||""}</td><td>${p.strike||""}</td><td>${p.expiry||""}</td><td>${p.position}</td><td>${fmt(p.avgCost)}</td></tr>`).join("");
     html += `</tbody></table>`;
@@ -505,7 +525,10 @@ async function loadPositions() {
 
 async function loadTrades() {
   const d = await getJSON("/api/trades?limit=500");
-  if (!d.trades.length) { document.getElementById("trades").innerHTML = `<div class="empty">No trades recorded yet. Run the execution agent (or the demo).</div>`; return; }
+  if (!d || d.error || !d.trades || !d.trades.length) {
+    document.getElementById("trades").innerHTML = `<div class="empty">${d && d.error ? d.error : "No trades recorded yet. Run the execution agent (or the demo)."}</div>`;
+    return;
+  }
   const rows = d.trades.map(t => {
     const live = t.status === "open" && t.unrealized_pnl != null;
     const pnl = live ? t.unrealized_pnl : t.pnl;
@@ -832,8 +855,14 @@ async function postJSON(url) {
 }
 
 async function refreshAll() {
-  try { await loadSummary(); await Promise.all([loadPerformance(), loadPositions(), loadTrades(), loadAuto(), loadTicker()]); }
-  catch (e) { console.error(e); }
+  await Promise.allSettled([
+    loadSummary(),
+    loadPerformance(),
+    loadPositions(),
+    loadTrades(),
+    loadAuto(),
+    loadTicker(),
+  ]);
 }
 
 document.getElementById("sigBtn").addEventListener("click", loadSignals);

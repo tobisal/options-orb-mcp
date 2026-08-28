@@ -2,14 +2,16 @@
 #
 #   1. Copy .env.example to .env and set IB_GATEWAY_USER / IB_GATEWAY_PASSWORD
 #      (paper credentials; keep them out of git).
-#   2. docker compose up -d --build
-#   3. Dashboard: http://127.0.0.1:8787
-#   4. Optional Discord: docker compose --profile discord up -d
+#   2. Optional: set VNC_SERVER_PASSWORD in .env to debug Gateway via VNC
+#      (SSH tunnel: ssh -L 5900:127.0.0.1:5900 user@host → VNC to 127.0.0.1:5900).
+#   3. docker compose up -d --build
+#   4. Dashboard via SSH tunnel: http://127.0.0.1:8787
+#   5. Optional Discord: docker compose --profile discord up -d
 #
-# Inside the compose network the app talks to ib-gateway:4002 (paper socat).
-# Paper API on the host remains 127.0.0.1:4002. TRADING_MODE controls which
-# Gateway port is active. restart: unless-stopped brings containers back after
-# a reboot or crash. AUTO_RESTART_TIME is IBKR's daily soft restart.
+# Dashboard shares ib-gateway's network so it can use Gateway's paper API at
+# 127.0.0.1:4002 (localhost-only). Host 127.0.0.1:4002 still maps to socat 4004
+# for processes on the EC2 host. Dashboard HTTP is published on the gateway
+# container as 127.0.0.1:8787.
 
 services:
   ib-gateway:
@@ -27,10 +29,20 @@ services:
       TWOFA_TIMEOUT_ACTION: restart
       AUTO_RESTART_TIME: "11:59 PM"
       RELOGIN_AFTER_TWOFA_TIMEOUT: "yes"
-      EXISTING_SESSION_DETECTED_ACTION: primary
+      # primaryoverride: take over if Windows TWS/Gateway still holds the paper session
+      EXISTING_SESSION_DETECTED_ACTION: primaryoverride
+      JAVA_HEAP_SIZE: "768"
+      # Set in .env to enable VNC (leave empty to disable).
+      VNC_SERVER_PASSWORD: ${VNC_SERVER_PASSWORD:-}
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     ports:
-      - "127.0.0.1:4002:4004"        # paper API (host 4002 -> container socat 4004)
+      - "127.0.0.1:4002:4004"        # paper API for the host (socat → Gateway 4002)
       - "127.0.0.1:4001:4003"        # live API
+      - "127.0.0.1:8787:8787"        # dashboard (shared network namespace)
+      - "127.0.0.1:5900:5900"        # VNC (only active if VNC_SERVER_PASSWORD set)
     volumes:
       - ib-settings:/home/ibgateway/tws_settings
 
@@ -39,19 +51,20 @@ services:
     image: options-orb-mcp:latest
     container_name: orb-dashboard
     restart: unless-stopped
+    network_mode: "service:ib-gateway"
     env_file:
       - .env
     environment:
-      IBKR_HOST: ib-gateway
+      # Must be localhost: Gateway only completes the API handshake on 127.0.0.1.
+      IBKR_HOST: 127.0.0.1
       IBKR_PORT: "4002"
       DASHBOARD_HOST: 0.0.0.0
       DASHBOARD_PORT: "8787"
-      DISCORD_DASHBOARD_URL: http://dashboard:8787
+      DISCORD_DASHBOARD_URL: http://127.0.0.1:8787
       DB_PATH: data/trades.db
-    ports:
-      - "8787:8787"
     volumes:
-      - orb-data:/app/data
+      # Bind-mount so a copied trades.db + history/*.csv are visible.
+      - ./data:/app/data
     depends_on:
       - ib-gateway
     healthcheck:
@@ -76,7 +89,8 @@ services:
     env_file:
       - .env
     environment:
-      DISCORD_DASHBOARD_URL: http://dashboard:8787
+      # Reach dashboard via the gateway service name (shared published port).
+      DISCORD_DASHBOARD_URL: http://ib-gateway:8787
     command: ["discord"]
     depends_on:
       dashboard:
@@ -84,4 +98,3 @@ services:
 
 volumes:
   ib-settings:
-  orb-data:

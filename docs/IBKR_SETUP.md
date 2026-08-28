@@ -94,15 +94,27 @@ IBC-based image referenced in [../docker-compose.yml](../docker-compose.yml):
 
 1. Add `IB_GATEWAY_USER` and `IB_GATEWAY_PASSWORD` (your paper credentials) to a
    local `.env` (keep them out of git).
-2. `docker compose up -d` (container restarts on reboot; Gateway also does a
+2. `docker compose up -d --build` (container restarts on reboot; Gateway also does a
    daily soft restart at 11:59 PM London so login survives without a new 2FA).
-3. Set `IBKR_PORT=4002` in your app `.env` and connect as usual.
+3. The dashboard service shares the Gateway network and uses `IBKR_HOST=127.0.0.1`
+   / `IBKR_PORT=4002` (Gateway only completes the API handshake on localhost).
+   Host processes still use `127.0.0.1:4002` (published to socat).
+4. Optional: set `VNC_SERVER_PASSWORD` in `.env`, recreate Gateway, then
+   `ssh -L 5900:127.0.0.1:5900 user@host` and open a VNC client to
+   `127.0.0.1:5900` to clear stuck login / API dialogs.
 
 First login from a new IP usually needs an IBKR Mobile confirmation. After that,
 IBC re-enters the stored username/password on every restart.
 
 ## Troubleshooting
 
+- **`TimeoutError` on `127.0.0.1:4002` in Docker**: TCP connected but the IB
+  handshake did not finish — Gateway still on login/2FA, API not listening, or
+  socat started before login. Check logs for `Login has completed`, then
+  `docker exec orb-ib-gateway pkill -x socat`. If ports never open, enable VNC
+  and/or wipe the `ib-settings` volume and log in again.
+- **Do not point the dashboard at `ib-gateway:4002`**: that address times out;
+  use shared network + `127.0.0.1:4002` as in compose.
 - **`API connection failed: ConnectionRefusedError`**: Gateway/TWS is not running,
   not logged in, or the API/port is not enabled. Re-check step 3.
 - **Connected but quotes are empty / NaN**: you likely lack a real-time

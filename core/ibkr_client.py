@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
+import socket
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -39,14 +39,12 @@ _NO_SUBSCRIPTION_CODES = {354, 10089, 10091, 10167, 10168, 10197}
 _last_failure_monotonic: float = 0.0
 _logging_configured = False
 
-# One IB socket per process. Dashboard polls, the auto-trader, and MCP tools
-# used to each open a new connection on the same clientId (17), which makes
-# Gateway time out with "clientId already in use".
+# One IB socket per process, always on IBKR_CLIENT_ID (default 17).
 _shared_ib: Any = None
 _shared_client_id: int | None = None
 _shared_refs: int = 0
+_shared_readonly: bool | None = None
 _shared_lock: asyncio.Lock | None = None
-_CLIENT_ID_TRIES = 12
 
 
 def _lock() -> asyncio.Lock:
@@ -57,13 +55,24 @@ def _lock() -> asyncio.Lock:
 
 
 def _client_id_candidates(preferred: int) -> list[int]:
-    """Unique-ish IDs so dashboard / MCP servers / check_ibkr don't collide.
+    """Always use ``IBKR_CLIENT_ID`` only (default 17). No pid offset / walk."""
+    return [int(preferred)]
 
-    IBKR allows only one live socket per clientId. Offset by pid, then walk a
-    short range if that slot is already taken.
-    """
-    start = preferred + (os.getpid() % 40)
-    return [start + i for i in range(_CLIENT_ID_TRIES)]
+
+def _resolve_ipv4(host: str) -> str:
+    """Force IPv4. Docker DNS AAAA records make ib_async connect hang until timeout."""
+    raw = (host or "").strip() or "127.0.0.1"
+    if raw in {"127.0.0.1", "0.0.0.0"}:
+        return raw
+    if raw in {"localhost", "::1"}:
+        return "127.0.0.1"
+    try:
+        infos = socket.getaddrinfo(raw, None, socket.AF_INET, socket.SOCK_STREAM)
+    except OSError:
+        return raw
+    if not infos:
+        return raw
+    return infos[0][4][0]
 
 
 def _configure_ib_logging() -> None:
@@ -121,6 +130,7 @@ class IBKRClient:
     host: str | None = None
     port: int | None = None
     client_id: int | None = None
+    readonly: bool = True  # avoid Gateway "write access" dialog for reads/status
     _ib: Any = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -130,15 +140,20 @@ class IBKRClient:
         self.client_id = self.client_id if self.client_id is not None else s.ibkr_client_id
 
     # --- connection lifecycle ---------------------------------------------
-    async def connect(self, timeout: float = 4.0) -> None:
+    async def connect(self, timeout: float = 12.0) -> None:
         global _last_failure_monotonic, _shared_ib, _shared_client_id, _shared_refs
+        global _shared_readonly
         _require_ib()
         _configure_ib_logging()
         if self._ib is not None and self._ib.isConnected():
             return
 
         async with _lock():
-            if _shared_ib is not None and _shared_ib.isConnected():
+            if (
+                _shared_ib is not None
+                and _shared_ib.isConnected()
+                and _shared_readonly is self.readonly
+            ):
                 self._ib = _shared_ib
                 self.client_id = _shared_client_id
                 _shared_refs += 1
@@ -151,6 +166,7 @@ class IBKRClient:
                 _shared_ib = None
                 _shared_client_id = None
                 _shared_refs = 0
+                _shared_readonly = None
 
             cooldown = get_settings().ibkr_retry_cooldown
             since = time.monotonic() - _last_failure_monotonic
@@ -164,11 +180,17 @@ class IBKRClient:
             preferred = int(self.client_id or get_settings().ibkr_client_id)
             last_exc: Exception | None = None
             gateway_down = False
+            host = _resolve_ipv4(str(self.host))
             for cid in _client_id_candidates(preferred):
                 ib = iba.IB()
                 try:
                     await asyncio.wait_for(
-                        ib.connectAsync(self.host, self.port, clientId=cid),
+                        ib.connectAsync(
+                            host,
+                            self.port,
+                            clientId=cid,
+                            readonly=self.readonly,
+                        ),
                         timeout=timeout,
                     )
                 except ConnectionRefusedError as exc:
@@ -179,19 +201,27 @@ class IBKRClient:
                     except Exception:
                         pass
                     break
-                except (TimeoutError, OSError) as exc:
+                except TimeoutError as exc:
                     last_exc = exc
                     try:
                         ib.disconnect()
                     except Exception:
                         pass
-                    continue
+                    break
+                except OSError as exc:
+                    last_exc = exc
+                    try:
+                        ib.disconnect()
+                    except Exception:
+                        pass
+                    break
 
                 self._ib = ib
                 self.client_id = cid
                 _shared_ib = ib
                 _shared_client_id = cid
                 _shared_refs = 1
+                _shared_readonly = self.readonly
                 _last_failure_monotonic = 0.0
                 self._apply_market_data_type()
                 return
@@ -200,11 +230,18 @@ class IBKRClient:
             hint = (
                 "Is TWS/IB Gateway running with the API enabled?"
                 if gateway_down
-                else "clientId slots may be in use by another process; retry in a moment."
+                else (
+                    "API handshake timed out. Often the Gateway dialog "
+                    "'API client needs write access' — ensure READ_ONLY_API=no "
+                    "and IBC logged 'Read-Only API checkbox is now set to: false'. "
+                    "Retry with readonly connect, or: docker exec orb-ib-gateway pkill -x socat"
+                    if isinstance(last_exc, TimeoutError)
+                    else "clientId already in use or connection failed; retry in a moment."
+                )
             )
             raise IBKRUnavailable(
-                f"Could not connect to IBKR at {self.host}:{self.port} "
-                f"(tried clientIds {_client_id_candidates(preferred)}). {hint} "
+                f"Could not connect to IBKR at {host}:{self.port} "
+                f"(configured host={self.host}; clientId={preferred}). {hint} "
                 f"Original error: {last_exc!r}"
             )
 
@@ -215,7 +252,7 @@ class IBKRClient:
         MCP tools in the same process). It is only torn down if it is already
         dead, or if this instance was not the shared socket.
         """
-        global _shared_ib, _shared_client_id, _shared_refs
+        global _shared_ib, _shared_client_id, _shared_refs, _shared_readonly
         async with _lock():
             if self._ib is _shared_ib:
                 _shared_refs = max(_shared_refs - 1, 0)

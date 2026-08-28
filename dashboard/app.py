@@ -71,18 +71,35 @@ async def _ibkr_fetch(
     cached = _ibkr_cache.get(key)
     if cached and now - cached[0] < _IBKR_CACHE_TTL:
         return cached[1]
-    try:
+
+    async def _inner() -> Any:
         async with IBKRClient() as ib:
-            value = await fn(ib)
+            return await fn(ib)
+
+    try:
+        # Gateway login on a fresh host can stall connectAsync for many clientId
+        # retries. Cap so the UI can render the journal instead of hanging.
+        value = await asyncio.wait_for(_inner(), timeout=5.0)
         result: tuple[bool, Any, str | None] = (True, value, None)
     except IBKRUnavailable as exc:
         result = (False, None, str(exc))
+    except TimeoutError:
+        result = (
+            False,
+            None,
+            "IBKR timed out (Gateway still starting, 2FA pending, or busy).",
+        )
     _ibkr_cache[key] = (now, result)
     return result
 
 
 async def index(_request: Request) -> HTMLResponse:
     return HTMLResponse((_STATIC / "index.html").read_text(encoding="utf-8"))
+
+
+async def api_health(_request: Request) -> JSONResponse:
+    """Tunnel / compose probe that does not touch IBKR."""
+    return JSONResponse({"ok": True, "service": "dashboard"})
 
 
 # --- backtesting / simulation helpers --------------------------------------
@@ -465,7 +482,12 @@ async def api_summary(_request: Request) -> JSONResponse:
     else:
         payload["ibkr_note"] = note
     opens = _db.query_trades(status=TradeStatus.OPEN, limit=1000)
-    spots = await _spot_by_symbol({t.symbol for t in opens})
+    try:
+        spots = await asyncio.wait_for(
+            _spot_by_symbol({t.symbol for t in opens}), timeout=4.0
+        )
+    except TimeoutError:
+        spots = {}
     paper = paper_account_snapshot(
         _db,
         spots,
@@ -930,6 +952,7 @@ async def api_autotrade_stop(_request: Request) -> JSONResponse:
 
 routes = [
     Route("/", index),
+    Route("/api/health", api_health),
     Route("/api/summary", api_summary),
     Route("/api/trades", api_trades),
     Route("/api/performance", api_performance),
