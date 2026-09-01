@@ -7,6 +7,7 @@ Default command is ``dashboard``. Named services:
   all        dashboard + Discord in one container
   demo       offline end-to-end demo (no IBKR)
   check      IBKR connectivity probe
+  watchdog  host-side style heal when run with docker + compose dir
 
 Anything else is executed as a raw command, e.g.
 ``docker run ... python -m servers.market_data_mcp.server``.
@@ -23,6 +24,7 @@ _SERVICES = {
     "discord": ["-m", "scripts.discord_bot"],
     "demo": ["-m", "scripts.demo"],
     "check": ["-m", "scripts.check_ibkr"],
+    "watchdog": ["-m", "scripts.ibkr_watchdog"],
 }
 
 

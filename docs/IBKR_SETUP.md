@@ -106,6 +106,24 @@ IBC-based image referenced in [../docker-compose.yml](../docker-compose.yml):
 First login from a new IP usually needs an IBKR Mobile confirmation. After that,
 IBC re-enters the stored username/password on every restart.
 
+### Auto-heal when dashboard is up but IBKR API is offline
+
+After Gateway's daily soft restart, socat sometimes accepts TCP while the API
+handshake fails. Install the host watchdog (every 5 minutes):
+
+```bash
+chmod +x scripts/ibkr_watchdog.sh
+crontab -e
+```
+
+```cron
+*/5 * * * * /home/ubuntu/options-orb-mcp/scripts/ibkr_watchdog.sh >>/home/ubuntu/orb-watchdog.log 2>&1
+```
+
+It probes `127.0.0.1:4002` (readonly, clientId 17). On failure it kicks socat
+inside `orb-ib-gateway` and restarts only the dashboard container so the UI
+keeps its port and Discord keeps working.
+
 ## Troubleshooting
 
 - **`TimeoutError` on `127.0.0.1:4002` in Docker**: TCP connected but the IB
