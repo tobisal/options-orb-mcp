@@ -130,6 +130,15 @@ watchdog restarts the dashboard, the loop starts again without a manual click.
 Set `AUTO_TRADE_AUTOSTART=1` in `.env` if you want it to start on every boot
 even after an explicit Stop.
 
+### Trailing stops (opt-in)
+
+Per window in `configs/windows.json`: set `use_trailing_stop: true` (default
+false). After `+trail_activate_r` R of profit the fixed take-profit is dropped
+and the stop trails `trail_distance_r` under the peak structure mark (floor at
+breakeven). IBKR places a native TrailingStop on activate (static-stop fallback
+if rejected). Kill-switch: `TRAILING_STOPS_ENABLED=0`. Trail/session events go
+to `DISCORD_LOG_CHANNEL_ID` via `/api/ops/logs`.
+
 ## Troubleshooting
 
 - **`TimeoutError` on `127.0.0.1:4002` in Docker**: TCP connected but the IB

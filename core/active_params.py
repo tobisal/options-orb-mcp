@@ -51,10 +51,16 @@ def strategy_payload(
 def format_strategy(payload: dict[str, Any]) -> str:
     p = payload.get("params") or {}
     src = payload.get("source") or "defaults"
+    trail = ""
+    if p.get("use_trailing_stop"):
+        trail = (
+            f" trail@{p.get('trail_activate_r')}/"
+            f"{p.get('trail_distance_r')}R"
+        )
     return (
         f"{src} OR {p.get('opening_range_minutes')}m "
         f"buf {p.get('breakout_buffer_atr')} str {p.get('min_strength')} "
-        f"TR {p.get('target_r')}"
+        f"TR {p.get('target_r')}{trail}"
     )
 
 

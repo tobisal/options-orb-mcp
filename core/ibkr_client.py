@@ -615,6 +615,125 @@ class IBKRClient:
             "oca_group": oca_group,
         }
 
+    def _working_exit_orders(self, order_ref: str) -> list:
+        oca = f"{order_ref}-EXIT"
+        trail_ref = f"{order_ref}-TRAIL"
+        out = []
+        try:
+            self.ib.reqAllOpenOrders()
+        except Exception:
+            pass
+        for trade in list(self.ib.openTrades()):
+            order = trade.order
+            ref = str(getattr(order, "orderRef", "") or "")
+            group = str(getattr(order, "ocaGroup", "") or "")
+            if ref in {trail_ref, f"{order_ref}-FLAT"}:
+                out.append(trade)
+                continue
+            if group == oca or ref.startswith(f"{order_ref}-"):
+                out.append(trade)
+        return out
+
+    def has_working_trail(self, order_ref: str) -> bool:
+        trail_ref = f"{order_ref}-TRAIL"
+        for trade in self._working_exit_orders(order_ref):
+            if str(getattr(trade.order, "orderRef", "") or "") == trail_ref:
+                return True
+            otype = str(getattr(trade.order, "orderType", "") or "").upper()
+            if otype in {"TRAIL", "TRAIL LIMIT"}:
+                return True
+        return False
+
+    async def place_trailing_stop(
+        self,
+        symbol: str,
+        long_leg: OptionLeg,
+        short_leg: OptionLeg,
+        contracts: int,
+        order_ref: str,
+        *,
+        trail_amount: float,
+        stop_loss_price: float | None = None,
+    ) -> dict[str, Any]:
+        """Cancel OCA exits and place a native TRAIL stop (or static fallback)."""
+        qty = max(int(contracts), 0)
+        if qty <= 0:
+            return {"ok": False, "error": "No contracts."}
+        if self.has_working_trail(order_ref):
+            return {"ok": True, "already": True, "mode": "trail"}
+
+        bag, _long_c, _short_c = await self._qualified_vertical_bag(symbol, long_leg, short_leg)
+        cancelled = self._cancel_working_for_ref(order_ref)
+        await asyncio.sleep(0.25)
+
+        trail_amt = max(round(float(trail_amount), 2), 0.01)
+        try:
+            if hasattr(iba, "TrailingStopOrder"):
+                order = iba.TrailingStopOrder("SELL", qty, trail_amt, tif="GTC")
+            else:
+                order = iba.Order()
+                order.action = "SELL"
+                order.totalQuantity = qty
+                order.orderType = "TRAIL"
+                order.auxPrice = trail_amt
+                order.tif = "GTC"
+            order.orderRef = f"{order_ref}-TRAIL"
+            trade = self.ib.placeOrder(bag, order)
+            await asyncio.sleep(0.35)
+            status = str(getattr(getattr(trade, "orderStatus", None), "status", "") or "")
+            if status in {"Cancelled", "Inactive", "ApiCancelled"}:
+                raise RuntimeError(f"TrailingStop not accepted ({status})")
+            return {
+                "ok": True,
+                "mode": "native_trail",
+                "cancelled": cancelled,
+                "status": status,
+                "trail_amount": trail_amt,
+            }
+        except Exception as exc:
+            # Restore a static stop so the position is never naked.
+            sl_px = round(float(stop_loss_price if stop_loss_price is not None else 0.0), 2)
+            if sl_px <= 0:
+                return {
+                    "ok": False,
+                    "error": f"TrailingStop failed and no SL to restore: {exc}",
+                    "cancelled": cancelled,
+                }
+            try:
+                sl = iba.StopOrder("SELL", qty, sl_px, tif="GTC")
+                sl.orderRef = f"{order_ref}-EXIT-SL"
+                self.ib.placeOrder(bag, sl)
+                await asyncio.sleep(0.2)
+                return {
+                    "ok": True,
+                    "mode": "trail_fallback_modify",
+                    "cancelled": cancelled,
+                    "stop_loss_price": sl_px,
+                    "error": str(exc),
+                }
+            except Exception as exc2:
+                return {
+                    "ok": False,
+                    "error": f"TrailingStop failed ({exc}); restore SL failed ({exc2})",
+                    "cancelled": cancelled,
+                }
+
+    async def position_open_for_spread(
+        self,
+        symbol: str,
+        long_leg: OptionLeg,
+        short_leg: OptionLeg,
+    ) -> bool:
+        _bag, long_c, short_c = await self._qualified_vertical_bag(symbol, long_leg, short_leg)
+        pos_by_id = {
+            int(p.contract.conId): float(p.position)
+            for p in self.ib.positions()
+            if getattr(p.contract, "conId", 0)
+        }
+        long_qty = pos_by_id.get(int(long_c.conId), 0.0)
+        short_qty = pos_by_id.get(int(short_c.conId), 0.0)
+        return abs(long_qty) >= 0.01 or abs(short_qty) >= 0.01
+
     async def account_summary(self) -> dict[str, Any]:
         rows = await self.ib.accountSummaryAsync()
         out: dict[str, Any] = {}

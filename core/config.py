@@ -82,6 +82,9 @@ class Settings(BaseSettings):
     auto_trade_interval: float | None = Field(default=None, alias="AUTO_TRADE_INTERVAL")
     auto_trade_demo: bool | None = Field(default=None, alias="AUTO_TRADE_DEMO")
 
+    # Global kill-switch for trailing stops (window flag still required when on).
+    trailing_stops_enabled: bool = Field(default=True, alias="TRAILING_STOPS_ENABLED")
+
     # --- Dashboard bind ----------------------------------------------------
     # Local default is loopback. Docker sets DASHBOARD_HOST=0.0.0.0.
     dashboard_host: str = Field(default="127.0.0.1", alias="DASHBOARD_HOST")

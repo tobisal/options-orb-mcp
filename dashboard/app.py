@@ -237,6 +237,12 @@ class AutoTrader:
     def _add_log(self, msg: str, level: str = "info") -> None:
         self.log.append({"t": utcnow().isoformat(), "level": level, "msg": msg})
         self.log = self.log[-120:]
+        try:
+            from core.ops_log import emit as ops_emit
+
+            ops_emit(msg, level=level, source="autotrade")
+        except Exception:
+            pass
 
     def status(self) -> dict:
         return {
@@ -490,6 +496,7 @@ async def api_summary(_request: Request) -> JSONResponse:
         "daily_realised_pnl": round(realised, 2),
         "daily_kill_switch_tripped": tripped,
         "open_positions": _db.open_position_count(),
+        "open_risk_acct": round(rm.total_open_risk_acct(), 2),
         "max_open_positions": settings.max_open_positions,
         "max_open_positions_per_window": settings.max_open_positions_per_window,
         "open_by_window": {
@@ -984,6 +991,13 @@ async def api_autotrade_status(_request: Request) -> JSONResponse:
     return JSONResponse(_autotrader.status())
 
 
+async def api_ops_logs(request: Request) -> JSONResponse:
+    from core.ops_log import recent
+
+    limit = int(request.query_params.get("limit", "80"))
+    return JSONResponse({"log": list(reversed(recent(limit=limit)))})
+
+
 async def api_autotrade_start(request: Request) -> JSONResponse:
     q = request.query_params
     settings = get_settings()
@@ -1019,6 +1033,7 @@ routes = [
     Route("/api/strategy/clear", api_strategy_clear, methods=["POST"]),
     Route("/api/preview", api_preview),
     Route("/api/autotrade/status", api_autotrade_status),
+    Route("/api/ops/logs", api_ops_logs),
     Route("/api/autotrade/start", api_autotrade_start, methods=["POST"]),
     Route("/api/autotrade/stop", api_autotrade_stop, methods=["POST"]),
 ]

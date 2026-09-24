@@ -19,17 +19,21 @@ from core.journal import (
     _journal_close,
     _parse_plan,
     _structure_value,
+    apply_trailing_to_trade,
     close_open_paper_trades,
+    evaluate_exit,
     is_ibkr_backed,
     legs_from_plan,
 )
 from core.marketdata import fetch_bars_with_fallback, synthetic_chain
 from core.models import Regime, SessionWindow, SpreadPlan, TradeRecord, TradeStatus
+from core.ops_log import emit as ops_emit
 from core.risk import RiskManager
 from core.sessions import active_window, bars_in_window, get_window_config
 from core.strategy.orb import compute_orb_signal
 from core.strategy.spreads import build_spread, per_contract_max_loss
 from core.timeutils import utcnow
+from core.trail import plan_uses_trailing, risk_share_from_plan
 
 
 def resolve_window(window: str) -> SessionWindow:
@@ -137,6 +141,9 @@ async def build_trade_plan(
         target_r=target_r,
         stop_r=cfg.stop_r,
         contracts=1,
+        use_trailing_stop=cfg.use_trailing_stop,
+        trail_activate_r=cfg.trail_activate_r,
+        trail_distance_r=cfg.trail_distance_r,
     )
     if preview_one is None:
         return {
@@ -164,6 +171,9 @@ async def build_trade_plan(
         target_r=target_r,
         stop_r=cfg.stop_r,
         contracts=max(decision.contracts, 0),
+        use_trailing_stop=cfg.use_trailing_stop,
+        trail_activate_r=cfg.trail_activate_r,
+        trail_distance_r=cfg.trail_distance_r,
     )
 
     return {
@@ -281,6 +291,146 @@ def _session_end_mark(trade: TradeRecord, bars: list) -> float:
     return _structure_value(trade, plan, path[-1].close)
 
 
+def _infer_flat_reason(plan: dict[str, Any], mark: float, entry: float) -> str:
+    if plan.get("trail_active"):
+        return "trailing_stop"
+    tp = plan.get("take_profit_price")
+    sl = plan.get("stop_loss_price")
+    try:
+        if tp is not None and mark >= float(tp) - 1e-6:
+            return "take_profit"
+        if sl is not None and mark <= float(sl) + 1e-6:
+            return "stop_loss"
+    except (TypeError, ValueError):
+        pass
+    if mark >= entry:
+        return "take_profit"
+    return "already_flat"
+
+
+async def manage_open_ibkr_exits(
+    db: Database,
+    symbol: str,
+    bars: list,
+    *,
+    client: IBKRClient,
+    now_window: SessionWindow | None = None,
+) -> list[dict[str, Any]]:
+    """Mid-session sync + trailing activation for IBKR-backed opens."""
+    closed: list[dict[str, Any]] = []
+    live = now_window if now_window is not None else active_window()
+    opens = [
+        t
+        for t in db.query_trades(status=TradeStatus.OPEN, limit=1000)
+        if t.symbol.upper() == symbol.upper() and is_ibkr_backed(t)
+    ]
+    for trade in opens:
+        plan = _parse_plan(trade.plan_json)
+        legs = legs_from_plan(plan)
+        if legs is None or not trade.order_ref:
+            continue
+        long_leg, short_leg = legs
+        try:
+            still_open = await client.position_open_for_spread(
+                trade.symbol, long_leg, short_leg
+            )
+        except Exception:
+            continue
+
+        mark = _session_end_mark(trade, bars)
+        if not still_open:
+            reason = _infer_flat_reason(plan, mark, float(trade.entry_price))
+            rec = _journal_close(db, trade, mark, reason)
+            rec["ibkr"] = True
+            rec["already_flat"] = True
+            closed.append(rec)
+            ops_emit(
+                f"CLOSED journal #{trade.id} {reason} pnl {rec['pnl']:+.2f} "
+                f"(mid-session sync {trade.symbol})",
+                level="trade",
+                source="trail",
+            )
+            continue
+
+        # Only manage trails while the trade's session window is live.
+        if live is not trade.window:
+            continue
+
+        new_plan, changed, just_activated = apply_trailing_to_trade(db, trade, mark)
+        if just_activated and plan_uses_trailing(new_plan):
+            if new_plan.get("ibkr_trail_placed"):
+                continue
+            rs = risk_share_from_plan(new_plan, float(trade.entry_price))
+            dist_r = float(new_plan.get("trail_distance_r") or 0.3)
+            trail_amount = max(dist_r * rs, 0.01)
+            try:
+                result = await client.place_trailing_stop(
+                    trade.symbol,
+                    long_leg,
+                    short_leg,
+                    trade.contracts,
+                    trade.order_ref,
+                    trail_amount=trail_amount,
+                    stop_loss_price=new_plan.get("stop_loss_price"),
+                )
+            except Exception as exc:
+                ops_emit(
+                    f"TRAIL place failed #{trade.id}: {exc}",
+                    level="error",
+                    source="trail",
+                )
+                continue
+            if result.get("ok"):
+                new_plan["ibkr_trail_placed"] = True
+                if trade.id:
+                    db.update_plan_json(trade.id, new_plan)
+                mode = result.get("mode")
+                level = "warn" if mode == "trail_fallback_modify" else "trade"
+                ops_emit(
+                    f"TRAIL activated {trade.symbol} #{trade.id} mode={mode} "
+                    f"amount={trail_amount:.2f} stop={new_plan.get('stop_loss_price')}",
+                    level=level,
+                    source="trail",
+                )
+            else:
+                ops_emit(
+                    f"TRAIL failed #{trade.id}: {result.get('error')}",
+                    level="error",
+                    source="trail",
+                )
+        elif changed and new_plan.get("trail_active") and not new_plan.get("ibkr_trail_placed"):
+            # Software trail raised SL before native place — keep plan only.
+            pass
+
+        # Software-side exit if mark hit raised SL (covers fallback static stop).
+        decision = evaluate_exit(
+            trade, bars, window_live=True, plan=new_plan
+        )
+        if decision and decision[1] in {"trailing_stop", "stop_loss", "take_profit"}:
+            exit_price, reason = decision
+            try:
+                flat = await client.close_spread_order(
+                    trade.symbol,
+                    long_leg,
+                    short_leg,
+                    trade.contracts,
+                    trade.order_ref,
+                )
+            except IBKRUnavailable:
+                continue
+            if not flat.get("ok"):
+                continue
+            rec = _journal_close(db, trade, exit_price, reason)
+            rec["ibkr"] = True
+            closed.append(rec)
+            ops_emit(
+                f"CLOSED journal #{trade.id} {reason} pnl {rec['pnl']:+.2f}",
+                level="trade",
+                source="trail",
+            )
+    return closed
+
+
 async def settle_session_exits(
     db: Database,
     symbol: str,
@@ -289,23 +439,28 @@ async def settle_session_exits(
     now_window: SessionWindow | None = None,
     ib: Any = None,
 ) -> list[dict[str, Any]]:
-    """Close journal-only trades and flatten IBKR combos whose session has ended.
+    """Close journal-only trades, manage IBKR trails/sync, flatten ended windows.
 
-    Take-profit / stop-loss on IBKR-backed trades stay with the broker OCA group.
-    When that window is no longer active, this cancels remaining exits and
-    market-sells the combo, then records the journal close. If IBKR rejects
-    (market closed, disconnect), the row stays open and the next cycle retries.
+    Take-profit / stop-loss on IBKR-backed trades stay with the broker OCA group
+    until trailing activates (native TRAIL) or the session ends. Mid-session
+    sync closes the journal when the broker is already flat.
     """
     closed = close_open_paper_trades(db, symbol, bars, now_window=now_window)
+    for row in closed:
+        ops_emit(
+            f"CLOSED journal #{row.get('trade_id')} {row.get('reason')} "
+            f"pnl {row.get('pnl', 0):+.2f}",
+            level="trade",
+            source="journal",
+        )
+
     live = now_window if now_window is not None else active_window()
-    ibkr_due = [
+    ibkr_opens = [
         t
         for t in db.query_trades(status=TradeStatus.OPEN, limit=1000)
-        if t.symbol.upper() == symbol.upper()
-        and is_ibkr_backed(t)
-        and live is not t.window
+        if t.symbol.upper() == symbol.upper() and is_ibkr_backed(t)
     ]
-    if not ibkr_due:
+    if not ibkr_opens:
         return closed
 
     owned_client = False
@@ -315,6 +470,20 @@ async def settle_session_exits(
             client = IBKRClient(readonly=False)
             await client.connect()
             owned_client = True
+
+        closed.extend(
+            await manage_open_ibkr_exits(
+                db, symbol, bars, client=client, now_window=live
+            )
+        )
+
+        ibkr_due = [
+            t
+            for t in db.query_trades(status=TradeStatus.OPEN, limit=1000)
+            if t.symbol.upper() == symbol.upper()
+            and is_ibkr_backed(t)
+            and live is not t.window
+        ]
         for trade in ibkr_due:
             plan = _parse_plan(trade.plan_json)
             legs = legs_from_plan(plan)
@@ -333,11 +502,22 @@ async def settle_session_exits(
                 continue
             if not result.get("ok"):
                 continue
-            rec = _journal_close(db, trade, _session_end_mark(trade, bars), "session_end")
+            reason = "session_end"
+            if result.get("already_flat"):
+                reason = _infer_flat_reason(
+                    plan, _session_end_mark(trade, bars), float(trade.entry_price)
+                )
+            rec = _journal_close(db, trade, _session_end_mark(trade, bars), reason)
             rec["ibkr"] = True
             rec["ibkr_status"] = result.get("status")
             rec["already_flat"] = bool(result.get("already_flat"))
             closed.append(rec)
+            ops_emit(
+                f"CLOSED journal #{trade.id} {reason} pnl {rec['pnl']:+.2f} "
+                f"(session flatten)",
+                level="trade",
+                source="session",
+            )
     finally:
         if owned_client and client is not None:
             await client.disconnect()

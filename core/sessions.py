@@ -25,6 +25,9 @@ _STRATEGY_FIELDS = (
     "min_strength",
     "target_r",
     "stop_r",
+    "use_trailing_stop",
+    "trail_activate_r",
+    "trail_distance_r",
 )
 
 EASTERN = pytz.timezone("US/Eastern")
@@ -42,6 +45,9 @@ class WindowConfig:
     min_strength: float
     target_r: float
     stop_r: float
+    use_trailing_stop: bool = False
+    trail_activate_r: float = 0.5
+    trail_distance_r: float = 0.3
 
     @property
     def wraps_midnight(self) -> bool:
@@ -63,7 +69,14 @@ class WindowConfig:
             if name not in params or params[name] is None:
                 continue
             current = getattr(self, name)
-            updates[name] = type(current)(params[name])
+            raw = params[name]
+            if isinstance(current, bool):
+                if isinstance(raw, str):
+                    updates[name] = raw.strip().lower() in {"1", "true", "yes", "on"}
+                else:
+                    updates[name] = bool(raw)
+            else:
+                updates[name] = type(current)(raw)
         return replace(self, **updates) if updates else self
 
 
@@ -90,6 +103,9 @@ def load_window_configs() -> dict[SessionWindow, WindowConfig]:
             min_strength=float(cfg["min_strength"]),
             target_r=float(cfg["target_r"]),
             stop_r=float(cfg["stop_r"]),
+            use_trailing_stop=bool(cfg.get("use_trailing_stop", False)),
+            trail_activate_r=float(cfg.get("trail_activate_r", 0.5)),
+            trail_distance_r=float(cfg.get("trail_distance_r", 0.3)),
         )
     return configs
 

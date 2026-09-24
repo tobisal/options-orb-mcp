@@ -104,6 +104,10 @@ class SpreadPlan(BaseModel):
     target_r: float = 1.5
     take_profit_price: float | None = None  # spread price at TP
     stop_loss_price: float | None = None  # spread price at SL
+    use_trailing_stop: bool = False
+    trail_activate_r: float = 0.5
+    trail_distance_r: float = 0.3
+    original_stop_loss_price: float | None = None
     rationale: str = ""
 
     @property

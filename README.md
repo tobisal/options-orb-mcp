@@ -310,6 +310,8 @@ Then on that PC only:
    After you Start once, the dashboard resumes auto-trade automatically on every
    process restart (Gateway nightly restart / watchdog). Set
    `AUTO_TRADE_AUTOSTART=1` in `.env` to always start on boot even after Stop.
+   Optional trailing stops: set `use_trailing_stop: true` per window in
+   `configs/windows.json` (see [docs/IBKR_SETUP.md](docs/IBKR_SETUP.md)).
 5. Nightly optimiser (23:30 GMT): `python -m scripts.nightly_optimise --install-task`
 6. Restart Cursor so MCP servers pick up `.cursor/mcp.json`.
 

@@ -38,6 +38,8 @@ def mark_open_trade(trade: TradeRecord, spot: float) -> dict[str, Any]:
         "unrealized_pnl": pnl,
         "take_profit_price": tp,
         "stop_loss_price": sl,
+        "trail_active": bool(plan.get("trail_active")),
+        "use_trailing_stop": bool(plan.get("use_trailing_stop")),
         "progress_to_tp": round(progress, 3) if progress is not None else None,
     }
 
@@ -78,22 +80,42 @@ def evaluate_exit(
     bars: list[Bar],
     *,
     window_live: bool,
+    plan: dict[str, Any] | None = None,
 ) -> tuple[float, str] | None:
     """Return ``(exit_price, reason)`` if this open trade should close now."""
     if not bars:
         return None
-    plan = _parse_plan(trade.plan_json)
+    plan = plan if plan is not None else _parse_plan(trade.plan_json)
     spot = bars[-1].close
     value = _structure_value(trade, plan, spot)
     tp = _num(plan.get("take_profit_price"))
     sl = _num(plan.get("stop_loss_price"))
-    if tp is not None and value >= tp:
+    trail_active = bool(plan.get("trail_active"))
+    if not trail_active and tp is not None and value >= tp:
         return tp, "take_profit"
     if sl is not None and value <= sl:
-        return sl, "stop_loss"
+        return sl, "trailing_stop" if trail_active else "stop_loss"
     if not window_live:
         return value, "session_end"
     return None
+
+
+def apply_trailing_to_trade(
+    db: Database,
+    trade: TradeRecord,
+    mark: float,
+) -> tuple[dict[str, Any], bool, bool]:
+    """Persist trail updates; returns (plan, changed, just_activated)."""
+    from core.trail import update_trailing_stop
+
+    plan = _parse_plan(trade.plan_json)
+    new_plan, changed, just_activated = update_trailing_stop(
+        plan, mark, entry=float(trade.entry_price)
+    )
+    if changed and trade.id:
+        db.update_plan_json(trade.id, new_plan)
+        trade.plan_json = __import__("json").dumps(new_plan)
+    return new_plan, changed, just_activated
 
 
 def is_ibkr_backed(trade: TradeRecord) -> bool:
@@ -175,7 +197,11 @@ def close_open_paper_trades(
         cfg = get_window_config(trade.window)
         in_win = bars_in_window(bars, cfg)
         path = in_win or bars
-        decision = evaluate_exit(trade, path, window_live=window_live)
+        if not path:
+            continue
+        mark = _structure_value(trade, _parse_plan(trade.plan_json), path[-1].close)
+        plan, _, _ = apply_trailing_to_trade(db, trade, mark)
+        decision = evaluate_exit(trade, path, window_live=window_live, plan=plan)
         if decision is None:
             continue
         exit_price, reason = decision

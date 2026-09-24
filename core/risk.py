@@ -8,13 +8,15 @@ loss of a position is known before entry.
 
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass, field
 
 from core.config import Settings, get_settings
 from core.db import Database
-from core.models import SessionWindow
+from core.models import SessionWindow, TradeRecord, TradeStatus
 from core.timeutils import utcnow
+from core.trail import open_risk_per_contract_usd
 
 # Rough FX to translate USD option risk into the account currency (GBP) for
 # sizing. This is a conservative default; for live use, source a live rate.
@@ -28,6 +30,7 @@ class RiskDecision:
     risk_budget: float  # account-currency amount allowed at risk this trade
     projected_risk: float  # account-currency max loss of the sized position
     reasons: list[str] = field(default_factory=list)
+    open_risk_acct: float = 0.0  # current stop-based open risk across book
 
     def as_dict(self) -> dict:
         return {
@@ -35,6 +38,7 @@ class RiskDecision:
             "contracts": self.contracts,
             "risk_budget": round(self.risk_budget, 2),
             "projected_risk": round(self.projected_risk, 2),
+            "open_risk_acct": round(self.open_risk_acct, 2),
             "reasons": self.reasons,
         }
 
@@ -69,6 +73,23 @@ class RiskManager:
         per_contract_acct = per_contract_max_loss_usd * self.acct_ccy_per_usd
         budget = self.risk_budget_per_trade()
         return max(int(math.floor(budget / per_contract_acct)), 0)
+
+    def open_risk_acct(self, trade: TradeRecord) -> float:
+        """Account-currency risk still on an open trade (current stop vs entry)."""
+        try:
+            plan = json.loads(trade.plan_json or "{}")
+        except json.JSONDecodeError:
+            plan = {}
+        if not isinstance(plan, dict):
+            plan = {}
+        per = open_risk_per_contract_usd(plan, float(trade.entry_price))
+        return round(per * max(trade.contracts, 0) * self.acct_ccy_per_usd, 2)
+
+    def total_open_risk_acct(self, environment: str | None = None) -> float:
+        assert self.db is not None
+        env = environment or self.environment()
+        opens = self.db.query_trades(status=TradeStatus.OPEN, environment=env, limit=1000)
+        return round(sum(self.open_risk_acct(t) for t in opens), 2)
 
     # --- gates -------------------------------------------------------------
     def environment(self) -> str:
@@ -166,6 +187,7 @@ class RiskManager:
             )
 
         projected_risk = contracts * per_contract_max_loss_usd * self.acct_ccy_per_usd
+        open_risk = self.total_open_risk_acct(env)
         approved = len(reasons) == 0 and contracts > 0
         return RiskDecision(
             approved=approved,
@@ -173,4 +195,5 @@ class RiskManager:
             risk_budget=self.risk_budget_per_trade(),
             projected_risk=projected_risk,
             reasons=reasons,
+            open_risk_acct=open_risk,
         )

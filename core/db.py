@@ -227,6 +227,17 @@ class Database:
             )
             return int(cur.lastrowid)
 
+    def update_plan_json(self, trade_id: int, plan: dict | str) -> bool:
+        import json
+
+        raw = plan if isinstance(plan, str) else json.dumps(plan)
+        with self._conn() as conn:
+            cur = conn.execute(
+                "UPDATE trades SET plan_json = ? WHERE id = ? AND status = ?",
+                (raw, trade_id, TradeStatus.OPEN.value),
+            )
+            return cur.rowcount > 0
+
     def close_trade(
         self, trade_id: int, exit_price: float, pnl: float, closed_at: datetime | None = None
     ) -> bool:

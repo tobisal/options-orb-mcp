@@ -174,7 +174,10 @@ class OrbDiscord(discord.Client):
         verbose = self.settings.discord_log_verbose
         while not self.is_closed():
             try:
-                status = await self.api.get("/api/autotrade/status")
+                # Prefer shared ops log (trail/session/autotrade); fall back to autotrade.
+                status = await self.api.get("/api/ops/logs", limit=80)
+                if status.get("error"):
+                    status = await self.api.get("/api/autotrade/status")
                 if status.get("error"):
                     await asyncio.sleep(15)
                     continue
@@ -234,7 +237,7 @@ def register_commands(bot: OrbDiscord) -> None:
                 "`/auto start|stop|status` paper auto-trader\n"
                 "`/optimise` rank params (does not apply)\n"
                 "`/nightly` rank and apply tomorrow's sets\n"
-                "Live auto-trade events stream to DISCORD_LOG_CHANNEL_ID."
+                "Live auto-trade + trail/session events stream to DISCORD_LOG_CHANNEL_ID."
             ),
             ephemeral=True,
         )

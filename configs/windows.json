@@ -1,5 +1,5 @@
 {
-  "_comment": "Per-window ORB parameters. Times are in US/Eastern (US options clock). GMT equivalents in summer (EDT=GMT-4): Asia 00:00-06:00, London 07:00-12:30, New York 13:30-20:00. In winter (EST=GMT-5) add one hour.",
+  "_comment": "Per-window ORB parameters. Times are in US/Eastern (US options clock). GMT equivalents in summer (EDT=GMT-4): Asia 00:00-06:00, London 07:00-12:30, New York 13:30-20:00. In winter (EST=GMT-5) add one hour. use_trailing_stop (default false): after +trail_activate_r R of profit, cancel TP and trail stop trail_distance_r under the peak (floor at breakeven). Global kill-switch: TRAILING_STOPS_ENABLED=0.",
   "asia": {
     "window_open": "20:00",
     "window_close": "02:00",
@@ -7,7 +7,10 @@
     "breakout_buffer_atr": 0.10,
     "min_strength": 0.15,
     "target_r": 1.5,
-    "stop_r": 1.0
+    "stop_r": 1.0,
+    "use_trailing_stop": false,
+    "trail_activate_r": 0.5,
+    "trail_distance_r": 0.3
   },
   "london": {
     "window_open": "03:00",
@@ -16,7 +19,10 @@
     "breakout_buffer_atr": 0.10,
     "min_strength": 0.20,
     "target_r": 1.5,
-    "stop_r": 1.0
+    "stop_r": 1.0,
+    "use_trailing_stop": false,
+    "trail_activate_r": 0.5,
+    "trail_distance_r": 0.3
   },
   "new_york": {
     "window_open": "09:30",
@@ -25,6 +31,9 @@
     "breakout_buffer_atr": 0.10,
     "min_strength": 0.25,
     "target_r": 1.5,
-    "stop_r": 1.0
+    "stop_r": 1.0,
+    "use_trailing_stop": false,
+    "trail_activate_r": 0.5,
+    "trail_distance_r": 0.3
   }
 }

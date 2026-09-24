@@ -40,6 +40,9 @@ class BacktestParams:
     min_strength: float = 0.25
     target_r: float = 1.5
     stop_r: float = 1.0
+    use_trailing_stop: bool = False
+    trail_activate_r: float = 0.5
+    trail_distance_r: float = 0.3
     iv: float = 0.25
     dte: int = 7
     strike_increment: float = 1.0
@@ -52,6 +55,9 @@ class BacktestParams:
             "min_strength": self.min_strength,
             "target_r": self.target_r,
             "stop_r": self.stop_r,
+            "use_trailing_stop": self.use_trailing_stop,
+            "trail_activate_r": self.trail_activate_r,
+            "trail_distance_r": self.trail_distance_r,
             "iv": self.iv,
             "dte": self.dte,
             "strike_increment": self.strike_increment,
@@ -183,12 +189,30 @@ def _simulate_trade(
     reward_share = min(params.target_r * risk_share, max_profit_share)
     tp = v0 + reward_share
     sl = v0 - risk_share
+    original_sl = sl
+    use_trail = bool(params.use_trailing_stop)
+    activate_r = float(params.trail_activate_r)
+    distance_r = float(params.trail_distance_r)
+    if use_trail and not (0 < activate_r <= 5 and 0 < distance_r <= activate_r):
+        use_trail = False
+    peak = v0
+    trail_active = False
 
     exit_v = None
     exit_reason = "session_end"
     for b in forward_bars:
         v = min(max(structure_value(b.close), band_low), band_high)
-        if v >= tp:
+        if use_trail:
+            peak = max(peak, v)
+            if not trail_active and v >= v0 + activate_r * risk_share:
+                trail_active = True
+            if trail_active:
+                sl = max(v0, peak - distance_r * risk_share)
+                if v <= sl:
+                    exit_v, exit_reason = sl, "trailing_stop"
+                    break
+                continue
+        if not trail_active and v >= tp:
             exit_v, exit_reason = tp, "take_profit"
             break
         if v <= sl:
@@ -207,9 +231,10 @@ def _simulate_trade(
         "entry_value": round(v0, 4),
         "exit_value": round(exit_v, 4),
         "tp": round(tp, 4),
-        "sl": round(sl, 4),
+        "sl": round(original_sl if not trail_active else sl, 4),
         "exit_reason": exit_reason,
         "pnl": round(pnl, 2),
+        "trail_active": trail_active,
     }
 
 

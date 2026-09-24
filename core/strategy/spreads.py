@@ -69,6 +69,9 @@ def build_spread(
     stop_r: float = 1.0,
     width_strikes: int = 1,
     contracts: int = 1,
+    use_trailing_stop: bool = False,
+    trail_activate_r: float = 0.5,
+    trail_distance_r: float = 0.3,
 ) -> SpreadPlan | None:
     """Build a :class:`SpreadPlan` for the given signal, or None if infeasible.
 
@@ -145,6 +148,12 @@ def build_spread(
     take_profit_price = round(v0 + reward_share, 4)
     stop_loss_price = round(v0 - risk_share, 4)
 
+    from core.trail import normalize_trail_params
+
+    use_trail, act_r, dist_r = normalize_trail_params(
+        use_trailing_stop, trail_activate_r, trail_distance_r
+    )
+
     contracts = max(contracts, 0)
     mult = CONTRACT_MULTIPLIER
     plan = SpreadPlan(
@@ -174,6 +183,10 @@ def build_spread(
         target_r=target_r,
         take_profit_price=take_profit_price,
         stop_loss_price=stop_loss_price,
+        use_trailing_stop=use_trail,
+        trail_activate_r=act_r,
+        trail_distance_r=dist_r,
+        original_stop_loss_price=stop_loss_price,
         rationale=(
             f"{spread_type.value} on {signal.symbol}: {'debit' if is_debit else 'credit'} "
             f"structure V0={v0:.2f}, width={width:.2f}, regime={signal.regime.value}, "

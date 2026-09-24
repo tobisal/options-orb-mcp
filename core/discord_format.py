@@ -187,7 +187,9 @@ def format_log_line(entry: dict[str, Any]) -> str:
     level = str(entry.get("level") or "info")
     msg = str(entry.get("msg") or "")
     t = str(entry.get("t") or "")[-8:]
-    return f"`{t}` **{level}** {msg}"
+    source = str(entry.get("source") or "").strip()
+    prefix = f"[{source}] " if source and source != "autotrade" else ""
+    return f"`{t}` **{level}** {prefix}{msg}"
 
 
 def should_relay_log(entry: dict[str, Any], *, verbose: bool) -> bool:
