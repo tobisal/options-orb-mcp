@@ -307,6 +307,9 @@ Then on that PC only:
 3. Leave `data/trades.db` behind unless you want this PC's journal. A missing
    file is a fresh paper ledger.
 4. `python -m dashboard.app` → http://127.0.0.1:8787 then **Start** auto-trade.
+   After you Start once, the dashboard resumes auto-trade automatically on every
+   process restart (Gateway nightly restart / watchdog). Set
+   `AUTO_TRADE_AUTOSTART=1` in `.env` to always start on boot even after Stop.
 5. Nightly optimiser (23:30 GMT): `python -m scripts.nightly_optimise --install-task`
 6. Restart Cursor so MCP servers pick up `.cursor/mcp.json`.
 

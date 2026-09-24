@@ -11,7 +11,11 @@ from __future__ import annotations
 
 import math
 import random
+from collections import defaultdict
 from dataclasses import asdict, dataclass
+from datetime import date, datetime
+
+from core.timeutils import utcnow
 
 # Finite stand-in for "infinite" ratios (no losses) so results stay JSON-safe
 # and comparable. Displayed as "inf" in the UI.
@@ -152,3 +156,87 @@ def summarize(pnls: list[float], *, include_monte_carlo: bool = True) -> dict:
     if include_monte_carlo:
         out["monte_carlo"] = monte_carlo(pnls)
     return out
+
+
+def daily_revenue(
+    trades: list,
+    *,
+    today_unrealized: float = 0.0,
+    today: date | datetime | None = None,
+) -> dict:
+    """Aggregate realised P&L by UTC calendar day from closed trades.
+
+    ``trades`` are objects (or dicts) with ``pnl`` and ``closed_at`` (or
+    ``created_at`` fallback). Days with no closes are omitted. ``today``
+    (UTC) gets ``today_unrealized`` added as ``open_mark`` so the current
+    day can show mark-to-market on open positions.
+    """
+    by_day: dict[str, list[float]] = defaultdict(list)
+    for t in trades:
+        if isinstance(t, dict):
+            pnl = t.get("pnl")
+            closed = t.get("closed_at") or t.get("created_at")
+        else:
+            pnl = getattr(t, "pnl", None)
+            closed = getattr(t, "closed_at", None) or getattr(t, "created_at", None)
+        if pnl is None or closed is None:
+            continue
+        if hasattr(closed, "date"):
+            day = closed.date().isoformat()
+        else:
+            day = str(closed)[:10]
+        by_day[day].append(float(pnl))
+
+    if isinstance(today, datetime):
+        today_key = today.date().isoformat()
+    elif isinstance(today, date):
+        today_key = today.isoformat()
+    else:
+        today_key = utcnow().date().isoformat()
+
+    days = sorted(by_day.keys())
+    if today_unrealized and today_key not in by_day:
+        days.append(today_key)
+
+    rows: list[dict] = []
+    cumulative = 0.0
+    best: dict | None = None
+    worst: dict | None = None
+    for day in days:
+        pnls = by_day.get(day, [])
+        realised = round(sum(pnls), 2)
+        open_mark = round(today_unrealized, 2) if day == today_key else 0.0
+        total = round(realised + open_mark, 2)
+        cumulative = round(cumulative + total, 2)
+        wins = sum(1 for p in pnls if p > 0)
+        losses = sum(1 for p in pnls if p < 0)
+        row = {
+            "date": day,
+            "trades": len(pnls),
+            "wins": wins,
+            "losses": losses,
+            "realised_pnl": realised,
+            "open_mark": open_mark,
+            "total_pnl": total,
+            "cumulative_pnl": cumulative,
+            "is_today": day == today_key,
+        }
+        rows.append(row)
+        if best is None or total > best["total_pnl"]:
+            best = row
+        if worst is None or total < worst["total_pnl"]:
+            worst = row
+
+    return {
+        "days": rows,
+        "summary": {
+            "days": len(rows),
+            "trades": sum(r["trades"] for r in rows),
+            "realised_pnl": round(sum(r["realised_pnl"] for r in rows), 2),
+            "total_pnl": round(sum(r["total_pnl"] for r in rows), 2),
+            "winning_days": sum(1 for r in rows if r["total_pnl"] > 0),
+            "losing_days": sum(1 for r in rows if r["total_pnl"] < 0),
+            "best_day": best,
+            "worst_day": worst,
+        },
+    }

@@ -23,6 +23,7 @@ uv.lock.bak
 # Data / artifacts
 data/*.db
 data/*.sqlite
+data/autotrade.json
 data/backtests/
 data/nightly/
 data/history/*.csv

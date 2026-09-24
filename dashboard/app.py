@@ -31,7 +31,8 @@ from core.active_params import (
     strategy_by_window,
     strategy_payload,
 )
-from core.analytics import performance_metrics, summarize
+from core.analytics import daily_revenue, performance_metrics, summarize
+from core.autotrade_state import load_state, save_state, should_autostart, start_kwargs
 from core.backtest import (
     DEFAULT_ORB_GRID,
     BacktestParams,
@@ -285,6 +286,19 @@ class AutoTrader:
             cfg, found = resolve_trading_config(self.symbol, w, self._db)
             payload = strategy_payload(cfg, found)
             self._add_log(f"{w.value}: {format_strategy(payload)}", "start")
+        try:
+            save_state(
+                {
+                    "enabled": True,
+                    "symbol": self.symbol,
+                    "window": self.window,
+                    "demo": self.demo,
+                    "interval": self.interval,
+                    "target_r": self.target_r,
+                }
+            )
+        except OSError as exc:
+            _log.warning("could not persist autotrade state: %s", exc)
         self._task = asyncio.create_task(self._loop())
         return {"ok": True, **self.status()}
 
@@ -298,6 +312,19 @@ class AutoTrader:
                 pass
             self._task = None
         self._add_log("Auto-trading stopped.", "stop")
+        try:
+            save_state(
+                {
+                    "enabled": False,
+                    "symbol": self.symbol,
+                    "window": self.window,
+                    "demo": self.demo,
+                    "interval": self.interval,
+                    "target_r": self.target_r,
+                }
+            )
+        except OSError as exc:
+            _log.warning("could not persist autotrade stop: %s", exc)
         return {"ok": True, **self.status()}
 
     async def _loop(self) -> None:
@@ -603,6 +630,31 @@ async def api_performance(_request: Request) -> JSONResponse:
             "by_strategy": by_strategy,
         }
     )
+
+
+async def api_revenue_daily(_request: Request) -> JSONResponse:
+    """Realised P&L grouped by UTC calendar day (revenue tracker)."""
+    settings = get_settings()
+    closed = _db.query_trades(status=TradeStatus.CLOSED, limit=100000)
+    closed_sorted = sorted(
+        [t for t in closed if t.pnl is not None],
+        key=lambda t: (t.closed_at or t.created_at),
+    )
+    opens = _db.query_trades(status=TradeStatus.OPEN, environment="PAPER", limit=1000)
+    spots = await _spot_by_symbol({t.symbol for t in opens})
+    paper = paper_account_snapshot(
+        _db,
+        spots,
+        starting_capital=settings.starting_capital,
+        environment=settings.trading_environment(),
+    )
+    payload = daily_revenue(
+        closed_sorted,
+        today_unrealized=float(paper.get("open_unrealized_pnl") or 0.0),
+    )
+    payload["currency"] = settings.account_currency
+    payload["starting_capital"] = settings.starting_capital
+    return JSONResponse(payload)
 
 
 async def api_positions(_request: Request) -> JSONResponse:
@@ -956,6 +1008,7 @@ routes = [
     Route("/api/summary", api_summary),
     Route("/api/trades", api_trades),
     Route("/api/performance", api_performance),
+    Route("/api/revenue/daily", api_revenue_daily),
     Route("/api/positions", api_positions),
     Route("/api/signals", api_signals),
     Route("/api/ticker", api_ticker),
@@ -971,10 +1024,31 @@ routes = [
 ]
 
 
+def _resume_autotrade_if_needed() -> None:
+    """Start the paper auto-trader when last intent (or env) says keep running."""
+    state = load_state()
+    if not should_autostart(state):
+        return
+    kwargs = start_kwargs(state)
+    result = _autotrader.start(**kwargs)
+    if result.get("ok"):
+        _autotrader._add_log("Resumed auto-trading after dashboard restart.", "start")
+        _log.info(
+            "autotrade resumed: %s / %s every %.0fs",
+            kwargs["symbol"],
+            kwargs["window"],
+            kwargs["interval"],
+        )
+    else:
+        _log.warning("autotrade resume skipped: %s", result.get("error"))
+
+
 @asynccontextmanager
 async def _lifespan(_app: Starlette):
     task = asyncio.create_task(_session_exit_loop(), name="orb-session-exits")
     try:
+        # After the event loop is running so create_task in start() is valid.
+        _resume_autotrade_if_needed()
         yield
     finally:
         task.cancel()

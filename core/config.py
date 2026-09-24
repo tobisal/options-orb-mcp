@@ -72,6 +72,16 @@ class Settings(BaseSettings):
     # --- Storage -----------------------------------------------------------
     db_path: str = Field(default="data/trades.db", alias="DB_PATH")
 
+    # --- Auto-trade resume -------------------------------------------------
+    # When true, dashboard always starts the paper auto-trader on boot (even if
+    # it was stopped before the last restart). Otherwise it resumes only when
+    # the last Start left enabled=true in data/autotrade.json.
+    auto_trade_autostart: bool = Field(default=False, alias="AUTO_TRADE_AUTOSTART")
+    auto_trade_symbol: str | None = Field(default=None, alias="AUTO_TRADE_SYMBOL")
+    auto_trade_window: str | None = Field(default=None, alias="AUTO_TRADE_WINDOW")
+    auto_trade_interval: float | None = Field(default=None, alias="AUTO_TRADE_INTERVAL")
+    auto_trade_demo: bool | None = Field(default=None, alias="AUTO_TRADE_DEMO")
+
     # --- Dashboard bind ----------------------------------------------------
     # Local default is loopback. Docker sets DASHBOARD_HOST=0.0.0.0.
     dashboard_host: str = Field(default="127.0.0.1", alias="DASHBOARD_HOST")

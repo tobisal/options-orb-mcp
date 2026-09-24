@@ -7,15 +7,16 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 probe() {
+  # Use clientId 117 for the probe so we never steal dashboard's IBKR_CLIENT_ID (17).
   docker run --rm --network container:orb-ib-gateway \
     -e IBKR_HOST=127.0.0.1 -e IBKR_PORT=4002 -e ACCOUNT_MODE=paper \
-    -e IBKR_CLIENT_ID=17 \
+    -e IBKR_CLIENT_ID=117 \
     options-orb-mcp:latest python -c "
 import asyncio
 from ib_async import IB
 async def main():
     ib = IB()
-    await ib.connectAsync('127.0.0.1', 4002, clientId=17, readonly=True, timeout=12)
+    await ib.connectAsync('127.0.0.1', 4002, clientId=117, readonly=True, timeout=12)
     print('API OK')
     ib.disconnect()
 asyncio.run(main())

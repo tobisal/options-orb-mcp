@@ -35,7 +35,8 @@ def _probe() -> tuple[bool, str]:
         return False, f"import failed: {exc}"
 
     async def _run() -> None:
-        async with IBKRClient(readonly=True) as ib:
+        # Dedicated probe id — must not collide with dashboard IBKR_CLIENT_ID (17).
+        async with IBKRClient(readonly=True, client_id=117) as ib:
             if not ib.is_connected():
                 raise IBKRUnavailable("connected flag false")
 

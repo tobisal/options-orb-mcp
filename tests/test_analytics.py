@@ -35,3 +35,42 @@ def test_empty_metrics():
     m = performance_metrics([])
     assert m.trades == 0
     assert m.expectancy == 0
+
+
+def test_daily_revenue_groups_by_utc_day():
+    from datetime import datetime
+
+    from core.analytics import daily_revenue
+
+    trades = [
+        {"pnl": 10.0, "closed_at": datetime(2026, 9, 1, 10, 0)},
+        {"pnl": -4.0, "closed_at": datetime(2026, 9, 1, 15, 0)},
+        {"pnl": 7.0, "closed_at": datetime(2026, 9, 2, 12, 0)},
+    ]
+    out = daily_revenue(trades, today_unrealized=0.0, today=datetime(2026, 9, 2))
+    assert len(out["days"]) == 2
+    assert out["days"][0]["date"] == "2026-09-01"
+    assert out["days"][0]["realised_pnl"] == 6.0
+    assert out["days"][0]["trades"] == 2
+    assert out["days"][1]["date"] == "2026-09-02"
+    assert out["days"][1]["total_pnl"] == 7.0
+    assert out["days"][1]["cumulative_pnl"] == 13.0
+    assert out["summary"]["winning_days"] == 2
+    assert out["summary"]["best_day"]["date"] == "2026-09-02"
+
+
+def test_daily_revenue_includes_today_open_mark():
+    from datetime import datetime
+
+    from core.analytics import daily_revenue
+
+    out = daily_revenue(
+        [],
+        today_unrealized=3.5,
+        today=datetime(2026, 9, 10, 8, 0),
+    )
+    assert len(out["days"]) == 1
+    assert out["days"][0]["date"] == "2026-09-10"
+    assert out["days"][0]["open_mark"] == 3.5
+    assert out["days"][0]["total_pnl"] == 3.5
+    assert out["days"][0]["is_today"] is True

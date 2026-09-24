@@ -120,9 +120,15 @@ crontab -e
 */5 * * * * /home/ubuntu/options-orb-mcp/scripts/ibkr_watchdog.sh >>/home/ubuntu/orb-watchdog.log 2>&1
 ```
 
-It probes `127.0.0.1:4002` (readonly, clientId 17). On failure it kicks socat
-inside `orb-ib-gateway` and restarts only the dashboard container so the UI
-keeps its port and Discord keeps working.
+It probes `127.0.0.1:4002` (readonly, **clientId 117** so it does not steal
+the dashboard's client **17**). On failure it kicks socat inside `orb-ib-gateway`
+and restarts only the dashboard container so the UI keeps its port and Discord
+keeps working.
+
+Paper auto-trade persists its Start intent in `data/autotrade.json`. After the
+watchdog restarts the dashboard, the loop starts again without a manual click.
+Set `AUTO_TRADE_AUTOSTART=1` in `.env` if you want it to start on every boot
+even after an explicit Stop.
 
 ## Troubleshooting
 

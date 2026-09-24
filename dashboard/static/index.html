@@ -163,6 +163,14 @@
     <div class="empty" id="equityEmpty" style="display:none">No closed trades yet.</div>
   </div>
 
+  <div class="panel" id="revenue">
+    <h2>Revenue per day <span class="hint">realised P&amp;L by UTC calendar day &middot; today includes open mark</span></h2>
+    <div class="grid cards" id="revenueCards" style="margin-bottom:14px"></div>
+    <canvas id="revenueChart" height="90"></canvas>
+    <div class="empty" id="revenueEmpty" style="display:none">No closed trades yet.</div>
+    <div id="revenueTable" style="margin-top:14px;overflow-x:auto"></div>
+  </div>
+
   <div class="panel">
     <h2>Live signals <span class="hint">current ORB read per session window &middot; times GMT</span></h2>
     <div class="toolbar" style="margin-bottom:14px">
@@ -248,6 +256,7 @@
 <script>
 let CCY = "GBP";
 let equityChart = null;
+let revenueChart = null;
 let tickerChart = null;
 
 const fmt = (n) => (n === null || n === undefined) ? "-" : new Intl.NumberFormat("en-GB", {maximumFractionDigits: 2}).format(n);
@@ -465,6 +474,85 @@ async function loadPerformance() {
   }
   document.getElementById("byWindow").innerHTML = metricsTable(p.by_window);
   document.getElementById("byStrategy").innerHTML = metricsTable(p.by_strategy);
+}
+
+async function loadRevenue() {
+  const d = await getJSON("/api/revenue/daily");
+  if (!d || d.error) return;
+  const days = d.days || [];
+  const s = d.summary || {};
+  const cards = [
+    { label: "Total realised", value: sign(s.realised_pnl), cls: cls(s.realised_pnl || 0), sub: (s.trades || 0) + " closed trades" },
+    { label: "Winning days", value: (s.winning_days || 0) + " / " + (s.days || 0), cls: "pos", sub: (s.losing_days || 0) + " losing" },
+    { label: "Best day", value: s.best_day ? sign(s.best_day.total_pnl) : "-", cls: "pos", sub: s.best_day ? s.best_day.date : "" },
+    { label: "Worst day", value: s.worst_day ? sign(s.worst_day.total_pnl) : "-", cls: "neg", sub: s.worst_day ? s.worst_day.date : "" },
+  ];
+  document.getElementById("revenueCards").innerHTML = cards.map(c => `
+    <div class="card">
+      <div class="label">${c.label}</div>
+      <div class="value small ${c.cls || ""}">${c.value}</div>
+      <div class="label" style="text-transform:none;margin-top:6px">${c.sub || ""}</div>
+    </div>`).join("");
+
+  const empty = document.getElementById("revenueEmpty");
+  const canvas = document.getElementById("revenueChart");
+  if (!days.length) {
+    empty.style.display = "block";
+    canvas.style.display = "none";
+    document.getElementById("revenueTable").innerHTML = "";
+    return;
+  }
+  empty.style.display = "none";
+  canvas.style.display = "block";
+  const labels = days.map(r => r.date.slice(5));
+  const data = days.map(r => r.total_pnl);
+  const colors = data.map(v => v >= 0 ? "rgba(63,185,80,.75)" : "rgba(248,81,73,.75)");
+  if (typeof Chart !== "undefined") {
+    if (revenueChart) {
+      revenueChart.data.labels = labels;
+      revenueChart.data.datasets[0].data = data;
+      revenueChart.data.datasets[0].backgroundColor = colors;
+      revenueChart.update();
+    } else {
+      revenueChart = new Chart(canvas, {
+        type: "bar",
+        data: {
+          labels,
+          datasets: [{
+            label: "Daily P&L",
+            data,
+            backgroundColor: colors,
+            borderWidth: 0,
+          }],
+        },
+        options: {
+          plugins: { legend: { display: false } },
+          scales: {
+            x: { ticks: { color: "#8b98a9", maxRotation: 0, maxTicksLimit: 14 }, grid: { color: "#243044" } },
+            y: { ticks: { color: "#8b98a9" }, grid: { color: "#243044" } },
+          },
+        },
+      });
+    }
+  }
+
+  const rows = [...days].reverse().map(r => `<tr class="${r.is_today ? "best-row" : ""}">
+    <td>${r.date}${r.is_today ? " · today" : ""}</td>
+    <td>${r.trades}</td>
+    <td>${r.wins} / ${r.losses}</td>
+    <td class="${cls(r.realised_pnl)}">${sign(r.realised_pnl)}</td>
+    <td class="${r.open_mark ? cls(r.open_mark) : "mut"}">${r.open_mark ? sign(r.open_mark) : "-"}</td>
+    <td class="${cls(r.total_pnl)}">${sign(r.total_pnl)}</td>
+    <td class="${cls(r.cumulative_pnl)}">${sign(r.cumulative_pnl)}</td>
+  </tr>`).join("");
+  document.getElementById("revenueTable").innerHTML = `
+    <table>
+      <thead><tr>
+        <th>Date (UTC)</th><th>Trades</th><th>W / L</th>
+        <th>Realised</th><th>Open mark</th><th>Day total</th><th>Cumulative</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
 }
 
 function metricsTable(obj) {
@@ -858,6 +946,7 @@ async function refreshAll() {
   await Promise.allSettled([
     loadSummary(),
     loadPerformance(),
+    loadRevenue(),
     loadPositions(),
     loadTrades(),
     loadAuto(),
