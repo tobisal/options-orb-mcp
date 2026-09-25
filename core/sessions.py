@@ -28,6 +28,9 @@ _STRATEGY_FIELDS = (
     "use_trailing_stop",
     "trail_activate_r",
     "trail_distance_r",
+    "require_vwap_align",
+    "require_trend_regime",
+    "volume_confirm_mult",
 )
 
 EASTERN = pytz.timezone("US/Eastern")
@@ -45,9 +48,12 @@ class WindowConfig:
     min_strength: float
     target_r: float
     stop_r: float
-    use_trailing_stop: bool = False
+    use_trailing_stop: bool = True
     trail_activate_r: float = 0.5
     trail_distance_r: float = 0.3
+    require_vwap_align: bool = False
+    require_trend_regime: bool = False
+    volume_confirm_mult: float = 0.0
 
     @property
     def wraps_midnight(self) -> bool:
@@ -103,9 +109,12 @@ def load_window_configs() -> dict[SessionWindow, WindowConfig]:
             min_strength=float(cfg["min_strength"]),
             target_r=float(cfg["target_r"]),
             stop_r=float(cfg["stop_r"]),
-            use_trailing_stop=bool(cfg.get("use_trailing_stop", False)),
+            use_trailing_stop=bool(cfg.get("use_trailing_stop", True)),
             trail_activate_r=float(cfg.get("trail_activate_r", 0.5)),
             trail_distance_r=float(cfg.get("trail_distance_r", 0.3)),
+            require_vwap_align=bool(cfg.get("require_vwap_align", False)),
+            require_trend_regime=bool(cfg.get("require_trend_regime", False)),
+            volume_confirm_mult=float(cfg.get("volume_confirm_mult", 0.0)),
         )
     return configs
 

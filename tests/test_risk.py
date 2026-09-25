@@ -14,6 +14,8 @@ def _settings(capital=1000.0, risk=0.05) -> Settings:
     s.max_open_positions_per_window = 3
     s.account_mode = AccountMode.PAPER
     s.live_trading_confirm = ""
+    # Isolate unit tests from the overnight hunter playbook.
+    s.weekly_hunter_enabled = False
     return s
 
 
@@ -134,3 +136,32 @@ def test_open_risk_uses_current_stop(tmp_path):
     )
     trade2 = rm.db.get_trade(tid)
     assert rm.open_risk_acct(trade2) == 0.0
+
+
+def test_equity_grows_risk_budget_and_size(tmp_path):
+    """10% of equity: after +£1000 realised, budget and contracts double."""
+    rm = _rm(tmp_path, capital=1000.0, risk=0.10)
+    assert rm.current_equity() == pytest.approx(1000.0)
+    assert rm.risk_budget_per_trade() == pytest.approx(100.0)
+    assert rm.size_position(50.0) == 2
+
+    rm.db.insert_trade(
+        TradeRecord(
+            environment="PAPER",
+            symbol="SPY",
+            window=SessionWindow.NEW_YORK,
+            regime=Regime.TREND,
+            spread_type=SpreadType.BULL_CALL,
+            direction=Direction.LONG,
+            contracts=1,
+            entry_price=1.0,
+            max_loss=40.0,
+            max_profit=60.0,
+            target_r=1.0,
+            status=TradeStatus.CLOSED,
+            pnl=1000.0,
+        )
+    )
+    assert rm.current_equity() == pytest.approx(2000.0)
+    assert rm.risk_budget_per_trade() == pytest.approx(200.0)
+    assert rm.size_position(50.0) == 4

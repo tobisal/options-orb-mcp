@@ -68,6 +68,15 @@ class Settings(BaseSettings):
     # --- Strategy defaults -------------------------------------------------
     default_symbol: str = Field(default="SPY", alias="DEFAULT_SYMBOL")
     default_target_r: float = Field(default=1.5, alias="DEFAULT_TARGET_R")
+    # auto = overnight (near close) then power-hour / tokyo / ORB by window.
+    # overnight | orb | power_hour_gamma | tokyo_range | multi_pack force one model.
+    entry_strategy: str = Field(default="overnight", alias="ENTRY_STRATEGY")
+    power_hour_gamma_enabled: bool = Field(default=True, alias="POWER_HOUR_GAMMA_ENABLED")
+    tokyo_range_enabled: bool = Field(default=True, alias="TOKYO_RANGE_ENABLED")
+    overnight_enabled: bool = Field(default=True, alias="OVERNIGHT_ENABLED")
+    # Aspirational ~5%/week stack (configs/weekly_hunter.json). Raises risk and
+    # filters trade days when on.
+    weekly_hunter_enabled: bool = Field(default=True, alias="WEEKLY_HUNTER_ENABLED")
 
     # --- Storage -----------------------------------------------------------
     db_path: str = Field(default="data/trades.db", alias="DB_PATH")

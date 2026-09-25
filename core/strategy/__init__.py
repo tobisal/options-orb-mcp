@@ -1,1 +1,1 @@
-"""Strategy layer: ORB signal generation and defined-risk spread construction."""
+"""Strategy layer: ORB, power-hour gamma, Tokyo range, and spread construction."""

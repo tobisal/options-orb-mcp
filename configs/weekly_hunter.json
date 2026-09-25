@@ -1,0 +1,20 @@
+{
+  "_comment": "Non-ORB overnight long. Risk = 10% of current equity (grows with account). contracts_scale=2 is the floor at starting capital and scales up as equity grows.",
+  "enabled": true,
+  "weekly_return_target": 0.05,
+  "trade_weekdays": ["mon", "wed", "fri"],
+  "symbols": ["SPY", "QQQ"],
+  "contracts_scale": 2,
+  "base_risk_per_trade": 0.10,
+  "max_risk_per_trade": 0.10,
+  "max_daily_loss": 0.12,
+  "after_target_risk_scale": 0.5,
+  "max_behind_boost": 1.0,
+  "use_overnight": true,
+  "enable_power_hour": false,
+  "enable_tokyo_range": false,
+  "enable_orb_filters": false,
+  "use_multi_pack": false,
+  "new_york_params": null,
+  "london_params": null
+}

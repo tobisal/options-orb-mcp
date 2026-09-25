@@ -31,6 +31,22 @@ from core.ops_log import emit as ops_emit
 from core.risk import RiskManager
 from core.sessions import active_window, bars_in_window, get_window_config
 from core.strategy.orb import compute_orb_signal
+from core.strategy.overnight import (
+    compute_overnight_signal,
+    load_overnight_config,
+    overnight_entry_window_active,
+)
+from core.strategy.power_hour_gamma import (
+    compute_power_hour_signal,
+    load_power_hour_config,
+    power_hour_active_now,
+)
+from core.strategy.tokyo_range import (
+    compute_tokyo_range_signal,
+    load_tokyo_range_config,
+    tokyo_entry_window_active,
+)
+from core.strategy.multi_pack import MultiPackConfig, compute_multi_pack_signal
 from core.strategy.spreads import build_spread, per_contract_max_loss
 from core.timeutils import utcnow
 from core.trail import plan_uses_trailing, risk_share_from_plan
@@ -61,12 +77,18 @@ async def build_trade_plan(
     target_r: float | None = None,
     synthetic_seed: int = 42,
     db: Database | None = None,
+    entry_strategy: str | None = None,
 ) -> dict[str, Any]:
-    """Signal -> option chain -> spread -> risk sizing. Places no order."""
+    """Signal -> option chain -> spread -> risk sizing. Places no order.
+
+    ``entry_strategy``: ``auto`` / ``overnight`` / ``orb`` / ``tokyo_range`` /
+    ``power_hour_gamma`` / ``multi_pack``.
+    """
     win = resolve_window(window)
     db = db or Database()
     cfg, opt_run = resolve_trading_config(symbol, win, db)
-    target_r = target_r if target_r is not None else cfg.target_r
+    settings = get_settings()
+    mode = (entry_strategy or settings.entry_strategy or "auto").lower().strip()
     strategy = strategy_payload(cfg, opt_run)
 
     try:
@@ -77,25 +99,232 @@ async def build_trade_plan(
     except IBKRUnavailable as exc:
         return {"ok": False, "error": str(exc), "hint": "Pass use_synthetic=true for a demo."}
 
-    signal = compute_orb_signal(symbol, win, bars, cfg)
-    if not signal.breakout:
-        if signal.range_high <= 0 and signal.range_low <= 0:
+    ph_cfg = load_power_hour_config(symbol)
+    tk_cfg = load_tokyo_range_config(symbol)
+    on_cfg = load_overnight_config()
+    try:
+        from core.weekly_hunter import load_weekly_hunter_config
+
+        wh = load_weekly_hunter_config()
+        wh_on = settings.weekly_hunter_enabled and wh.enabled
+        use_multi = bool(getattr(wh, "use_multi_pack", False)) if wh_on else False
+        use_overnight = bool(getattr(wh, "use_overnight", False)) if wh_on else False
+    except Exception:
+        wh_on, wh, use_multi, use_overnight = False, None, False, False
+
+    if mode == "multi_pack":
+        use_multi = True
+    if mode == "overnight":
+        use_overnight = True
+
+    # Overnight-only playbook: never fall through to ORB / multi_pack.
+    overnight_only = use_overnight and mode in ("auto", "overnight")
+
+    signal = None
+    entry_model = "orb"
+    stop_r = cfg.stop_r
+    resolved_target_r = target_r if target_r is not None else cfg.target_r
+    range_width = 0.0
+    pack_cfg = MultiPackConfig()
+
+    use_on = (
+        signal is None
+        and mode in ("auto", "overnight")
+        and settings.overnight_enabled
+        and on_cfg.enabled
+        and (overnight_only or overnight_entry_window_active(cfg=on_cfg) or mode == "overnight")
+    )
+    in_overnight = overnight_entry_window_active(cfg=on_cfg)
+    if use_on and (mode == "overnight" or overnight_only or in_overnight):
+        on_signal = compute_overnight_signal(symbol, bars, cfg=on_cfg)
+        if on_signal.breakout:
+            signal = on_signal
+            entry_model = "overnight"
+            resolved_target_r = on_cfg.target_r if target_r is None else target_r
+            stop_r = on_cfg.stop_r
+            win = SessionWindow.NEW_YORK
+        elif mode == "overnight" or overnight_only or in_overnight:
+            return {
+                "ok": False,
+                "reason": on_signal.notes or "overnight idle",
+                "signal": on_signal.model_dump(mode="json"),
+                "data_source": source,
+                "strategy": {**strategy, "entry_model": "overnight"},
+            }
+
+    if overnight_only:
+        # Already handled (or returned idle). Do not try ORB / packs.
+        if signal is None:
+            return {
+                "ok": False,
+                "reason": "overnight playbook: no entry outside 15:45-16:00 ET",
+                "signal": None,
+                "data_source": source,
+                "strategy": {**strategy, "entry_model": "overnight"},
+            }
+    elif use_multi and mode in ("auto", "multi_pack"):
+        mp = compute_multi_pack_signal(symbol, bars, cfg=pack_cfg)
+        if mp.breakout:
+            signal = mp
+            entry_model = "multi_pack"
+            resolved_target_r = pack_cfg.target_r if target_r is None else target_r
+            stop_r = pack_cfg.stop_r
+            win = SessionWindow.NEW_YORK
+        elif mode == "multi_pack":
+            return {
+                "ok": False,
+                "reason": mp.notes or "multi_pack idle",
+                "signal": mp.model_dump(mode="json"),
+                "data_source": source,
+                "strategy": {**strategy, "entry_model": "multi_pack"},
+            }
+
+    use_ph = (
+        signal is None
+        and not overnight_only
+        and mode in ("auto", "power_hour_gamma")
+        and settings.power_hour_gamma_enabled
+        and ph_cfg.enabled
+        and (not wh_on or wh.enable_power_hour)
+        and not use_multi  # multi_pack already includes power-hour leg
+    )
+    in_power_hour = power_hour_active_now(cfg=ph_cfg)
+    if use_ph and (mode == "power_hour_gamma" or in_power_hour):
+        ph_signal = compute_power_hour_signal(symbol, bars, cfg=ph_cfg, window=win)
+        if ph_signal.breakout:
+            signal = ph_signal
+            entry_model = "power_hour_gamma"
+            resolved_target_r = ph_cfg.target_r if target_r is None else target_r
+            stop_r = ph_cfg.stop_r
+        elif mode == "power_hour_gamma" or in_power_hour:
+            return {
+                "ok": False,
+                "reason": ph_signal.notes or "No power-hour gamma entry yet.",
+                "signal": ph_signal.model_dump(mode="json"),
+                "data_source": source,
+                "strategy": {**strategy, "entry_model": "power_hour_gamma"},
+            }
+
+    use_tk = (
+        signal is None
+        and not overnight_only
+        and mode in ("auto", "tokyo_range")
+        and settings.tokyo_range_enabled
+        and tk_cfg.enabled
+        and (not wh_on or wh.enable_tokyo_range)
+    )
+    in_tokyo = tokyo_entry_window_active(cfg=tk_cfg)
+    if use_tk and (mode == "tokyo_range" or in_tokyo):
+        tk_signal = compute_tokyo_range_signal(symbol, bars, cfg=tk_cfg, window=SessionWindow.LONDON)
+        if tk_signal.breakout:
+            signal = tk_signal
+            entry_model = "tokyo_range"
+            # Un-buffered raw width for R maths.
+            range_width = max(
+                (tk_signal.range_high - tk_cfg.buffer) - (tk_signal.range_low + tk_cfg.buffer),
+                1e-9,
+            )
+            resolved_target_r = tk_cfg.target_r(range_width) if target_r is None else target_r
+            stop_r = tk_cfg.stop_r(range_width)
+            win = SessionWindow.LONDON
+        elif mode == "tokyo_range" or in_tokyo:
+            return {
+                "ok": False,
+                "reason": tk_signal.notes or "No Tokyo range breakout yet.",
+                "signal": tk_signal.model_dump(mode="json"),
+                "data_source": source,
+                "strategy": {**strategy, "entry_model": "tokyo_range"},
+            }
+
+    if signal is None and not overnight_only and mode in ("auto", "orb"):
+        signal = compute_orb_signal(symbol, win, bars, cfg)
+        entry_model = "orb"
+        resolved_target_r = target_r if target_r is not None else cfg.target_r
+        stop_r = cfg.stop_r
+
+    if signal is None or not signal.breakout:
+        if signal is None:
+            reason = f"Entry strategy '{mode}' produced no signal."
+            sig_dump = None
+        elif signal.range_high <= 0 and signal.range_low <= 0:
             reason = (
                 f"No opening-range bars for {win.value} "
                 f"(as of {signal.as_of}). Waiting for session data."
             )
+            sig_dump = signal.model_dump(mode="json")
         else:
             reason = (
                 f"No breakout in {win.value}: last {signal.last_price:.2f} "
                 f"inside OR [{signal.range_low:.2f}, {signal.range_high:.2f}] "
                 f"(need close beyond the range + buffer)."
             )
+            sig_dump = signal.model_dump(mode="json")
         return {
             "ok": False,
             "reason": reason,
-            "signal": signal.model_dump(mode="json"),
+            "signal": sig_dump,
             "data_source": source,
-            "strategy": strategy,
+            "strategy": {**strategy, "entry_model": entry_model},
+        }
+
+    strategy = {**strategy, "entry_model": entry_model}
+    # Trailing is on for every entry model (window defaults + global kill-switch).
+    use_trail = cfg.use_trailing_stop
+    trail_act = cfg.trail_activate_r
+    trail_dist = cfg.trail_distance_r
+    if entry_model == "overnight":
+        use_trail = on_cfg.use_trailing_stop
+        trail_act = on_cfg.trail_activate_r
+        trail_dist = on_cfg.trail_distance_r
+        strategy = {
+            **strategy,
+            "entry_after_et": on_cfg.entry_after_et.strftime("%H:%M"),
+            "flatten_after_et": on_cfg.flatten_after_et.strftime("%H:%M"),
+            "target_r": resolved_target_r,
+            "stop_r": stop_r,
+            "use_trailing_stop": use_trail,
+            "trail_activate_r": trail_act,
+            "trail_distance_r": trail_dist,
+        }
+    elif entry_model == "power_hour_gamma":
+        strategy = {
+            **strategy,
+            "break_points": ph_cfg.break_points,
+            "stop_points": ph_cfg.stop_points,
+            "target_points": ph_cfg.target_points,
+            "require_negative_gamma": ph_cfg.require_negative_gamma,
+            "use_trailing_stop": use_trail,
+            "trail_activate_r": trail_act,
+            "trail_distance_r": trail_dist,
+        }
+    elif entry_model == "tokyo_range":
+        strategy = {
+            **strategy,
+            "buffer": tk_cfg.buffer,
+            "target_range_mult": tk_cfg.target_range_mult,
+            "range_width": round(range_width, 4),
+            "entry_until_gmt": tk_cfg.entry_until_gmt.strftime("%H:%M"),
+            "flatten_gmt": tk_cfg.flatten_gmt.strftime("%H:%M"),
+            "use_trailing_stop": use_trail,
+            "trail_activate_r": trail_act,
+            "trail_distance_r": trail_dist,
+        }
+    elif entry_model == "multi_pack":
+        strategy = {
+            **strategy,
+            "pack": "gap_fade+orb_5m+power_hour",
+            "target_r": resolved_target_r,
+            "stop_r": stop_r,
+            "use_trailing_stop": use_trail,
+            "trail_activate_r": trail_act,
+            "trail_distance_r": trail_dist,
+        }
+    else:
+        strategy = {
+            **strategy,
+            "use_trailing_stop": use_trail,
+            "trail_activate_r": trail_act,
+            "trail_distance_r": trail_dist,
         }
 
     chain: dict[str, Any]
@@ -138,12 +367,12 @@ async def build_trade_plan(
         days_to_expiry=chain["days_to_expiry"],
         iv=chain["iv"],
         strikes=chain["strikes"],
-        target_r=target_r,
-        stop_r=cfg.stop_r,
+        target_r=resolved_target_r,
+        stop_r=stop_r,
         contracts=1,
-        use_trailing_stop=cfg.use_trailing_stop,
-        trail_activate_r=cfg.trail_activate_r,
-        trail_distance_r=cfg.trail_distance_r,
+        use_trailing_stop=use_trail,
+        trail_activate_r=trail_act,
+        trail_distance_r=trail_dist,
     )
     if preview_one is None:
         return {
@@ -168,12 +397,12 @@ async def build_trade_plan(
         days_to_expiry=chain["days_to_expiry"],
         iv=chain["iv"],
         strikes=chain["strikes"],
-        target_r=target_r,
-        stop_r=cfg.stop_r,
+        target_r=resolved_target_r,
+        stop_r=stop_r,
         contracts=max(decision.contracts, 0),
-        use_trailing_stop=cfg.use_trailing_stop,
-        trail_activate_r=cfg.trail_activate_r,
-        trail_distance_r=cfg.trail_distance_r,
+        use_trailing_stop=use_trail,
+        trail_activate_r=trail_act,
+        trail_distance_r=trail_dist,
     )
 
     return {
@@ -188,6 +417,7 @@ async def build_trade_plan(
         "tradeable": decision.approved,
         "strategy": strategy,
         "iv": chain["iv"],
+        "entry_model": entry_model,
     }
 
 
@@ -352,8 +582,9 @@ async def manage_open_ibkr_exits(
             )
             continue
 
-        # Only manage trails while the trade's session window is live.
-        if live is not trade.window:
+        # Trailing applies to every entry model; keep managing even when the
+        # trade's session window has ended (e.g. overnight hold into next day).
+        if live is not trade.window and not plan_uses_trailing(plan):
             continue
 
         new_plan, changed, just_activated = apply_trailing_to_trade(db, trade, mark)

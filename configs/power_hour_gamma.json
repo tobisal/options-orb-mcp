@@ -1,0 +1,29 @@
+{
+  "_comment": "Power-hour gamma breakout (etalon.capital reel DdpjuNKALLS). Nasdaq video defaults are 40/10/20 NQ points. ETF symbols use NQ-scaled prices (~NQ/QQQ ≈ 37). require_negative_gamma uses a pin/VWAP proxy when no GEX feed is wired.",
+  "enabled": true,
+  "anchor_time_et": "15:00",
+  "session_end_et": "16:00",
+  "break_points": 40.0,
+  "stop_points": 10.0,
+  "target_points": 20.0,
+  "require_negative_gamma": true,
+  "use_gamma_proxy": true,
+  "pin_pct": 0.004,
+  "symbols": {
+    "QQQ": {
+      "break_points": 1.1,
+      "stop_points": 0.28,
+      "target_points": 0.55
+    },
+    "SPY": {
+      "break_points": 1.0,
+      "stop_points": 0.25,
+      "target_points": 0.5
+    },
+    "IWM": {
+      "break_points": 0.9,
+      "stop_points": 0.22,
+      "target_points": 0.45
+    }
+  }
+}

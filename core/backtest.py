@@ -16,13 +16,14 @@ Assumptions:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import time
 from itertools import product
 
 from core.analytics import summarize
 from core.models import Bar, Direction, Regime, SessionWindow, SpreadType
 from core.pricing import vertical_spread_value
 from core.sessions import get_window_config, group_by_session, opening_range_of
-from core.strategy.orb import average_true_range
+from core.strategy.orb import average_true_range, classify_regime_bars, passes_entry_filters
 from core.strategy.spreads import CONTRACT_MULTIPLIER
 
 # Shared with the dashboard optimiser, MCP, and the nightly selector.
@@ -40,9 +41,12 @@ class BacktestParams:
     min_strength: float = 0.25
     target_r: float = 1.5
     stop_r: float = 1.0
-    use_trailing_stop: bool = False
+    use_trailing_stop: bool = True
     trail_activate_r: float = 0.5
     trail_distance_r: float = 0.3
+    require_vwap_align: bool = False
+    require_trend_regime: bool = False
+    volume_confirm_mult: float = 0.0
     iv: float = 0.25
     dte: int = 7
     strike_increment: float = 1.0
@@ -58,6 +62,9 @@ class BacktestParams:
             "use_trailing_stop": self.use_trailing_stop,
             "trail_activate_r": self.trail_activate_r,
             "trail_distance_r": self.trail_distance_r,
+            "require_vwap_align": self.require_vwap_align,
+            "require_trend_regime": self.require_trend_regime,
+            "volume_confirm_mult": self.volume_confirm_mult,
             "iv": self.iv,
             "dte": self.dte,
             "strike_increment": self.strike_increment,
@@ -83,20 +90,7 @@ class BacktestResult:
 
 
 def _efficiency_regime(bars: list[Bar]) -> Regime:
-    if len(bars) < 3:
-        return Regime.UNCERTAIN
-    net = abs(bars[-1].close - bars[0].open)
-    path = sum(abs(b.close - b.open) for b in bars) + sum(
-        abs(c.open - p.close) for p, c in zip(bars[:-1], bars[1:])
-    )
-    if path <= 0:
-        return Regime.UNCERTAIN
-    eff = net / path
-    if eff >= 0.4:
-        return Regime.TREND
-    if eff <= 0.2:
-        return Regime.RANGE
-    return Regime.UNCERTAIN
+    return classify_regime_bars(bars)
 
 
 def _round_to_increment(value: float, inc: float) -> float:
@@ -124,16 +118,34 @@ def run_backtest(
         entry_idx = None
         direction = Direction.NEUTRAL
         for i, b in enumerate(post):
+            candidate = Direction.NEUTRAL
+            strength = 0.0
             if b.close > range_high + buffer:
                 strength = (b.close - range_high) / width_range
                 if strength >= params.min_strength:
-                    entry_idx, direction = i, Direction.LONG
-                    break
+                    candidate = Direction.LONG
             elif b.close < range_low - buffer:
                 strength = (range_low - b.close) / width_range
                 if strength >= params.min_strength:
-                    entry_idx, direction = i, Direction.SHORT
-                    break
+                    candidate = Direction.SHORT
+            if candidate is Direction.NEUTRAL:
+                continue
+            regime = _efficiency_regime(post[: i + 1])
+            ok, _ = passes_entry_filters(
+                direction=candidate,
+                price=b.close,
+                vwap_bars=list(orb) + list(post[: i + 1]),
+                entry_bar=b,
+                orb_bars=orb,
+                regime=regime,
+                require_vwap_align=params.require_vwap_align,
+                require_trend_regime=params.require_trend_regime,
+                volume_confirm_mult=params.volume_confirm_mult,
+            )
+            if not ok:
+                continue
+            entry_idx, direction = i, candidate
+            break
         if entry_idx is None:
             continue
 
@@ -332,9 +344,11 @@ def walk_forward(
     grid: dict[str, list],
     *,
     folds: int = 3,
+    base: BacktestParams | None = None,
 ) -> dict:
     """Walk-forward: optimise on each in-sample fold, test on the next out-of-sample
     segment. Guards against curve-fitting by scoring on unseen data."""
+    base = base or BacktestParams()
     cfg = get_window_config(window)
     sessions = group_by_session(bars, cfg)
     if len(sessions) < folds + 1:
@@ -352,11 +366,11 @@ def walk_forward(
         is_bars = [b for _, sb in is_sessions for b in sb]
         oos_bars = [b for _, sb in oos_sessions for b in sb]
 
-        ranked = grid_search(is_bars, window, grid)
+        ranked = grid_search(is_bars, window, grid, base=base)
         best = ranked[0] if ranked else None
         if best is None:
             continue
-        best_params = BacktestParams(**{**BacktestParams().as_dict(), **best["params"]})
+        best_params = BacktestParams(**{**base.as_dict(), **best["params"]})
         oos = run_backtest(oos_bars, window, best_params).summary(include_monte_carlo=False)
         oos_pnls.extend([t["pnl"] for t in oos["trades"]])
         fold_reports.append(
@@ -380,3 +394,223 @@ def walk_forward(
             "If it is much worse than in-sample, the parameters are overfit."
         ),
     }
+
+
+def run_power_hour_backtest(
+    bars: list[Bar],
+    *,
+    symbol: str = "SPY",
+    require_negative_gamma: bool | None = None,
+) -> BacktestResult:
+    """Session-day power-hour gamma breakout backtest (New York cash close)."""
+    from dataclasses import replace
+
+    from core.strategy.power_hour_gamma import (
+        _rth_bars_for_day,
+        _to_et,
+        estimate_negative_gamma,
+        load_power_hour_config,
+    )
+
+    cfg = load_power_hour_config(symbol)
+    if require_negative_gamma is not None:
+        cfg = replace(cfg, require_negative_gamma=require_negative_gamma)
+
+    params = BacktestParams(
+        target_r=cfg.target_r,
+        stop_r=cfg.stop_r,
+        use_trailing_stop=True,
+        trail_activate_r=0.5,
+        trail_distance_r=0.3,
+    )
+    result = BacktestResult(window=SessionWindow.NEW_YORK, params=params)
+
+    days = sorted({_to_et(b.ts).date() for b in bars})
+    for day in days:
+        day_bars = _rth_bars_for_day(bars, day)
+        if len(day_bars) < 10:
+            continue
+        post = [b for b in day_bars if _to_et(b.ts).time() >= cfg.anchor_time_et]
+        if len(post) < 2:
+            continue
+        anchor_bar = post[0]
+        anchor = anchor_bar.open
+        bars_to_anchor = [b for b in day_bars if b.ts <= anchor_bar.ts]
+        neg, _why = estimate_negative_gamma(
+            spot=anchor, day_bars=bars_to_anchor or day_bars, cfg=cfg
+        )
+        if cfg.require_negative_gamma and not neg:
+            continue
+
+        up = anchor + cfg.break_points
+        down = anchor - cfg.break_points
+        entry_idx = None
+        direction = Direction.NEUTRAL
+        for i, b in enumerate(post[1:], start=1):
+            if b.close >= up:
+                entry_idx, direction = i, Direction.LONG
+                break
+            if b.close <= down:
+                entry_idx, direction = i, Direction.SHORT
+                break
+        if entry_idx is None or entry_idx >= len(post) - 1:
+            continue
+
+        trade = _simulate_trade(
+            spot=post[entry_idx].close,
+            direction=direction,
+            regime=Regime.TREND,
+            forward_bars=post[entry_idx + 1 :],
+            params=params,
+        )
+        if trade is None:
+            continue
+        trade["session"] = day.isoformat()
+        trade["entry_model"] = "power_hour_gamma"
+        trade["anchor"] = round(anchor, 4)
+        result.pnls.append(trade["pnl"])
+        result.trades.append(trade)
+
+    return result
+
+
+def run_tokyo_range_backtest(
+    bars: list[Bar],
+    *,
+    symbol: str = "SPY",
+) -> BacktestResult:
+    """Tokyo 00:00-06:00 GMT range breakout with 09:00 cancel / 12:00 flatten."""
+    from core.strategy.tokyo_range import (
+        _bars_in_gmt_window,
+        _to_gmt,
+        load_tokyo_range_config,
+    )
+
+    cfg = load_tokyo_range_config(symbol)
+    result = BacktestResult(window=SessionWindow.LONDON, params=BacktestParams())
+    if not cfg.enabled:
+        return result
+
+    days = sorted({_to_gmt(b.ts).date() for b in bars})
+    for day in days:
+        range_bars = _bars_in_gmt_window(bars, day, cfg.range_start_gmt, cfg.range_end_gmt)
+        if len(range_bars) < 2:
+            continue
+        range_high = max(b.high for b in range_bars)
+        range_low = min(b.low for b in range_bars)
+        width = max(range_high - range_low, 1e-9)
+        up = range_high + cfg.buffer
+        down = range_low - cfg.buffer
+
+        post = [
+            b
+            for b in bars
+            if _to_gmt(b.ts).date() == day
+            and cfg.range_end_gmt <= _to_gmt(b.ts).time() < cfg.flatten_gmt
+        ]
+        if len(post) < 2:
+            continue
+
+        entry_idx = None
+        direction = Direction.NEUTRAL
+        for i, b in enumerate(post):
+            if _to_gmt(b.ts).time() >= cfg.entry_until_gmt:
+                break
+            if b.close >= up:
+                entry_idx, direction = i, Direction.LONG
+                break
+            if b.close <= down:
+                entry_idx, direction = i, Direction.SHORT
+                break
+        if entry_idx is None:
+            continue
+
+        forward = post[entry_idx + 1 :]
+        if not forward:
+            continue
+
+        params = BacktestParams(
+            target_r=cfg.target_r(width),
+            stop_r=cfg.stop_r(width),
+            use_trailing_stop=True,
+            trail_activate_r=0.5,
+            trail_distance_r=0.3,
+        )
+        trade = _simulate_trade(
+            spot=post[entry_idx].close,
+            direction=direction,
+            regime=Regime.TREND,
+            forward_bars=forward,
+            params=params,
+        )
+        if trade is None:
+            continue
+        trade["session"] = day.isoformat()
+        trade["entry_model"] = "tokyo_range"
+        trade["range_high"] = round(range_high, 4)
+        trade["range_low"] = round(range_low, 4)
+        result.params = params
+        result.pnls.append(trade["pnl"])
+        result.trades.append(trade)
+
+    return result
+
+
+def run_overnight_backtest(
+    bars: list[Bar],
+    *,
+    symbol: str = "SPY",
+    require_red_day: bool | None = None,
+) -> BacktestResult:
+    """Buy near cash close, hold overnight gap, flatten next morning (~10:30 ET)."""
+    from dataclasses import replace
+
+    from core.strategy.overnight import _rth_bars, _to_et, load_overnight_config
+
+    cfg = load_overnight_config()
+    if require_red_day is not None:
+        cfg = replace(cfg, require_red_day=require_red_day)
+
+    params = BacktestParams(
+        target_r=cfg.target_r,
+        stop_r=cfg.stop_r,
+        use_trailing_stop=cfg.use_trailing_stop,
+        trail_activate_r=cfg.trail_activate_r,
+        trail_distance_r=cfg.trail_distance_r,
+    )
+    result = BacktestResult(window=SessionWindow.NEW_YORK, params=params)
+    if not cfg.enabled:
+        return result
+
+    days = sorted({_to_et(b.ts).date() for b in bars})
+    for i in range(len(days) - 1):
+        day, nxt = days[i], days[i + 1]
+        day_bars = _rth_bars(bars, day)
+        next_bars = _rth_bars(bars, nxt)
+        if len(day_bars) < 5 or len(next_bars) < 4:
+            continue
+        if cfg.require_red_day and day_bars[-1].close >= day_bars[0].open:
+            continue
+
+        entry = day_bars[-1].close
+        # Match discovery: hold into next morning first ~hour.
+        forward = [b for b in next_bars if _to_et(b.ts).time() <= time(10, 30)]
+        if len(forward) < 2:
+            continue
+
+        trade = _simulate_trade(
+            spot=entry,
+            direction=Direction.LONG,
+            regime=Regime.TREND,
+            forward_bars=forward,
+            params=params,
+        )
+        if trade is None:
+            continue
+        trade["session"] = nxt.isoformat()
+        trade["entry_model"] = "overnight"
+        trade["entry_day"] = day.isoformat()
+        result.pnls.append(trade["pnl"])
+        result.trades.append(trade)
+
+    return result

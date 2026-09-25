@@ -1,0 +1,13 @@
+{
+  "_comment": "Non-ORB overnight long: enter after 15:45 ET, flatten next morning after 10:00 ET. Trailing on after +0.5R, distance 0.3R under peak.",
+  "enabled": true,
+  "entry_after_et": "15:45",
+  "session_end_et": "16:00",
+  "flatten_after_et": "10:00",
+  "require_red_day": false,
+  "target_r": 1.0,
+  "stop_r": 1.0,
+  "use_trailing_stop": true,
+  "trail_activate_r": 0.5,
+  "trail_distance_r": 0.3
+}

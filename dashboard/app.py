@@ -222,6 +222,8 @@ class AutoTrader:
         self._task: asyncio.Task | None = None
         self.running = False
         self.symbol = "SPY"
+        self.symbols: list[str] = ["SPY"]
+        self._symbol_idx = 0
         self.window = "auto"
         self.demo = False
         self.interval = 60.0
@@ -271,6 +273,18 @@ class AutoTrader:
                          "measure. Set ACCOUNT_MODE=paper to use it.",
             }
         self.symbol = (symbol or "SPY").upper()
+        # Weekly hunter may expand to SPY+QQQ.
+        try:
+            from core.weekly_hunter import load_weekly_hunter_config
+
+            wh = load_weekly_hunter_config()
+            if get_settings().weekly_hunter_enabled and wh.enabled and wh.symbols:
+                self.symbols = list(wh.symbols)
+            else:
+                self.symbols = [self.symbol]
+        except Exception:
+            self.symbols = [self.symbol]
+        self._symbol_idx = 0
         self.window = window or "auto"
         self.demo = demo
         self.interval = max(float(interval), self.MIN_INTERVAL)
@@ -349,6 +363,35 @@ class AutoTrader:
         self.last_cycle_at = utcnow().isoformat()
         seed = 100 + self.cycles if self.demo else 42
 
+        # Weekly hunter: MWF only + rotate symbols + status log.
+        try:
+            from core.weekly_hunter import (
+                is_trade_weekday,
+                load_weekly_hunter_config,
+                week_status,
+            )
+
+            wh = load_weekly_hunter_config()
+            if get_settings().weekly_hunter_enabled and wh.enabled:
+                if not is_trade_weekday(cfg=wh):
+                    self._add_log(
+                        f"Weekly hunter: skip {utcnow().strftime('%A')} (MWF only).",
+                        "muted",
+                    )
+                    return
+                st = week_status(self._db, wh)
+                if self.cycles == 1 or self.cycles % 5 == 0:
+                    self._add_log(
+                        f"Week P&L {st.week_pnl:+.2f} / target {st.target_pnl:.2f} "
+                        f"({st.notes}; risk {st.risk_fraction*100:.1f}%).",
+                        "info",
+                    )
+                if self.symbols:
+                    self.symbol = self.symbols[self._symbol_idx % len(self.symbols)]
+                    self._symbol_idx += 1
+        except Exception as exc:
+            self._add_log(f"Weekly hunter status error: {exc}", "warn")
+
         try:
             bars, _, _ = await fetch_bars_with_fallback(
                 self.symbol,
@@ -394,7 +437,7 @@ class AutoTrader:
 
         if not preview.get("ok"):
             reason = preview.get("reason") or preview.get("error") or "no trade"
-            self._add_log(f"No entry: {reason}", "muted")
+            self._add_log(f"No entry ({self.symbol}): {reason}", "muted")
             return
 
         win = resolve_window(cycle_window).value

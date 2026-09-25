@@ -4,6 +4,9 @@ and the paper/live safety gate.
 Every order the executor places must pass ``RiskManager.pre_trade_checks``.
 Sizing assumes **defined-risk** structures only (verticals), so the maximum
 loss of a position is known before entry.
+
+Risk budgets are fractions of **current equity** (starting capital + lifetime
+realised P&L), so position size grows as the account grows.
 """
 
 from __future__ import annotations
@@ -53,26 +56,77 @@ class RiskManager:
         if self.db is None:
             self.db = Database()
 
+    # --- equity ------------------------------------------------------------
+    def current_equity(self) -> float:
+        """Starting capital + lifetime realised P&L (account currency).
+
+        Open mark-to-market is omitted here so sizing does not depend on a
+        live spot feed; closed P&L still compounds size as the book grows.
+        Floor at a small positive amount so a drawdown cannot invert sizing.
+        """
+        assert self.db is not None
+        start = float(self.settings.starting_capital)
+        realised = float(self.db.realised_pnl(environment=self.environment()))
+        return max(start + realised, start * 0.05, 1.0)
+
     # --- budgets -----------------------------------------------------------
     def risk_budget_per_trade(self) -> float:
         """Account-currency amount permitted at risk on a single trade."""
-        return self.settings.starting_capital * self.settings.max_risk_per_trade
+        from core.weekly_hunter import load_weekly_hunter_config, week_status
+
+        equity = self.current_equity()
+        settings = self.settings
+        cfg = load_weekly_hunter_config()
+        if settings.weekly_hunter_enabled and cfg.enabled:
+            status = week_status(self.db, cfg)
+            return equity * status.risk_fraction
+        return equity * settings.max_risk_per_trade
 
     def daily_loss_limit(self) -> float:
-        return self.settings.starting_capital * self.settings.max_daily_loss
+        from core.weekly_hunter import load_weekly_hunter_config
+
+        equity = self.current_equity()
+        cfg = load_weekly_hunter_config()
+        if self.settings.weekly_hunter_enabled and cfg.enabled:
+            return equity * cfg.max_daily_loss
+        return equity * self.settings.max_daily_loss
 
     # --- sizing ------------------------------------------------------------
+    def _contracts_cap(self) -> int | None:
+        """Optional hunter contract ceiling that scales with equity.
+
+        At starting capital the cap equals ``contracts_scale`` (e.g. 2).
+        As equity doubles, the cap doubles, so size can grow with the account.
+        """
+        try:
+            from core.weekly_hunter import load_weekly_hunter_config
+
+            cfg = load_weekly_hunter_config()
+            if not (self.settings.weekly_hunter_enabled and cfg.enabled):
+                return None
+            start = max(float(self.settings.starting_capital), 1.0)
+            equity = self.current_equity()
+            return max(1, int(math.floor(cfg.contracts_scale * equity / start)))
+        except Exception:
+            return None
+
     def size_position(self, per_contract_max_loss_usd: float) -> int:
         """Number of contracts whose combined max loss fits the risk budget.
 
         ``per_contract_max_loss_usd`` is the USD max loss of one spread
         contract (already inclusive of the x100 multiplier).
+        When weekly hunter is on, contracts are capped at a ceiling that
+        scales with current equity (``contracts_scale`` at start capital).
         """
         if per_contract_max_loss_usd <= 0:
             return 0
         per_contract_acct = per_contract_max_loss_usd * self.acct_ccy_per_usd
         budget = self.risk_budget_per_trade()
-        return max(int(math.floor(budget / per_contract_acct)), 0)
+        n = max(int(math.floor(budget / per_contract_acct)), 0)
+        cap = self._contracts_cap()
+        if cap is not None:
+            n = min(n, cap)
+        return n
 
     def open_risk_acct(self, trade: TradeRecord) -> float:
         """Account-currency risk still on an open trade (current stop vs entry)."""
@@ -132,14 +186,15 @@ class RiskManager:
         if requested_contracts is not None:
             contracts = min(requested_contracts, max_contracts)
 
+        equity = self.current_equity()
         if per_contract_max_loss_usd <= 0:
             reasons.append("Per-contract max loss is non-positive; not a defined-risk spread.")
         if contracts <= 0 and per_contract_max_loss_usd > 0:
             single = per_contract_max_loss_usd * self.acct_ccy_per_usd
-            pct = single / self.settings.starting_capital * 100 if self.settings.starting_capital else 0
+            pct = single / equity * 100 if equity else 0
             reasons.append(
                 f"One contract would risk {single:.2f} {self.settings.account_currency} "
-                f"({pct:.1f}% of capital), exceeding the per-trade cap of "
+                f"({pct:.1f}% of equity {equity:.2f}), exceeding the per-trade cap of "
                 f"{self.risk_budget_per_trade():.2f} "
                 f"({self.settings.max_risk_per_trade * 100:.1f}%). "
                 "Increase MAX_RISK_PER_TRADE, use a narrower spread, or add capital."

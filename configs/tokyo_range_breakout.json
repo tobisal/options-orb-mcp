@@ -1,0 +1,18 @@
+{
+  "_comment": "Tokyo Range Breakout from hooper.algo.fxx reel DZPpCeevmMr. Range 00:00-06:00 GMT; buy/sell stops buffer beyond high/low; SL opposite side of range; TP 1.5x width; cancel unfilled by 09:00 GMT; flatten by 12:00 GMT. Reel FX favourites: USDJPY, AUDJPY, AUDUSD. ETF buffers are price units (not pips).",
+  "enabled": true,
+  "range_start_gmt": "00:00",
+  "range_end_gmt": "06:00",
+  "entry_until_gmt": "09:00",
+  "flatten_gmt": "12:00",
+  "buffer": 0.05,
+  "target_range_mult": 1.5,
+  "allowed_symbols": [],
+  "symbols": {
+    "USDJPY": { "buffer": 0.03 },
+    "AUDJPY": { "buffer": 0.03 },
+    "AUDUSD": { "buffer": 0.0003 },
+    "SPY": { "buffer": 0.05 },
+    "QQQ": { "buffer": 0.08 }
+  }
+}
