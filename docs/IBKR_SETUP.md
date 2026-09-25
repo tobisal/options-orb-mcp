@@ -95,7 +95,7 @@ IBC-based image referenced in [../docker-compose.yml](../docker-compose.yml):
 1. Add `IB_GATEWAY_USER` and `IB_GATEWAY_PASSWORD` (your paper credentials) to a
    local `.env` (keep them out of git).
 2. `docker compose up -d --build` (container restarts on reboot; Gateway also does a
-   daily soft restart at 11:59 PM London so login survives without a new 2FA).
+   daily soft restart at 9:00 PM London so login survives without a new 2FA).
 3. The dashboard service shares the Gateway network and uses `IBKR_HOST=127.0.0.1`
    / `IBKR_PORT=4002` (Gateway only completes the API handshake on localhost).
    Host processes still use `127.0.0.1:4002` (published to socat).

@@ -27,7 +27,7 @@ services:
       TIME_ZONE: Europe/London
       TZ: Europe/London
       TWOFA_TIMEOUT_ACTION: restart
-      AUTO_RESTART_TIME: "11:59 PM"
+      AUTO_RESTART_TIME: "9:00 PM"
       RELOGIN_AFTER_TWOFA_TIMEOUT: "yes"
       # primaryoverride: take over if Windows TWS/Gateway still holds the paper session
       EXISTING_SESSION_DETECTED_ACTION: primaryoverride
