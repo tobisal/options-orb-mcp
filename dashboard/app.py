@@ -1,10 +1,9 @@
-"""Starlette web dashboard for the Options ORB MCP system.
+"""Starlette web dashboard for the MES 5ORB futures system.
 
 Serves a single-page UI plus a small JSON API over the trade journal and (when
-TWS/IB Gateway is reachable) live IBKR positions and account values. Read-only:
-it never places or modifies trades - that stays with the execution agent.
+IB Gateway is reachable) live IBKR positions and account values.
 
-Run with:  python -m dashboard.app   (or the ``orb-dashboard`` entry point)
+Run with:  python -m dashboard.app
 """
 
 from __future__ import annotations
@@ -203,16 +202,13 @@ def _equity_curve(pnls: list[float], starting: float = 0.0) -> list[dict]:
 
 
 class AutoTrader:
-    """Background loop that runs the ORB entry logic on an interval.
+    """Background loop that runs MES 5ORB entry logic on an interval.
 
-    Each cycle it builds a risk-sized plan for the active session window and, if
-    a qualifying breakout passes all risk gates, places it (paper/simulated) via
-    the shared engine. It places up to 3 trades per window (max 9 per UTC day
-    across Asia / London / New York).
+    Each cycle builds a risk-sized MES futures plan for the active London/NY
+    window and, if a break/retest passes risk gates, places it (paper) via
+    the shared engine.
 
-    Safety: refuses to *start* against a LIVE account. Session-window
-    flatten still runs from the dashboard loop so live IBKR combos close
-    at each Asia / London / New York window_close.
+    Safety: refuses to *start* against a LIVE account.
     """
 
     MIN_INTERVAL = 10.0
@@ -264,7 +260,9 @@ class AutoTrader:
                 "error": "Auto-trading is disabled for LIVE accounts as a safety "
                          "measure. Set ACCOUNT_MODE=paper to use it.",
             }
-        self.symbol = (symbol or "SPY").upper()
+        self.symbol = (symbol or get_settings().default_symbol or "MES").upper()
+        if self.symbol != "MES":
+            self.symbol = "MES"
         self.window = window or "auto"
         self.demo = demo
         self.interval = max(float(interval), self.MIN_INTERVAL)

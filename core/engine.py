@@ -1,8 +1,7 @@
-"""Shared trading engine: signal -> chain -> risk-sized spread -> placement.
+"""Shared trading engine: MES 5ORB break/retest -> futures bracket -> journal.
 
-This is the single source of truth for building and placing a defined-risk
-vertical from the current ORB signal. Both the execution MCP server (LLM-driven)
-and the dashboard auto-trader import these functions so behaviour is identical.
+This build is MES-only. Dashboard auto-trader and execution MCP import these
+functions so paper/live behaviour stays identical.
 """
 
 from __future__ import annotations
@@ -11,24 +10,22 @@ import json
 from datetime import datetime
 from typing import Any
 
-from core.active_params import resolve_trading_config, strategy_payload
+from core.backtest_mes import evaluate_mes_signal_live
 from core.config import get_settings
 from core.db import Database
-from core.ibkr_client import IBKRClient, IBKRUnavailable, atm_strike_grid, chain_is_usable
+from core.ibkr_client import IBKRClient, IBKRUnavailable
 from core.journal import (
     _journal_close,
     _parse_plan,
-    _structure_value,
-    close_open_paper_trades,
     is_ibkr_backed,
-    legs_from_plan,
 )
-from core.marketdata import fetch_bars_with_fallback, synthetic_chain
-from core.models import Regime, SessionWindow, SpreadPlan, TradeRecord, TradeStatus
+from core.marketdata import fetch_bars_with_fallback
+from core.models import Direction, Regime, SessionWindow, SpreadType, TradeRecord, TradeStatus
 from core.risk import RiskManager
-from core.sessions import active_window, bars_in_window, get_window_config
-from core.strategy.orb import compute_orb_signal
-from core.strategy.spreads import build_spread, per_contract_max_loss
+from core.sessions import active_window
+from core.strategy.mes_5orb.opening_range import to_et
+from core.strategy.mes_5orb.sessions import load_mes_5orb_config
+from core.strategy.mes_5orb.trailing_stop import SwingTrailingStop
 from core.timeutils import utcnow
 
 
@@ -36,17 +33,117 @@ def resolve_window(window: str) -> SessionWindow:
     """Map a window name (or 'auto'/'active'/'current') to a SessionWindow."""
     if window.lower() in ("auto", "active", "current"):
         return active_window() or SessionWindow.NEW_YORK
-    return SessionWindow(window.lower())
+    key = window.lower().replace(" ", "_")
+    if key in ("ny", "newyork", "new_york"):
+        return SessionWindow.NEW_YORK
+    if key == "london":
+        return SessionWindow.LONDON
+    return SessionWindow(key)
 
 
-def days_to_expiry(expiry: str) -> float:
-    if not expiry or len(expiry) < 8:
-        return 7.0
+def _mes_session_to_window(session_name: str) -> SessionWindow:
+    if session_name == "london":
+        return SessionWindow.LONDON
+    return SessionWindow.NEW_YORK
+
+
+async def build_mes_trade_plan(
+    symbol: str = "MES",
+    window: str = "auto",
+    *,
+    use_synthetic: bool = False,
+    synthetic_seed: int = 42,
+    db: Database | None = None,
+) -> dict[str, Any]:
+    """MES 5ORB signal -> futures plan -> risk sizing. Places no order."""
+    db = db or Database()
+    cfg = load_mes_5orb_config()
+    symbol = "MES"
+
     try:
-        exp = datetime.strptime(expiry[:8], "%Y%m%d")
-    except ValueError:
-        return 7.0
-    return max((exp - utcnow()).total_seconds() / 86400.0, 0.5)
+        bars, source, warning = await fetch_bars_with_fallback(
+            symbol,
+            duration="3 D",
+            bar_size="5 mins",
+            use_synthetic=use_synthetic,
+            synthetic_seed=synthetic_seed,
+            allow_synthetic_fallback=use_synthetic,
+        )
+    except IBKRUnavailable as exc:
+        return {
+            "ok": False,
+            "error": str(exc),
+            "hint": "Pass use_synthetic=true for a demo, or place MES_5mins.csv in data/history/.",
+        }
+
+    session_name = None
+    if window.lower() not in ("auto", "active", "current"):
+        session_name = "london" if "london" in window.lower() else (
+            "new_york" if "new" in window.lower() or window.lower() in ("ny", "new_york") else None
+        )
+
+    signal = evaluate_mes_signal_live(bars, session_name=session_name, cfg=cfg)
+    strategy = {
+        "entry_model": "mes_5orb",
+        "symbol": symbol,
+        "point_value": cfg.point_value,
+        "tick_size": cfg.tick_size,
+        "contracts_config": cfg.risk.contracts,
+        "max_concurrent": cfg.risk.max_concurrent,
+    }
+
+    if not signal.get("ok"):
+        return {
+            "ok": False,
+            "reason": signal.get("reason", "No MES 5ORB setup"),
+            "signal": {k: v for k, v in signal.items() if k != "mes_plan"},
+            "data_source": source,
+            "warning": warning,
+            "strategy": strategy,
+        }
+
+    mes_plan = signal.get("mes_plan")
+    plan_dict = signal.get("plan") or (mes_plan.as_dict() if mes_plan else {})
+    stop_points = float(plan_dict.get("stop_points") or 0)
+    rm = RiskManager(db=db)
+    win = _mes_session_to_window(str(plan_dict.get("session_name") or "new_york"))
+    decision = rm.pre_trade_checks_futures(
+        stop_points,
+        point_value=cfg.point_value,
+        requested_contracts=cfg.risk.contracts,
+        max_concurrent=cfg.risk.max_concurrent,
+        window=win,
+    )
+    plan_dict["contracts"] = decision.contracts
+    plan_dict["max_loss_usd"] = round(
+        stop_points * cfg.point_value * max(decision.contracts, 0), 2
+    )
+
+    return {
+        "ok": True,
+        "environment": rm.environment(),
+        "data_source": source,
+        "warning": warning,
+        "signal": {
+            "session": signal.get("session"),
+            "or_high": signal.get("or_high"),
+            "or_low": signal.get("or_low"),
+            "state": signal.get("state"),
+            "direction": plan_dict.get("direction"),
+            "breakout": True,
+            "regime": Regime.TREND.value,
+            "strength": 1.0,
+            "symbol": symbol,
+            "notes": plan_dict.get("notes", ""),
+        },
+        "plan": plan_dict,
+        "per_contract_max_loss_usd": round(stop_points * cfg.point_value, 2),
+        "risk": decision.as_dict(),
+        "tradeable": decision.approved,
+        "strategy": strategy,
+        "instrument": "future",
+        "entry_model": "mes_5orb",
+    }
 
 
 async def build_trade_plan(
@@ -57,128 +154,17 @@ async def build_trade_plan(
     target_r: float | None = None,
     synthetic_seed: int = 42,
     db: Database | None = None,
+    entry_strategy: str | None = None,
 ) -> dict[str, Any]:
-    """Signal -> option chain -> spread -> risk sizing. Places no order."""
-    win = resolve_window(window)
-    db = db or Database()
-    cfg, opt_run = resolve_trading_config(symbol, win, db)
-    target_r = target_r if target_r is not None else cfg.target_r
-    strategy = strategy_payload(cfg, opt_run)
-
-    try:
-        bars, source, warning = await fetch_bars_with_fallback(
-            symbol, duration="3 D", bar_size="5 mins",
-            use_synthetic=use_synthetic, synthetic_seed=synthetic_seed,
-        )
-    except IBKRUnavailable as exc:
-        return {"ok": False, "error": str(exc), "hint": "Pass use_synthetic=true for a demo."}
-
-    signal = compute_orb_signal(symbol, win, bars, cfg)
-    if not signal.breakout:
-        if signal.range_high <= 0 and signal.range_low <= 0:
-            reason = (
-                f"No opening-range bars for {win.value} "
-                f"(as of {signal.as_of}). Waiting for session data."
-            )
-        else:
-            reason = (
-                f"No breakout in {win.value}: last {signal.last_price:.2f} "
-                f"inside OR [{signal.range_low:.2f}, {signal.range_high:.2f}] "
-                f"(need close beyond the range + buffer)."
-            )
-        return {
-            "ok": False,
-            "reason": reason,
-            "signal": signal.model_dump(mode="json"),
-            "data_source": source,
-            "strategy": strategy,
-        }
-
-    chain: dict[str, Any]
-    chain_source = source
-    chain_warning = warning
-    if source == "synthetic":
-        chain = synthetic_chain(signal.last_price)
-    else:
-        try:
-            async with IBKRClient() as ib:
-                raw = await ib.option_chain(symbol, spot_hint=signal.last_price)
-                expiry = raw["expiries"][0] if raw.get("expiries") else ""
-                iv = await ib.atm_iv(symbol, expiry) if expiry else None
-            spot = raw.get("spot") or signal.last_price
-            strikes = list(raw.get("strikes") or [])
-            if not chain_is_usable(spot, strikes):
-                strikes = atm_strike_grid(spot)
-                extra = (
-                    f"IBKR chain {raw.get('trading_class')} strikes unusable "
-                    f"near {spot:.2f}; using ATM $1 grid."
-                )
-                chain_warning = f"{chain_warning}; {extra}" if chain_warning else extra
-            chain = {
-                "spot": spot,
-                "strikes": strikes,
-                "expiry": expiry,
-                "days_to_expiry": days_to_expiry(expiry),
-                "iv": iv or 0.25,
-                "multiplier": int(raw.get("multiplier") or 100),
-            }
-            chain_source = "ibkr"
-        except IBKRUnavailable:
-            chain = synthetic_chain(signal.last_price)
-            chain_source = "synthetic"
-
-    preview_one = build_spread(
-        signal,
-        spot=chain["spot"],
-        expiry=chain["expiry"],
-        days_to_expiry=chain["days_to_expiry"],
-        iv=chain["iv"],
-        strikes=chain["strikes"],
-        target_r=target_r,
-        stop_r=cfg.stop_r,
-        contracts=1,
+    """MES-only entry point (symbol forced to MES)."""
+    _ = target_r, entry_strategy
+    return await build_mes_trade_plan(
+        symbol="MES",
+        window=window,
+        use_synthetic=use_synthetic,
+        synthetic_seed=synthetic_seed,
+        db=db,
     )
-    if preview_one is None:
-        return {
-            "ok": False,
-            "reason": (
-                "Could not construct a valid spread from the chain "
-                f"(spot={chain.get('spot')}, expiry={chain.get('expiry')}, "
-                f"strikes={chain.get('strikes')})."
-            ),
-            "signal": signal.model_dump(mode="json"),
-            "strategy": strategy,
-        }
-
-    rm = RiskManager(db=db)
-    per_loss = per_contract_max_loss(preview_one)
-    decision = rm.pre_trade_checks(per_loss, window=win)
-
-    plan = build_spread(
-        signal,
-        spot=chain["spot"],
-        expiry=chain["expiry"],
-        days_to_expiry=chain["days_to_expiry"],
-        iv=chain["iv"],
-        strikes=chain["strikes"],
-        target_r=target_r,
-        stop_r=cfg.stop_r,
-        contracts=max(decision.contracts, 0),
-    )
-
-    return {
-        "ok": True,
-        "environment": rm.environment(),
-        "data_source": chain_source,
-        "warning": chain_warning,
-        "signal": signal.model_dump(mode="json"),
-        "plan": (plan or preview_one).model_dump(mode="json"),
-        "per_contract_max_loss_usd": round(per_loss, 2),
-        "risk": decision.as_dict(),
-        "tradeable": decision.approved,
-        "strategy": strategy,
-        "iv": chain["iv"],
-    }
 
 
 async def place_trade_plan(
@@ -189,47 +175,48 @@ async def place_trade_plan(
     use_synthetic: bool = False,
     db: Database | None = None,
 ) -> dict[str, Any]:
-    """Place a previously built (and approved) plan; record it to the journal.
-
-    In synthetic mode - or when the data was synthetic - the fill is simulated.
-    Otherwise the combo order is routed to IBKR (paper by default).
-    """
+    """Place an approved MES plan; record it to the journal."""
     db = db or Database()
     if not preview.get("ok"):
         return preview
     if not preview.get("tradeable"):
         return {"ok": False, "error": "Risk checks failed.", **preview}
 
-    plan_dict = preview["plan"]
-    plan = SpreadPlan(**plan_dict)
-    win = resolve_window(window)
+    plan_dict = dict(preview["plan"])
     settings = get_settings()
-    regime = Regime(preview["signal"]["regime"])
+    direction = Direction(plan_dict.get("direction") or "long")
+    session_name = str(plan_dict.get("session_name") or "new_york")
+    win = _mes_session_to_window(session_name)
+    contracts = int(plan_dict.get("contracts") or 1)
+    entry_price = float(plan_dict.get("entry_price") or 0)
+    stop_price = float(plan_dict.get("stop_price") or 0)
+    stop_points = abs(entry_price - stop_price)
+    max_loss = stop_points * float(plan_dict.get("point_value") or 5) * contracts
 
-    simulate = preview["data_source"] == "synthetic" or use_synthetic
+    simulate = preview.get("data_source") == "synthetic" or use_synthetic
+    side = "BUY" if direction is Direction.LONG else "SELL"
+
     if simulate:
-        order_ref = f"SIM-{symbol}-{utcnow():%Y%m%d%H%M%S}"
+        order_ref = f"SIM-MES-{utcnow():%Y%m%d%H%M%S}"
         environment = f"{settings.trading_environment()}(sim)"
         placement: dict[str, Any] = {"simulated": True, "order_ref": order_ref}
     else:
         try:
             async with IBKRClient(readonly=False) as ib:
-                placement = await ib.place_spread_order(
-                    symbol,
-                    plan.long_leg,
-                    plan.short_leg,
-                    plan.contracts,
-                    limit_price=plan.net_debit,
-                    take_profit_price=plan.take_profit_price,
-                    stop_loss_price=plan.stop_loss_price,
+                placement = await ib.place_mes_bracket(
+                    side=side,
+                    contracts=contracts,
+                    stop_price=stop_price,
+                    entry_limit=None,
                 )
+            if not placement.get("ok"):
+                return {"ok": False, "error": placement.get("error", "MES place failed"), **preview}
             order_ref = placement["order_ref"]
             environment = settings.trading_environment()
         except IBKRUnavailable as exc:
-            # Paper journal should still record the fill so research has a sample.
             if settings.trading_environment() != "PAPER":
                 return {"ok": False, "error": f"Order placement failed: {exc}"}
-            order_ref = f"SIM-{symbol}-{utcnow():%Y%m%d%H%M%S}"
+            order_ref = f"SIM-MES-{utcnow():%Y%m%d%H%M%S}"
             environment = "PAPER(sim)"
             placement = {
                 "simulated": True,
@@ -238,27 +225,34 @@ async def place_trade_plan(
             }
 
     plan_payload = dict(plan_dict)
-    plan_payload["iv"] = preview.get("iv", 0.25)
+    plan_payload["entry_model"] = "mes_5orb"
+    plan_payload["instrument"] = "future"
+    plan_payload["side"] = side
+    plan_payload["use_trailing_stop"] = True
+    plan_payload["trail_active"] = False
+    plan_payload["original_stop_loss_price"] = stop_price
+    plan_payload["stop_loss_price"] = stop_price
+
+    notes = str(plan_dict.get("notes") or "mes_5orb")
+    if placement.get("ibkr_error"):
+        notes += f" | IBKR unavailable, simulated paper fill: {placement['ibkr_error']}"
+
     record = TradeRecord(
         environment=environment,
-        symbol=symbol,
+        symbol="MES",
         window=win,
-        regime=regime,
-        spread_type=plan.spread_type,
-        direction=plan.direction,
-        contracts=plan.contracts,
-        entry_price=plan.net_debit,
-        max_loss=plan.max_loss,
-        max_profit=plan.max_profit,
-        target_r=plan.target_r,
+        regime=Regime.TREND,
+        spread_type=SpreadType.BULL_CALL if direction is Direction.LONG else SpreadType.BEAR_PUT,
+        direction=direction,
+        contracts=contracts,
+        entry_price=entry_price,
+        max_loss=max_loss,
+        max_profit=0.0,
+        target_r=0.0,
         status=TradeStatus.OPEN,
-        signal_strength=preview["signal"]["strength"],
+        signal_strength=1.0,
         order_ref=order_ref,
-        notes=plan.rationale + (
-            f" | IBKR unavailable, simulated paper fill: {placement.get('ibkr_error')}"
-            if placement.get("ibkr_error")
-            else ""
-        ),
+        notes=notes,
         plan_json=json.dumps(plan_payload),
     )
     trade_id = db.insert_trade(record)
@@ -268,17 +262,37 @@ async def place_trade_plan(
         "trade_id": trade_id,
         "environment": environment,
         "placement": placement,
-        "plan": plan_dict,
+        "plan": plan_payload,
+        "entry_model": "mes_5orb",
+        "instrument": "future",
     }
 
 
-def _session_end_mark(trade: TradeRecord, bars: list) -> float:
+def _mes_mark(trade: TradeRecord, bars: list) -> float:
+    if not bars:
+        return float(trade.entry_price)
+    return float(bars[-1].close)
+
+
+def _mes_force_flat_due(trade: TradeRecord, cfg, now: datetime | None = None) -> bool:
+    """True when ET clock is at/after this trade's session force_flat."""
     plan = _parse_plan(trade.plan_json)
-    cfg = get_window_config(trade.window)
-    path = bars_in_window(bars, cfg) or bars
-    if not path:
-        return trade.entry_price
-    return _structure_value(trade, plan, path[-1].close)
+    session_name = str(plan.get("session_name") or "")
+    if trade.window is SessionWindow.LONDON:
+        session_name = session_name or "london"
+    elif trade.window is SessionWindow.NEW_YORK:
+        session_name = session_name or "new_york"
+    sess = cfg.session(session_name) if session_name else None
+    if sess is None:
+        # Fallback: map window
+        if trade.window is SessionWindow.LONDON:
+            sess = cfg.session("london")
+        else:
+            sess = cfg.session("new_york")
+    if sess is None:
+        return False
+    et = to_et(now or utcnow())
+    return et.time() >= sess.force_flat
 
 
 async def settle_session_exits(
@@ -289,55 +303,109 @@ async def settle_session_exits(
     now_window: SessionWindow | None = None,
     ib: Any = None,
 ) -> list[dict[str, Any]]:
-    """Close journal-only trades and flatten IBKR combos whose session has ended.
+    """Manage MES trail stops and force-flat at session force_flat times."""
+    _ = now_window
+    symbol = "MES"
+    cfg = load_mes_5orb_config()
+    # Do not use equity ORB session_end paper flatten — MES uses force_flat times.
+    closed: list[dict[str, Any]] = []
 
-    Take-profit / stop-loss on IBKR-backed trades stay with the broker OCA group.
-    When that window is no longer active, this cancels remaining exits and
-    market-sells the combo, then records the journal close. If IBKR rejects
-    (market closed, disconnect), the row stays open and the next cycle retries.
-    """
-    closed = close_open_paper_trades(db, symbol, bars, now_window=now_window)
-    live = now_window if now_window is not None else active_window()
-    ibkr_due = [
+
+    opens = [
         t
         for t in db.query_trades(status=TradeStatus.OPEN, limit=1000)
-        if t.symbol.upper() == symbol.upper()
-        and is_ibkr_backed(t)
-        and live is not t.window
+        if t.symbol.upper() == "MES"
     ]
-    if not ibkr_due:
+    if not opens:
         return closed
 
     owned_client = False
     client = ib
     try:
-        if client is None:
-            client = IBKRClient(readonly=False)
-            await client.connect()
-            owned_client = True
-        for trade in ibkr_due:
-            plan = _parse_plan(trade.plan_json)
-            legs = legs_from_plan(plan)
-            if legs is None or not trade.order_ref:
-                continue
-            long_leg, short_leg = legs
+        need_ib = any(is_ibkr_backed(t) for t in opens)
+        if need_ib and client is None:
             try:
-                result = await client.close_spread_order(
-                    trade.symbol,
-                    long_leg,
-                    short_leg,
-                    trade.contracts,
-                    trade.order_ref,
-                )
+                client = IBKRClient(readonly=False)
+                await client.connect()
+                owned_client = True
             except IBKRUnavailable:
+                client = None
+
+        for trade in opens:
+            plan = _parse_plan(trade.plan_json)
+            if plan.get("entry_model") != "mes_5orb" and plan.get("instrument") != "future":
+                # Still treat as MES in this build
+                pass
+
+            direction = trade.direction
+            stop = float(plan.get("stop_loss_price") or trade.entry_price)
+            lag = int(plan.get("trail_pivot_lag") or cfg.trailing_stop.pivot_lag_bars)
+            buffer = float(cfg.trailing_stop.buffer_ticks) * float(cfg.tick_size)
+
+            # Software trail update on recent bars after entry
+            trail = SwingTrailingStop(
+                direction=direction,
+                stop=stop,
+                pivot_lag=lag,
+                buffer=buffer,
+            )
+            mark = _mes_mark(trade, bars)
+            if bars:
+                # Feed last N bars for pivot confirmation
+                for b in bars[-40:]:
+                    changed = trail.update(b)
+                    if changed is not None:
+                        plan["stop_loss_price"] = trail.stop
+                        plan["trail_active"] = True
+                        if trade.id:
+                            db.update_plan_json(trade.id, plan)
+
+            hit = bool(bars) and trail.hit(bars[-1])
+            due_flat = _mes_force_flat_due(trade, cfg)
+
+            if not hit and not due_flat:
+                # Push stop to broker if trail moved and IBKR-backed
+                if (
+                    client is not None
+                    and is_ibkr_backed(trade)
+                    and trade.order_ref
+                    and plan.get("trail_active")
+                    and abs(float(plan.get("stop_loss_price") or 0) - stop) > 1e-9
+                ):
+                    side = "BUY" if direction is Direction.LONG else "SELL"
+                    try:
+                        await client.modify_mes_stop(
+                            trade.order_ref,
+                            stop_price=float(plan["stop_loss_price"]),
+                            contracts=trade.contracts,
+                            side=side,
+                        )
+                    except Exception:
+                        pass
                 continue
-            if not result.get("ok"):
-                continue
-            rec = _journal_close(db, trade, _session_end_mark(trade, bars), "session_end")
-            rec["ibkr"] = True
-            rec["ibkr_status"] = result.get("status")
-            rec["already_flat"] = bool(result.get("already_flat"))
-            closed.append(rec)
+
+            reason = "trailing_stop" if hit else "force_flat"
+            exit_px = trail.stop if hit else mark
+
+            if is_ibkr_backed(trade) and client is not None and trade.order_ref:
+                side = "BUY" if direction is Direction.LONG else "SELL"
+                try:
+                    result = await client.close_mes_position(
+                        contracts=trade.contracts,
+                        side=side,
+                        order_ref=trade.order_ref,
+                    )
+                except IBKRUnavailable:
+                    continue
+                if not result.get("ok"):
+                    continue
+                rec = _journal_close(db, trade, exit_px, reason)
+                rec["ibkr"] = True
+                rec["ibkr_status"] = result.get("status")
+                closed.append(rec)
+            elif not is_ibkr_backed(trade):
+                rec = _journal_close(db, trade, exit_px, reason)
+                closed.append(rec)
     finally:
         if owned_client and client is not None:
             await client.disconnect()

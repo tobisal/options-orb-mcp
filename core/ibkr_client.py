@@ -638,6 +638,198 @@ class IBKRClient:
             for p in poss
         ]
 
+    # --- MES futures -------------------------------------------------------
+    def _mes_cont_future(self) -> Any:
+        return iba.ContFuture("MES", "CME", currency="USD")
+
+    def _mes_future_template(self) -> Any:
+        return iba.Future(symbol="MES", exchange="CME", currency="USD")
+
+    async def qualify_mes_future(self) -> Any:
+        """Qualify the nearest MES front-month Future (tradable)."""
+        details = await self.ib.reqContractDetailsAsync(self._mes_future_template())
+        if not details:
+            # Fall back to continuous for data; trading may still fail later.
+            return await self._qualify(self._mes_cont_future())
+        today = utcnow().strftime("%Y%m%d")
+        candidates = []
+        for d in details:
+            c = d.contract
+            exp = str(getattr(c, "lastTradeDateOrContractMonth", "") or "")
+            if len(exp) >= 6 and exp[:6] >= today[:6]:
+                candidates.append(c)
+        if not candidates:
+            candidates = [d.contract for d in details]
+        candidates.sort(key=lambda c: str(getattr(c, "lastTradeDateOrContractMonth", "") or ""))
+        return await self._qualify(candidates[0])
+
+    async def historical_bars_mes(
+        self,
+        *,
+        duration: str = "2 D",
+        bar_size: str = "5 mins",
+        use_rth: bool = False,
+        what_to_show: str = "TRADES",
+        end_datetime: str = "",
+    ) -> list[Bar]:
+        """Fetch MES futures OHLCV via ContFuture (continuous history)."""
+        try:
+            contract = await self._qualify(self._mes_cont_future())
+        except IBKRUnavailable:
+            contract = await self.qualify_mes_future()
+        end = end_datetime.strip()
+        if end and " " in end and not end.upper().endswith("UTC") and " GMT" not in end.upper():
+            end = f"{end} UTC"
+        raw = await self.ib.reqHistoricalDataAsync(
+            contract,
+            endDateTime=end,
+            durationStr=duration,
+            barSizeSetting=bar_size,
+            whatToShow=what_to_show,
+            useRTH=use_rth,
+            formatDate=2,
+        )
+        bars: list[Bar] = []
+        for b in raw:
+            ts = b.date if isinstance(b.date, datetime) else datetime.fromisoformat(str(b.date))
+            bars.append(
+                Bar(
+                    ts=as_naive_utc(ts),
+                    open=float(b.open),
+                    high=float(b.high),
+                    low=float(b.low),
+                    close=float(b.close),
+                    volume=float(b.volume or 0),
+                )
+            )
+        return bars
+
+    async def place_mes_bracket(
+        self,
+        *,
+        side: str,
+        contracts: int,
+        stop_price: float,
+        entry_limit: float | None = None,
+    ) -> dict[str, Any]:
+        """Place MES market (or limit) entry with an attached stop.
+
+        ``side`` is BUY or SELL. Trailing is managed in software (modify stop).
+        """
+        contract = await self.qualify_mes_future()
+        qty = max(int(contracts), 0)
+        if qty <= 0:
+            return {"ok": False, "error": "No contracts to place."}
+        action = side.upper()
+        if action not in {"BUY", "SELL"}:
+            return {"ok": False, "error": f"Invalid side {side}"}
+        order_ref = f"MES-{utcnow():%Y%m%d%H%M%S}"
+        if entry_limit is not None:
+            entry = iba.LimitOrder(action, qty, round(float(entry_limit), 2), tif="DAY")
+        else:
+            entry = iba.MarketOrder(action, qty, tif="DAY")
+        entry.orderRef = order_ref
+        entry_trade = self.ib.placeOrder(contract, entry)
+
+        exit_action = "SELL" if action == "BUY" else "BUY"
+        sl = iba.StopOrder(exit_action, qty, round(float(stop_price), 2), tif="GTC")
+        sl.orderRef = f"{order_ref}-STOP"
+        sl_trade = self.ib.placeOrder(contract, sl)
+
+        await asyncio.sleep(0.35)
+        status = getattr(getattr(entry_trade, "orderStatus", None), "status", "Submitted")
+        return {
+            "ok": True,
+            "order_ref": order_ref,
+            "status": status,
+            "stop_order_ref": sl.orderRef,
+            "contract": {
+                "symbol": contract.symbol,
+                "localSymbol": getattr(contract, "localSymbol", ""),
+                "expiry": getattr(contract, "lastTradeDateOrContractMonth", ""),
+                "conId": getattr(contract, "conId", 0),
+            },
+            "entry_trade_id": getattr(getattr(entry_trade, "order", None), "orderId", None),
+            "stop_trade_id": getattr(getattr(sl_trade, "order", None), "orderId", None),
+        }
+
+    async def modify_mes_stop(
+        self,
+        order_ref: str,
+        *,
+        stop_price: float,
+        contracts: int,
+        side: str,
+    ) -> dict[str, Any]:
+        """Cancel existing MES stop child and place a new stop at ``stop_price``."""
+        contract = await self.qualify_mes_future()
+        stop_ref = f"{order_ref}-STOP"
+        self._cancel_working_for_ref(order_ref)
+        await asyncio.sleep(0.2)
+        exit_action = "SELL" if side.upper() == "BUY" else "BUY"
+        # If parent ref was BUY (long), exit is SELL
+        if side.upper() in {"LONG", "BUY"}:
+            exit_action = "SELL"
+        else:
+            exit_action = "BUY"
+        sl = iba.StopOrder(exit_action, max(int(contracts), 1), round(float(stop_price), 2), tif="GTC")
+        sl.orderRef = stop_ref
+        trade = self.ib.placeOrder(contract, sl)
+        await asyncio.sleep(0.2)
+        status = getattr(getattr(trade, "orderStatus", None), "status", "Submitted")
+        return {"ok": True, "order_ref": stop_ref, "status": status, "stop_price": stop_price}
+
+    async def close_mes_position(
+        self,
+        *,
+        contracts: int,
+        side: str,
+        order_ref: str,
+    ) -> dict[str, Any]:
+        """Flatten MES: cancel working orders, market close."""
+        contract = await self.qualify_mes_future()
+        qty = max(int(contracts), 0)
+        if qty <= 0:
+            return {"ok": False, "error": "No contracts to close."}
+        cancelled = self._cancel_working_for_ref(order_ref)
+        await asyncio.sleep(0.25)
+        # Determine flat from positions
+        pos = 0.0
+        for p in self.ib.positions():
+            if getattr(p.contract, "symbol", "") == "MES" and getattr(p.contract, "secType", "") in {
+                "FUT",
+                "CONTFUT",
+            }:
+                pos += float(p.position)
+        already_flat = abs(pos) < 0.01
+        if already_flat:
+            return {"ok": True, "already_flat": True, "cancelled": cancelled, "status": "Inactive"}
+        # Close opposite to position
+        if pos > 0:
+            action = "SELL"
+            flatten_qty = max(qty, int(round(abs(pos))))
+        elif pos < 0:
+            action = "BUY"
+            flatten_qty = max(qty, int(round(abs(pos))))
+        else:
+            action = "SELL" if side.upper() in {"LONG", "BUY"} else "BUY"
+            flatten_qty = qty
+        close = iba.MarketOrder(action, flatten_qty, tif="DAY")
+        close.orderRef = f"{order_ref}-FLAT"
+        try:
+            trade = self.ib.placeOrder(contract, close)
+        except Exception as exc:
+            return {"ok": False, "error": f"MES flatten rejected: {exc}", "cancelled": cancelled}
+        await asyncio.sleep(0.35)
+        status = getattr(getattr(trade, "orderStatus", None), "status", "Submitted")
+        return {
+            "ok": True,
+            "already_flat": False,
+            "cancelled": cancelled,
+            "status": status,
+            "order_ref": close.orderRef,
+        }
+
 
 def _clean(x: Any) -> float | None:
     """IBKR uses NaN / -1 to mean 'no data'; normalise to None."""

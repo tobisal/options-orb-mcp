@@ -249,6 +249,15 @@ class Database:
             )
             return cur.rowcount > 0
 
+    def update_plan_json(self, trade_id: int, plan: dict[str, Any] | str) -> bool:
+        """Persist trail / stop updates on an open trade's plan blob."""
+        payload = plan if isinstance(plan, str) else json.dumps(plan)
+        with self._conn() as conn:
+            cur = conn.execute(
+                "UPDATE trades SET plan_json = ? WHERE id = ?", (payload, trade_id)
+            )
+            return cur.rowcount > 0
+
     def get_trade(self, trade_id: int) -> TradeRecord | None:
         with self._conn() as conn:
             row = conn.execute("SELECT * FROM trades WHERE id = ?", (trade_id,)).fetchone()

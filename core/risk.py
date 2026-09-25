@@ -58,17 +58,85 @@ class RiskManager:
         return self.settings.starting_capital * self.settings.max_daily_loss
 
     # --- sizing ------------------------------------------------------------
-    def size_position(self, per_contract_max_loss_usd: float) -> int:
-        """Number of contracts whose combined max loss fits the risk budget.
+    def size_futures(
+        self,
+        stop_points: float,
+        *,
+        point_value: float = 5.0,
+        requested_contracts: int | None = None,
+    ) -> int:
+        """Size MES (or similar) futures by dollar stop risk.
 
-        ``per_contract_max_loss_usd`` is the USD max loss of one spread
-        contract (already inclusive of the x100 multiplier).
+        Risk per contract (USD) = stop_points × point_value.
         """
-        if per_contract_max_loss_usd <= 0:
+        if stop_points <= 0 or point_value <= 0:
             return 0
-        per_contract_acct = per_contract_max_loss_usd * self.acct_ccy_per_usd
+        per_contract_usd = stop_points * point_value
+        per_contract_acct = per_contract_usd * self.acct_ccy_per_usd
         budget = self.risk_budget_per_trade()
-        return max(int(math.floor(budget / per_contract_acct)), 0)
+        n = max(int(math.floor(budget / per_contract_acct)), 0)
+        if requested_contracts is not None:
+            n = min(n, max(int(requested_contracts), 0))
+        return n
+
+    def pre_trade_checks_futures(
+        self,
+        stop_points: float,
+        *,
+        point_value: float = 5.0,
+        requested_contracts: int | None = None,
+        max_concurrent: int = 1,
+        window: SessionWindow | None = None,
+    ) -> RiskDecision:
+        """Risk gates for MES futures (stop-distance sizing)."""
+        assert self.db is not None
+        reasons: list[str] = []
+        reasons.extend(self._live_gate_reasons())
+
+        contracts = self.size_futures(
+            stop_points,
+            point_value=point_value,
+            requested_contracts=requested_contracts,
+        )
+        # Prefer configured fixed size when budget allows at least that many.
+        if requested_contracts and contracts >= requested_contracts:
+            contracts = requested_contracts
+        elif requested_contracts and contracts < requested_contracts and contracts > 0:
+            pass  # use what budget allows
+        elif requested_contracts and contracts == 0:
+            reasons.append(
+                f"Stop risk {stop_points:.2f} pts × ${point_value:.0f} exceeds "
+                f"per-trade budget {self.risk_budget_per_trade():.2f} "
+                f"{self.settings.account_currency}."
+            )
+
+        env = self.environment()
+        open_count = self.db.open_position_count(environment=env)
+        if open_count >= max_concurrent:
+            reasons.append(
+                f"MES max concurrent positions reached ({open_count}/{max_concurrent})."
+            )
+        if open_count >= self.settings.max_open_positions:
+            reasons.append(
+                f"Max open positions reached ({open_count}/{self.settings.max_open_positions})."
+            )
+
+        tripped, realised = self.daily_loss_tripped()
+        if tripped:
+            reasons.append(
+                f"Daily loss kill switch active (realised {realised:.2f} "
+                f"{self.settings.account_currency} <= -{self.daily_loss_limit():.2f})."
+            )
+
+        projected = contracts * stop_points * point_value * self.acct_ccy_per_usd
+        approved = len(reasons) == 0 and contracts > 0
+        return RiskDecision(
+            approved=approved,
+            contracts=contracts,
+            risk_budget=self.risk_budget_per_trade(),
+            projected_risk=projected,
+            reasons=reasons,
+        )
 
     # --- gates -------------------------------------------------------------
     def environment(self) -> str:

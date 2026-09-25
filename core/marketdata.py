@@ -111,6 +111,8 @@ async def fetch_bars(
     if days > _CHUNK_DAYS:
         return await fetch_bars_range(symbol, days=days, bar_size=bar_size)
     async with IBKRClient() as ib:
+        if symbol.upper() == "MES":
+            return await ib.historical_bars_mes(duration=duration, bar_size=bar_size)
         return await ib.historical_bars(symbol, duration=duration, bar_size=bar_size)
 
 
@@ -252,12 +254,19 @@ async def fetch_bars_range(
             if progress:
                 progress(f"IBKR chunk {chunk_i}/{max_chunks}: {_CHUNK_DAYS} D ending {end_str} GMT")
             try:
-                chunk = await ib.historical_bars(
-                    symbol,
-                    duration=f"{_CHUNK_DAYS} D",
-                    bar_size=bar_size,
-                    end_datetime=end_str,
-                )
+                if symbol.upper() == "MES":
+                    chunk = await ib.historical_bars_mes(
+                        duration=f"{_CHUNK_DAYS} D",
+                        bar_size=bar_size,
+                        end_datetime=end_str,
+                    )
+                else:
+                    chunk = await ib.historical_bars(
+                        symbol,
+                        duration=f"{_CHUNK_DAYS} D",
+                        bar_size=bar_size,
+                        end_datetime=end_str,
+                    )
             except Exception as exc:
                 msg = str(exc).lower()
                 if "162" in str(exc) or "no data" in msg or "hmids" in msg or "hmds" in msg:

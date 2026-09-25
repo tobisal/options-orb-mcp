@@ -66,8 +66,10 @@ class Settings(BaseSettings):
     max_open_positions_per_window: int = Field(default=3, alias="MAX_OPEN_POSITIONS_PER_WINDOW")
 
     # --- Strategy defaults -------------------------------------------------
-    default_symbol: str = Field(default="SPY", alias="DEFAULT_SYMBOL")
+    default_symbol: str = Field(default="MES", alias="DEFAULT_SYMBOL")
     default_target_r: float = Field(default=1.5, alias="DEFAULT_TARGET_R")
+    # orb = options vertical ORB; mes_5orb = MES futures break/retest.
+    entry_strategy: str = Field(default="mes_5orb", alias="ENTRY_STRATEGY")
 
     # --- Storage -----------------------------------------------------------
     db_path: str = Field(default="data/trades.db", alias="DB_PATH")

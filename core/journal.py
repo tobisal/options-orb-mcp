@@ -21,12 +21,21 @@ from core.timeutils import utcnow
 
 
 def mark_open_trade(trade: TradeRecord, spot: float) -> dict[str, Any]:
-    """Black-Scholes mark of an open vertical vs the current underlying print."""
+    """Mark an open trade vs the current underlying print."""
     plan = _parse_plan(trade.plan_json)
-    mark = _structure_value(trade, plan, spot)
-    pnl = round(
-        (mark - trade.entry_price) * CONTRACT_MULTIPLIER * trade.contracts, 2
-    )
+    if plan.get("instrument") == "future" or plan.get("entry_model") == "mes_5orb":
+        point_value = float(plan.get("point_value") or 5.0)
+        if trade.direction.value == "long":
+            points = spot - trade.entry_price
+        else:
+            points = trade.entry_price - spot
+        pnl = round(points * point_value * trade.contracts, 2)
+        mark = spot
+    else:
+        mark = _structure_value(trade, plan, spot)
+        pnl = round(
+            (mark - trade.entry_price) * CONTRACT_MULTIPLIER * trade.contracts, 2
+        )
     tp = _num(plan.get("take_profit_price"))
     sl = _num(plan.get("stop_loss_price"))
     progress: float | None = None
@@ -132,9 +141,18 @@ def legs_from_plan(plan: dict[str, Any]) -> tuple[OptionLeg, OptionLeg] | None:
 def _journal_close(
     db: Database, trade: TradeRecord, exit_price: float, reason: str
 ) -> dict[str, Any]:
-    pnl = round(
-        (exit_price - trade.entry_price) * CONTRACT_MULTIPLIER * trade.contracts, 2
-    )
+    plan = _parse_plan(trade.plan_json)
+    if plan.get("instrument") == "future" or plan.get("entry_model") == "mes_5orb":
+        point_value = float(plan.get("point_value") or 5.0)
+        if trade.direction.value == "long":
+            points = exit_price - trade.entry_price
+        else:
+            points = trade.entry_price - exit_price
+        pnl = round(points * point_value * trade.contracts, 2)
+    else:
+        pnl = round(
+            (exit_price - trade.entry_price) * CONTRACT_MULTIPLIER * trade.contracts, 2
+        )
     db.close_trade(trade.id or 0, exit_price=exit_price, pnl=pnl)
     notes = (trade.notes or "").strip()
     extra = f"exit={reason}"

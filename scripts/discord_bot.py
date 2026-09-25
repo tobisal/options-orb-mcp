@@ -219,21 +219,20 @@ def register_commands(bot: OrbDiscord) -> None:
         )
         return False
 
-    @tree.command(name="help", description="List ORB Discord commands")
+    @tree.command(name="help", description="List MES Discord commands")
     async def help_cmd(interaction: discord.Interaction) -> None:
         if not await guard(interaction):
             return
         await interaction.response.send_message(
             clip(
-                "**ORB remote** (paper). Dashboard must be running.\n"
+                "**MES 5ORB remote** (paper). Dashboard must be running.\n"
                 "`/status` account + auto-trade\n"
-                "`/signals` current ORB per window\n"
-                "`/preview` size a spread, does not place\n"
+                "`/signals` London / New York break-retest state\n"
+                "`/preview` size a MES futures plan (no order)\n"
                 "`/positions` open mark-to-market\n"
                 "`/trades` journal\n"
-                "`/auto start|stop|status` paper auto-trader\n"
-                "`/optimise` rank params (does not apply)\n"
-                "`/nightly` rank and apply tomorrow's sets\n"
+                "`/auto start|stop|status` paper auto-trader (MES)\n"
+                "`/optimise` / `/nightly` legacy hooks (options params unused)\n"
                 "Live auto-trade events stream to DISCORD_LOG_CHANNEL_ID."
             ),
             ephemeral=True,
@@ -253,27 +252,27 @@ def register_commands(bot: OrbDiscord) -> None:
             return
         await interaction.followup.send(format_status(summary, auto if not auto.get("error") else None))
 
-    @tree.command(name="signals", description="ORB read for Asia / London / New York")
-    @app_commands.describe(symbol="Underlying, default SPY")
-    async def signals_cmd(interaction: discord.Interaction, symbol: str = "SPY") -> None:
+    @tree.command(name="signals", description="MES 5ORB London / New York state")
+    @app_commands.describe(symbol="Symbol (MES only)")
+    async def signals_cmd(interaction: discord.Interaction, symbol: str = "MES") -> None:
         if not await guard(interaction):
             return
         await interaction.response.defer(thinking=True)
-        data = await bot.api.get("/api/signals", symbol=symbol.upper())
+        data = await bot.api.get("/api/signals", symbol="MES")
         await interaction.followup.send(format_signals(data))
 
-    @tree.command(name="preview", description="Preview a defined-risk vertical (no order)")
-    @app_commands.describe(window="auto, asia, london, or new_york", symbol="Underlying")
+    @tree.command(name="preview", description="Preview MES 5ORB plan (no order)")
+    @app_commands.describe(window="auto, london, or new_york", symbol="MES only")
     async def preview_cmd(
         interaction: discord.Interaction,
         window: str = "auto",
-        symbol: str = "SPY",
+        symbol: str = "MES",
     ) -> None:
         if not await guard(interaction):
             return
         await interaction.response.defer(thinking=True)
         data = await bot.api.get(
-            "/api/preview", symbol=symbol.upper(), window=window.lower()
+            "/api/preview", symbol="MES", window=window.lower()
         )
         await interaction.followup.send(format_preview(data))
 
@@ -317,10 +316,10 @@ def register_commands(bot: OrbDiscord) -> None:
         await interaction.followup.send(clip("\n".join(lines)))
 
     @auto.command(name="start", description="Start paper auto-trade (dashboard process)")
-    @app_commands.describe(symbol="Underlying", window="auto / asia / london / new_york")
+    @app_commands.describe(symbol="MES only", window="auto / london / new_york")
     async def auto_start(
         interaction: discord.Interaction,
-        symbol: str = "SPY",
+        symbol: str = "MES",
         window: str = "auto",
     ) -> None:
         if not await guard(interaction):
@@ -334,7 +333,7 @@ def register_commands(bot: OrbDiscord) -> None:
         await interaction.response.defer(thinking=True)
         data = await bot.api.post(
             "/api/autotrade/start",
-            symbol=symbol.upper(),
+            symbol="MES",
             window=window.lower(),
             demo="false",
             interval="60",

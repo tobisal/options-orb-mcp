@@ -1,0 +1,48 @@
+{
+  "_comment": "MES 5ORB break-and-retest. Times America/New_York. point_value=$5/pt, tick=0.25.",
+  "symbol": "MES",
+  "point_value": 5.0,
+  "tick_size": 0.25,
+  "timezone": "America/New_York",
+  "sessions": {
+    "london": {
+      "or_start": "03:00",
+      "or_end": "03:05",
+      "search_end": "08:00",
+      "force_flat": "08:00",
+      "opening_range": {
+        "min_range_points": 0.75,
+        "max_range_points": 6.0
+      },
+      "retest": {
+        "tolerance_ticks": 2,
+        "timeout_bars": 12,
+        "require_rejection_candle": true
+      }
+    },
+    "new_york": {
+      "or_start": "09:30",
+      "or_end": "09:35",
+      "search_end": "15:00",
+      "force_flat": "15:55",
+      "opening_range": {
+        "min_range_points": 1.0,
+        "max_range_points": 8.0
+      },
+      "retest": {
+        "tolerance_ticks": 2,
+        "timeout_bars": 12,
+        "require_rejection_candle": true
+      }
+    }
+  },
+  "trailing_stop": {
+    "method": "swing_low",
+    "pivot_lag_bars": 2,
+    "buffer_ticks": 1
+  },
+  "risk": {
+    "contracts": 1,
+    "max_concurrent": 1
+  }
+}
