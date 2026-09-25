@@ -197,7 +197,6 @@
       <select id="btWindow">
         <option value="new_york">New York</option>
         <option value="london">London</option>
-        <option value="asia">Asia</option>
       </select>
       <label class="check">Lookback
         <select id="btLookback">
@@ -210,28 +209,14 @@
       </label>
       <label class="check"><input type="checkbox" id="btDemo" /> Demo data (offline, no IBKR)</label>
       <button id="btRun" class="primary">Run backtest</button>
-      <button id="btOpt">Optimise</button>
+      <button id="btOpt">Walk-forward 70/30</button>
       <span class="sub" id="btNote"></span>
     </div>
-    <details style="margin-bottom:14px">
-      <summary class="sub" style="cursor:pointer">Advanced parameters</summary>
-      <div class="toolbar" style="margin-top:12px">
-        <label class="sub">Opening range (min)<input id="pOrm" type="number" value="30" style="width:64px"></label>
-        <label class="sub">Buffer (ATR)<input id="pBuf" type="number" step="0.05" value="0.10" style="width:64px"></label>
-        <label class="sub">Min strength<input id="pStr" type="number" step="0.05" value="0.25" style="width:64px"></label>
-        <label class="sub">Target R<input id="pTr" type="number" step="0.1" value="1.5" style="width:64px"></label>
-        <label class="sub">Stop R<input id="pSr" type="number" step="0.1" value="1.0" style="width:64px"></label>
-        <label class="sub">IV<input id="pIv" type="number" step="0.05" value="0.25" style="width:64px"></label>
-        <label class="sub">DTE<input id="pDte" type="number" value="7" style="width:64px"></label>
-        <label class="sub">Cost/trade<input id="pCost" type="number" step="0.5" value="0" style="width:64px"></label>
-        <button id="useParamsBtn" class="primary" type="button">Use these for trading</button>
-      </div>
-    </details>
+    <div class="sub mut" style="margin-bottom:12px">Uses the futures 5ORB break/retest rules for the selected symbol (config in configs/*_5orb.json).</div>
     <div id="btMetrics" class="grid cards" style="margin-bottom:6px"></div>
     <canvas id="simChart" height="90" style="display:none"></canvas>
     <div id="btResult"></div>
   </div>
-
   <div class="panel">
     <h2>Optimisations made <span class="hint">saved optimiser runs and the best parameters they found</span></h2>
     <div id="optHistory"></div>
@@ -679,14 +664,6 @@ function backtestQuery() {
     window: document.getElementById("btWindow").value,
     lookback_days: document.getElementById("btLookback").value,
     demo: document.getElementById("btDemo").checked,
-    opening_range_minutes: document.getElementById("pOrm").value,
-    breakout_buffer_atr: document.getElementById("pBuf").value,
-    min_strength: document.getElementById("pStr").value,
-    target_r: document.getElementById("pTr").value,
-    stop_r: document.getElementById("pSr").value,
-    iv: document.getElementById("pIv").value,
-    dte: document.getElementById("pDte").value,
-    cost_per_trade: document.getElementById("pCost").value,
   });
   return p.toString();
 }
@@ -736,23 +713,22 @@ function renderSimChart(curve) {
 }
 
 function renderSimTrades(trades) {
-  if (!trades || !trades.length) { document.getElementById("btResult").innerHTML = `<div class="empty">No qualifying breakouts in this period. Try a longer lookback or looser parameters.</div>`; return; }
+  if (!trades || !trades.length) { document.getElementById("btResult").innerHTML = `<div class="empty">No qualifying break/retests in this period. Try a longer lookback or Demo data.</div>`; return; }
   const rows = trades.map((t, i) => `<tr>
     <td class="mut">${i + 1}</td>
     <td class="mut">${t.session || "-"}</td>
-    <td>${(t.spread_type||"").replace(/_/g, " ")}</td>
+    <td class="mut">${t.day || "-"}</td>
     <td>${dirPill(t.direction)}</td>
-    <td><span class="pill">${t.regime}</span></td>
     <td>${fmt(t.entry_value)}</td>
     <td>${fmt(t.exit_value)}</td>
-    <td class="pos">${fmt(t.tp)}</td>
     <td class="neg">${fmt(t.sl)}</td>
     <td class="mut">${(t.exit_reason||"").replace(/_/g, " ")}</td>
+    <td class="mut">${fmt(t.r_multiple)}</td>
     <td class="${cls(t.pnl)}">${sign(t.pnl)}</td>
   </tr>`).join("");
   document.getElementById("btResult").innerHTML =
     `<h2 style="margin-top:18px;font-size:13px">Simulated trades <span class="hint">${trades.length} trades</span></h2>
-     <div style="overflow-x:auto"><table><thead><tr><th>#</th><th>Session</th><th>Strategy</th><th>Dir</th><th>Regime</th><th>Entry</th><th>Exit</th><th>TP</th><th>SL</th><th>Exit reason</th><th>P&L</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+     <div style="overflow-x:auto"><table><thead><tr><th>#</th><th>Session</th><th>Day</th><th>Dir</th><th>Entry</th><th>Exit</th><th>Stop</th><th>Exit reason</th><th>R</th><th>P&L</th></tr></thead><tbody>${rows}</tbody></table></div>`;
 }
 
 async function runBacktest() {
@@ -761,7 +737,9 @@ async function runBacktest() {
   try {
     const j = await getJSON("/api/backtest?" + backtestQuery());
     if (j.error) { note.textContent = ""; document.getElementById("btResult").innerHTML = `<div class="empty">${j.error}${j.hint ? " - " + j.hint : ""}</div>`; return; }
-    note.textContent = `source: ${j.data_source}${j.warning ? " (" + j.warning + ")" : ""}`;
+    const wf = j.walk_forward_70_30;
+    const oos = wf && wf.out_of_sample ? ` · OOS trades ${wf.out_of_sample.trades ?? "-"}` : "";
+    note.textContent = `source: ${j.data_source}${j.warning ? " (" + j.warning + ")" : ""}${oos}`;
     renderBacktestMetrics(j);
     renderSimChart(j.equity_curve || []);
     renderSimTrades(j.trades || []);
@@ -792,13 +770,8 @@ async function useFormForTrading() {
   const r = await selectForTrading({
     symbol: document.getElementById("btSymbol").value,
     window: document.getElementById("btWindow").value,
-    opening_range_minutes: document.getElementById("pOrm").value,
-    breakout_buffer_atr: document.getElementById("pBuf").value,
-    min_strength: document.getElementById("pStr").value,
-    target_r: document.getElementById("pTr").value,
-    stop_r: document.getElementById("pSr").value,
   });
-  if (r && r.ok) document.getElementById("btNote").textContent = `now trading ${r.symbol} ${r.window} with the chosen parameters`;
+  if (r && r.ok) document.getElementById("btNote").textContent = `now trading ${r.symbol} ${r.window}`;
 }
 
 async function useDefaultsForTrading() {
@@ -811,65 +784,43 @@ async function useDefaultsForTrading() {
 
 async function runOptimise() {
   const note = document.getElementById("btNote");
-  note.textContent = "optimising (grid search, may take a few seconds)...";
+  note.textContent = "running 70/30 walk-forward...";
   try {
     const j = await getJSON("/api/optimise?" + backtestQuery() + "&top_n=8");
     if (j.error) { note.textContent = ""; document.getElementById("btResult").innerHTML = `<div class="empty">${j.error}${j.hint ? " - " + j.hint : ""}</div>`; return; }
-    const distinct = j.distinct_outcomes ?? j.top.length;
-    note.textContent = `tested ${j.combinations_tested} combinations (${distinct} distinct outcomes) on ${j.data_source} data`;
-    document.getElementById("btMetrics").innerHTML = "";
-    document.getElementById("simChart").style.display = "none";
-    const rows = j.top.map((r, i) => {
+    note.textContent = `source: ${j.data_source}${j.note ? " · " + j.note : ""}`;
+    const top = j.top || [];
+    const rows = top.map((r, i) => {
       const m = r.metrics || {};
-      const p = r.params || {};
-      return `<tr class="${i === 0 ? "best-row" : ""}">
-        <td>${i === 0 ? "<b>#1 best</b>" : "#" + (i + 1)}</td>
-        <td class="${cls(r.score)}">${fmt(r.score)}</td>
-        <td>${p.opening_range_minutes}m</td>
-        <td>${fmt(p.breakout_buffer_atr)}</td>
-        <td>${fmt(p.min_strength)}</td>
-        <td>${m.trades}</td>
-        <td>${pct(m.win_rate)}</td>
-        <td class="${cls(m.expectancy)}">${sign(m.expectancy)}</td>
-        <td>${PF(m.profit_factor)}</td>
-        <td class="${cls(m.max_drawdown)}">${money(m.max_drawdown)}</td>
-        <td class="${cls(m.total_pnl)}">${sign(m.total_pnl)}</td>
-        <td><button data-orm="${p.opening_range_minutes}" data-buf="${p.breakout_buffer_atr}" data-str="${p.min_strength}" data-tr="${p.target_r}" data-sr="${p.stop_r}" data-id="${i === 0 && j.persisted_id ? j.persisted_id : ""}" class="applyBtn">Use for trading</button></td>
+      return `<tr>
+        <td>${r.label || i + 1}</td>
+        <td>${m.trades ?? "-"}</td>
+        <td>${m.win_rate !== undefined ? pct(m.win_rate) : "-"}</td>
+        <td class="${cls(m.expectancy)}">${m.expectancy !== undefined ? sign(m.expectancy) : "-"}</td>
+        <td class="${cls(m.total_pnl)}">${m.total_pnl !== undefined ? sign(m.total_pnl) : "-"}</td>
+        <td>${fmt(r.score)}</td>
       </tr>`;
     }).join("");
     document.getElementById("btResult").innerHTML =
-      `<h2 style="margin-top:18px;font-size:13px">Optimiser ranking <span class="hint">${j.top.length} distinct of ${j.combinations_tested} combinations tested, best saved to history. Click Use for trading to apply that set to live entries for this symbol/window.</span></h2>
-       <div style="overflow-x:auto"><table><thead><tr><th>Rank</th><th>Score</th><th>Open range</th><th>Buffer ATR</th><th>Min str.</th><th>Trades</th><th>Win%</th><th>Expectancy</th><th>PF</th><th>Max DD</th><th>Total P&L</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`;
-    document.querySelectorAll(".applyBtn").forEach(b => b.addEventListener("click", async () => {
-      fillAdvancedParams(b);
-      const opts = {
-        symbol: document.getElementById("btSymbol").value,
-        window: document.getElementById("btWindow").value,
-        opening_range_minutes: b.dataset.orm,
-        breakout_buffer_atr: b.dataset.buf,
-        min_strength: b.dataset.str,
-      };
-      if (b.dataset.tr && b.dataset.tr !== "undefined") opts.target_r = b.dataset.tr;
-      if (b.dataset.sr && b.dataset.sr !== "undefined") opts.stop_r = b.dataset.sr;
-      if (b.dataset.id) opts.backtest_id = b.dataset.id;
-      await selectForTrading(opts);
-    }));
-    loadOptimisations();
+      `<h2 style="margin-top:18px;font-size:13px">Walk-forward 70/30</h2>
+       <div style="overflow-x:auto"><table><thead><tr><th>Split</th><th>Trades</th><th>Win%</th><th>Expectancy</th><th>Total P&L</th><th>Score</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+    await loadOptimisations();
   } catch (e) { note.textContent = "error: " + e; }
 }
 
 async function loadOptimisations() {
   const d = await getJSON("/api/optimisations?limit=50");
-  if (!d.runs || !d.runs.length) { document.getElementById("optHistory").innerHTML = `<div class="empty">No optimisations saved yet. Click "Optimise" above to run one.</div>`; return; }
+  if (!d.runs || !d.runs.length) { document.getElementById("optHistory").innerHTML = `<div class="empty">No walk-forward runs saved yet. Click "Walk-forward 70/30" above.</div>`; return; }
   const rows = d.runs.map(r => {
     const m = r.metrics || {};
     const p = r.params || {};
-    const paramStr = p.grid ? `grid x${p.folds || "?"} folds` :
-      `OR ${p.opening_range_minutes}m, buf ${fmt(p.breakout_buffer_atr)}, str ${fmt(p.min_strength)}, TR ${fmt(p.target_r)}`;
-    const useBtn = p.grid ? "" : `<button data-id="${r.id}" class="histUseBtn">Use for trading</button>`;
+    const paramStr = p.entry_model
+      ? `${p.symbol || r.symbol} ${p.walk_forward || "5ORB"}`
+      : `OR ${p.opening_range_minutes}m, buf ${fmt(p.breakout_buffer_atr)}`;
+    const useBtn = `<button data-id="${r.id}" class="histUseBtn">Use for trading</button>`;
     return `<tr class="${r.is_active ? "best-row" : ""}">
       <td class="mut">${fmtGmt(r.created_at)}</td>
-      <td>${r.label}${r.is_out_of_sample ? ' <span class="tag oos">OOS</span>' : ""}${r.is_active ? ' <span class="tag oos">active</span>' : ""}</td>
+      <td>${r.label}${r.is_active ? ' <span class="tag oos">active</span>' : ""}</td>
       <td>${r.symbol}</td>
       <td>${(r.window||"").replace(/_/g, " ")}</td>
       <td class="mut">${paramStr}</td>
@@ -972,7 +923,6 @@ document.getElementById("sigBtn").addEventListener("click", loadSignals);
 document.getElementById("btRun").addEventListener("click", runBacktest);
 document.getElementById("btOpt").addEventListener("click", runOptimise);
 document.getElementById("autoToggle").addEventListener("click", toggleAuto);
-document.getElementById("useParamsBtn").addEventListener("click", useFormForTrading);
 document.getElementById("autoDefaults").addEventListener("click", useDefaultsForTrading);
 document.getElementById("tickerSymbol").addEventListener("change", loadTicker);
 document.getElementById("tickerHours").addEventListener("change", loadTicker);

@@ -30,16 +30,9 @@ from core.active_params import (
     strategy_by_window,
     strategy_payload,
 )
-from core.analytics import daily_revenue, performance_metrics, summarize
+from core.analytics import daily_revenue, monte_carlo, performance_metrics, summarize
 from core.autotrade_state import load_state, save_state, should_autostart, start_kwargs
-from core.backtest import (
-    DEFAULT_ORB_GRID,
-    BacktestParams,
-    dedupe_by_outcome,
-    grid_search,
-    run_backtest,
-)
-from core.backtest import _score as score_metrics
+from core.backtest_mes import run_mes_5orb_backtest, walk_forward_mes_7030
 from core.config import get_settings
 from core.db import Database, is_tradable_orb_params
 from core.engine import build_trade_plan, place_trade_plan, resolve_window, settle_session_exits
@@ -48,6 +41,8 @@ from core.journal import close_open_paper_trades, mark_open_trade, paper_account
 from core.marketdata import fetch_bars_with_fallback
 from core.models import Regime, SessionWindow, TradeStatus
 from core.risk import RiskManager
+from core.strategy.mes_5orb.markets import coerce_futures_symbol, is_supported_futures
+from core.strategy.mes_5orb.sessions import clear_mes_5orb_config_cache, load_mes_5orb_config
 from core.sessions import active_window, describe_windows_gmt
 from core.strategy.orb import compute_orb_signal
 from core.timeutils import as_naive_utc, utcnow
@@ -112,15 +107,62 @@ _bars_cache: dict[tuple, tuple[float, tuple[list, str, str | None]]] = {}
 
 def _resolve_window(window: str) -> SessionWindow:
     w = (window or "new_york").lower()
-    if w in ("auto", "active", "current"):
+    if w in ("auto", "active", "current", "asia"):
+        # Futures 5ORB has London + New York only; Asia maps to NY for UI compat.
         return SessionWindow.NEW_YORK
+    if w in ("ny", "newyork", "new_york"):
+        return SessionWindow.NEW_YORK
+    if w == "london":
+        return SessionWindow.LONDON
     return SessionWindow(w)
+
+
+def _mes_score(metrics: dict[str, Any]) -> float:
+    """Simple rank score for futures runs (expectancy + win rate − drawdown)."""
+    if not metrics or int(metrics.get("trades") or 0) == 0:
+        return -1e9
+    exp = float(metrics.get("expectancy") or 0)
+    wr = float(metrics.get("win_rate") or 0)
+    dd = float(metrics.get("max_drawdown_pct") or 0)
+    return exp * (0.5 + wr) - abs(dd) * 100
+
+
+def _mes_trades_for_ui(trades: list) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for t in trades:
+        d = t.as_dict() if hasattr(t, "as_dict") else dict(t)
+        rows.append(
+            {
+                "session": d.get("session_name") or d.get("session"),
+                "spread_type": "futures_5orb",
+                "direction": d.get("direction"),
+                "regime": "trend",
+                "entry_value": d.get("entry_price"),
+                "exit_value": d.get("exit_price"),
+                "tp": None,
+                "sl": d.get("stop_final") or d.get("stop_initial"),
+                "exit_reason": d.get("exit_reason"),
+                "pnl": d.get("pnl_usd"),
+                "day": d.get("day"),
+                "r_multiple": d.get("r_multiple"),
+                "contracts": d.get("contracts"),
+                "points": d.get("points"),
+            }
+        )
+    return rows
+
+
+def _filter_bars_for_window(bars: list, window: SessionWindow) -> list:
+    """Optional session filter: keep full series (strategy is session-aware)."""
+    _ = window
+    return bars
 
 
 async def _load_history(
     symbol: str, *, demo: bool, lookback_days: int, seed: int
 ) -> tuple[list, str, str | None]:
     """Fetch historical bars (IBKR live history, or synthetic in demo mode)."""
+    symbol = coerce_futures_symbol(symbol) if is_supported_futures(symbol) else symbol.upper()
     key = (symbol.upper(), demo, lookback_days, seed)
     now = time.monotonic()
     cached = _bars_cache.get(key)
@@ -162,31 +204,6 @@ def _with_mark(trade, spots: dict[str, float]) -> dict[str, Any]:
         return payload
     payload.update(mark_open_trade(trade, spot))
     return payload
-
-
-def _params_from_query(q) -> BacktestParams:
-    """Build BacktestParams from query params, falling back to defaults."""
-    d = BacktestParams()
-
-    def num(name: str, cast, default):
-        raw = q.get(name)
-        if raw is None or raw == "":
-            return default
-        try:
-            return cast(raw)
-        except (TypeError, ValueError):
-            return default
-
-    return BacktestParams(
-        opening_range_minutes=num("opening_range_minutes", int, d.opening_range_minutes),
-        breakout_buffer_atr=num("breakout_buffer_atr", float, d.breakout_buffer_atr),
-        min_strength=num("min_strength", float, d.min_strength),
-        target_r=num("target_r", float, d.target_r),
-        stop_r=num("stop_r", float, d.stop_r),
-        iv=num("iv", float, d.iv),
-        dte=num("dte", int, d.dte),
-        cost_per_trade=num("cost_per_trade", float, d.cost_per_trade),
-    )
 
 
 def _equity_curve(pnls: list[float], starting: float = 0.0) -> list[dict]:
@@ -796,19 +813,15 @@ async def api_ticker(request: Request) -> JSONResponse:
 
 
 async def api_backtest(request: Request) -> JSONResponse:
-    """Run a single ORB spread backtest over historical (or demo) data.
-
-    Returns the performance metrics, the simulated trades, and a simulated
-    equity curve so the GUI can plot the run.
-    """
+    """Run a futures 5ORB break/retest backtest (optional 70/30 walk-forward)."""
     q = request.query_params
     settings = get_settings()
-    symbol = q.get("symbol", settings.default_symbol)
+    symbol = coerce_futures_symbol(q.get("symbol", settings.default_symbol))
     window = _resolve_window(q.get("window", "new_york"))
     demo = q.get("demo", "false").lower() == "true"
     lookback_days = max(int(q.get("lookback_days", "30") or 30), 5)
     seed = int(q.get("seed", "3") or 3)
-    params = _params_from_query(q)
+    walk_forward = q.get("walk_forward", "true").lower() != "false"
 
     try:
         bars, source, warning = await _load_history(
@@ -816,35 +829,75 @@ async def api_backtest(request: Request) -> JSONResponse:
         )
     except IBKRUnavailable as exc:
         return JSONResponse(
-            {"error": str(exc), "hint": "Tick 'Demo data' to run offline, or start IB Gateway."}
+            {
+                "error": str(exc),
+                "hint": "Tick 'Demo data' to run offline, or start IB Gateway.",
+            }
         )
 
-    result = await anyio.to_thread.run_sync(lambda: run_backtest(bars, window, params).summary())
-    pnls = [t["pnl"] for t in result["trades"]]
-    result["equity_curve"] = _equity_curve(pnls)
-    result["score"] = round(score_metrics(result), 4)
-    result["data_source"] = source
-    result["warning"] = warning
-    result["symbol"] = symbol
-    result["lookback_days"] = lookback_days
-    result["bars_analysed"] = len(bars)
+    clear_mes_5orb_config_cache()
+    cfg = load_mes_5orb_config(symbol)
+    bars = _filter_bars_for_window(bars, window)
+
+    def _run():
+        bt = run_mes_5orb_backtest(bars, cfg=cfg)
+        summary = bt.summary()
+        combined = summary.get("combined") or {}
+        trades_ui = _mes_trades_for_ui(bt.trades)
+        pnls = [float(t["pnl"] or 0) for t in trades_ui]
+        metrics = summarize(pnls) if pnls else combined
+        if "monte_carlo" not in metrics and pnls:
+            metrics = {**metrics, "monte_carlo": monte_carlo(pnls)}
+        payload = {
+            "window": window.value,
+            "params": {
+                "entry_model": "mes_5orb",
+                "symbol": cfg.symbol,
+                "point_value": cfg.point_value,
+                "tick_size": cfg.tick_size,
+                "risk_pct": cfg.risk.risk_pct,
+            },
+            "num_trades": len(trades_ui),
+            "metrics": metrics,
+            "trades": trades_ui,
+            "by_session": summary.get("by_session") or {},
+            "score": round(_mes_score(metrics), 4),
+            "equity_curve": _equity_curve(pnls),
+            "data_source": source,
+            "warning": warning,
+            "symbol": symbol,
+            "lookback_days": lookback_days,
+            "bars_analysed": len(bars),
+        }
+        if walk_forward:
+            wf = walk_forward_mes_7030(bars, cfg=cfg, is_fraction=0.70)
+            payload["walk_forward_70_30"] = {
+                "method": wf.get("method"),
+                "is_fraction": wf.get("is_fraction"),
+                "oos_fraction": wf.get("oos_fraction"),
+                "total_trading_days": wf.get("total_trading_days"),
+                "in_sample": wf.get("in_sample"),
+                "out_of_sample": wf.get("out_of_sample"),
+                "note": wf.get("walk_forward_note") or wf.get("error"),
+            }
+        return payload
+
+    try:
+        result = await anyio.to_thread.run_sync(_run)
+    except Exception as exc:
+        return JSONResponse({"error": f"Backtest failed: {exc}"})
     return JSONResponse(result)
 
 
 async def api_optimise(request: Request) -> JSONResponse:
-    """Grid-search the ORB parameter space and return the ranked top-N.
-
-    The best run is persisted to the backtests table so it appears in the
-    'Optimisations made' history.
-    """
+    """70/30 walk-forward report for the chosen futures symbol (no options grid)."""
     q = request.query_params
     settings = get_settings()
-    symbol = q.get("symbol", settings.default_symbol)
+    symbol = coerce_futures_symbol(q.get("symbol", settings.default_symbol))
     window = _resolve_window(q.get("window", "new_york"))
     demo = q.get("demo", "false").lower() == "true"
     lookback_days = max(int(q.get("lookback_days", "60") or 60), 10)
     seed = int(q.get("seed", "3") or 3)
-    top_n = max(min(int(q.get("top_n", "5") or 5), 25), 1)
 
     try:
         bars, source, warning = await _load_history(
@@ -852,28 +905,67 @@ async def api_optimise(request: Request) -> JSONResponse:
         )
     except IBKRUnavailable as exc:
         return JSONResponse(
-            {"error": str(exc), "hint": "Tick 'Demo data' to run offline, or start IB Gateway."}
+            {
+                "error": str(exc),
+                "hint": "Tick 'Demo data' to run offline, or start IB Gateway.",
+            }
         )
 
-    ranked = await anyio.to_thread.run_sync(
-        lambda: grid_search(bars, window, DEFAULT_ORB_GRID)
-    )
-    distinct = dedupe_by_outcome(ranked)
-    top = [
-        {"params": r["params"], "score": r["score"], "metrics": r["metrics"]}
-        for r in distinct[:top_n]
-    ]
+    clear_mes_5orb_config_cache()
+    cfg = load_mes_5orb_config(symbol)
+
+    def _run():
+        wf = walk_forward_mes_7030(bars, cfg=cfg, is_fraction=0.70)
+        params = {
+            "entry_model": "mes_5orb",
+            "symbol": cfg.symbol,
+            "walk_forward": "70/30",
+            "point_value": cfg.point_value,
+        }
+
+        def _metrics(period: dict | None) -> dict:
+            if not period:
+                return {}
+            summary = period.get("summary") or {}
+            combined = dict(summary.get("combined") or {})
+            if "trades" not in combined:
+                combined["trades"] = period.get("trade_count") or combined.get("trades") or 0
+            return combined
+
+        oos_m = _metrics(wf.get("out_of_sample") if isinstance(wf, dict) else None)
+        is_m = _metrics(wf.get("in_sample") if isinstance(wf, dict) else None)
+        metrics = oos_m if oos_m.get("trades") else is_m
+        return wf, params, metrics, is_m, oos_m
+
+    try:
+        wf, params, metrics, is_m, oos_m = await anyio.to_thread.run_sync(_run)
+    except Exception as exc:
+        return JSONResponse({"error": f"Walk-forward failed: {exc}"})
 
     persisted_id = None
-    best = distinct[0] if distinct else None
-    if best is not None and best["score"] > -1e8:
+    if metrics and int(metrics.get("trades") or 0) > 0:
         persisted_id = _db.insert_backtest(
-            label=f"optimise {symbol} {window.value} (best of {len(ranked)})",
+            label=f"walk-forward 70/30 {symbol} {window.value}",
             symbol=symbol,
             window=window,
-            params=best["params"],
-            metrics=best["metrics"],
+            params=params,
+            metrics=metrics,
         )
+
+    top = [
+        {
+            "params": params,
+            "score": round(_mes_score(oos_m), 4),
+            "metrics": oos_m,
+            "label": "out_of_sample",
+        },
+        {
+            "params": {**params, "split": "in_sample"},
+            "score": round(_mes_score(is_m), 4),
+            "metrics": is_m,
+            "label": "in_sample",
+        },
+    ]
 
     return JSONResponse(
         {
@@ -882,11 +974,11 @@ async def api_optimise(request: Request) -> JSONResponse:
             "data_source": source,
             "warning": warning,
             "lookback_days": lookback_days,
-            "combinations_tested": len(ranked),
-            "distinct_outcomes": len(distinct),
             "bars_analysed": len(bars),
             "top": top,
             "persisted_id": persisted_id,
+            "walk_forward_70_30": wf,
+            "note": "Futures 5ORB uses chronological 70/30 walk-forward (no options grid).",
         }
     )
 
@@ -903,30 +995,24 @@ async def api_optimisations(request: Request) -> JSONResponse:
 
 
 async def api_strategy_select(request: Request) -> JSONResponse:
-    """Make an explicit parameter set the one used for live/paper entries."""
+    """Record the selected futures symbol/window as active (params are config-driven)."""
     q = request.query_params
     settings = get_settings()
-    symbol = (q.get("symbol") or settings.default_symbol).upper()
+    symbol = coerce_futures_symbol(q.get("symbol") or settings.default_symbol)
     bid_raw = q.get("backtest_id")
     try:
         if bid_raw not in (None, ""):
             run = _db.get_backtest(int(bid_raw))
             if run is None:
                 return JSONResponse({"ok": False, "error": "No saved run with that id."})
-            if not is_tradable_orb_params(run["params"]):
-                return JSONResponse(
-                    {"ok": False, "error": "That run is a walk-forward grid, not a tradable set."}
-                )
-            symbol = (run["symbol"] or symbol).upper()
+            symbol = coerce_futures_symbol(run["symbol"] or symbol)
             window = SessionWindow(run["window"])
-            params = run["params"]
+            params = run["params"] or {"entry_model": "mes_5orb", "symbol": symbol}
             label = run["label"]
             backtest_id = run["id"]
         else:
             window = _resolve_window(q.get("window", "new_york"))
-            params = _params_from_query(q).as_dict()
-            if not is_tradable_orb_params(params):
-                return JSONResponse({"ok": False, "error": "Missing ORB parameters."})
+            params = {"entry_model": "mes_5orb", "symbol": symbol}
             backtest_id = None
             label = f"selected {symbol} {window.value}"
         chosen = _db.set_active_strategy(

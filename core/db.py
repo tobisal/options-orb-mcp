@@ -571,11 +571,17 @@ class Database:
 
 
 def is_tradable_orb_params(params: Any) -> bool:
-    return (
-        isinstance(params, dict)
-        and "opening_range_minutes" in params
-        and "grid" not in params
-    )
+    if not isinstance(params, dict) or "grid" in params:
+        return False
+    # Legacy options ORB sets.
+    if "opening_range_minutes" in params:
+        return True
+    # Futures 5ORB config / walk-forward payloads.
+    if params.get("entry_model") in {"mes_5orb", "futures_5orb"}:
+        return True
+    if params.get("symbol") and params.get("walk_forward"):
+        return True
+    return False
 
 
 def _row_to_trade(row: sqlite3.Row) -> TradeRecord:
