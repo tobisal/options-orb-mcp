@@ -1,4 +1,4 @@
-"""MES 5ORB session windows and config loader."""
+"""5ORB session windows and per-symbol futures config loader."""
 
 from __future__ import annotations
 
@@ -9,8 +9,19 @@ from functools import lru_cache
 from typing import Any
 
 from core.config import REPO_ROOT
+from core.strategy.mes_5orb.markets import (
+    DEFAULT_FUTURES_SYMBOL,
+    coerce_futures_symbol,
+    get_futures_market,
+    is_supported_futures,
+    normalize_futures_symbol,
+)
 
-_CONFIG_PATH = REPO_ROOT / "configs" / "mes_5orb.json"
+_LEGACY_CONFIG_PATH = REPO_ROOT / "configs" / "mes_5orb.json"
+
+
+def _config_path_for(symbol: str):
+    return REPO_ROOT / "configs" / f"{symbol.lower()}_5orb.json"
 
 
 def _parse_hhmm(s: str) -> time:
@@ -57,9 +68,10 @@ class MesRiskConfig:
 
 @dataclass(frozen=True)
 class Mes5OrbConfig:
-    symbol: str = "MES"
+    symbol: str = DEFAULT_FUTURES_SYMBOL
     point_value: float = 5.0
     tick_size: float = 0.25
+    exchange: str = "CME"
     timezone: str = "America/New_York"
     sessions: tuple[MesSession, ...] = ()
     trailing_stop: TrailingStopConfig = field(default_factory=TrailingStopConfig)
@@ -70,7 +82,6 @@ class Mes5OrbConfig:
         for s in self.sessions:
             if s.name == key or s.name.replace("_", "") == key.replace("_", ""):
                 return s
-        # aliases
         if key in ("ny", "newyork", "new_york"):
             return next((s for s in self.sessions if s.name == "new_york"), None)
         if key == "london":
@@ -78,7 +89,7 @@ class Mes5OrbConfig:
         return None
 
 
-def _session_from_raw(name: str, raw: dict[str, Any]) -> MesSession:
+def _session_from_raw(name: str, raw: dict[str, Any], *, defaults: OpeningRangeFilter) -> MesSession:
     or_raw = raw.get("opening_range") or {}
     rt_raw = raw.get("retest") or {}
     return MesSession(
@@ -88,8 +99,8 @@ def _session_from_raw(name: str, raw: dict[str, Any]) -> MesSession:
         search_end=_parse_hhmm(str(raw.get("search_end", "15:00"))),
         force_flat=_parse_hhmm(str(raw.get("force_flat", "15:55"))),
         opening_range=OpeningRangeFilter(
-            min_range_points=float(or_raw.get("min_range_points", 0.75)),
-            max_range_points=float(or_raw.get("max_range_points", 6.0)),
+            min_range_points=float(or_raw.get("min_range_points", defaults.min_range_points)),
+            max_range_points=float(or_raw.get("max_range_points", defaults.max_range_points)),
         ),
         retest=RetestConfig(
             tolerance_ticks=int(rt_raw.get("tolerance_ticks", 2)),
@@ -99,46 +110,75 @@ def _session_from_raw(name: str, raw: dict[str, Any]) -> MesSession:
     )
 
 
+def _default_sessions(market) -> list[MesSession]:
+    london_or = OpeningRangeFilter(market.london_min_range, market.london_max_range)
+    ny_or = OpeningRangeFilter(market.ny_min_range, market.ny_max_range)
+    return [
+        _session_from_raw(
+            "london",
+            {
+                "or_start": "03:00",
+                "or_end": "03:05",
+                "search_end": "08:00",
+                "force_flat": "08:00",
+            },
+            defaults=london_or,
+        ),
+        _session_from_raw(
+            "new_york",
+            {
+                "or_start": "09:30",
+                "or_end": "09:35",
+                "search_end": "15:00",
+                "force_flat": "15:55",
+            },
+            defaults=ny_or,
+        ),
+    ]
+
+
+def _load_raw(symbol: str) -> dict[str, Any]:
+    path = _config_path_for(symbol)
+    if path.exists():
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    # Back-compat: MES used configs/mes_5orb.json exclusively.
+    if symbol == "MES" and _LEGACY_CONFIG_PATH.exists():
+        with open(_LEGACY_CONFIG_PATH, encoding="utf-8") as fh:
+            return json.load(fh)
+    return {}
+
+
 @lru_cache
-def load_mes_5orb_config() -> Mes5OrbConfig:
-    raw: dict[str, Any] = {}
-    if _CONFIG_PATH.exists():
-        with open(_CONFIG_PATH, encoding="utf-8") as fh:
-            raw = json.load(fh)
+def load_mes_5orb_config(symbol: str | None = None) -> Mes5OrbConfig:
+    """Load 5ORB config for a supported futures symbol (default MES)."""
+    sym = coerce_futures_symbol(symbol)
+    market = get_futures_market(sym)
+    raw = _load_raw(sym)
+    # If JSON declares a different symbol, prefer the requested one when supported.
+    json_sym = normalize_futures_symbol(str(raw.get("symbol") or sym))
+    if is_supported_futures(json_sym) and symbol is None and json_sym != sym:
+        sym = json_sym
+        market = get_futures_market(sym)
+
     sess_raw = raw.get("sessions") or {}
+    london_defaults = OpeningRangeFilter(market.london_min_range, market.london_max_range)
+    ny_defaults = OpeningRangeFilter(market.ny_min_range, market.ny_max_range)
     sessions: list[MesSession] = []
-    for name in ("london", "new_york"):
-        if name in sess_raw:
-            sessions.append(_session_from_raw(name, sess_raw[name]))
-        elif name == "new_york" and "newyork" in sess_raw:
-            sessions.append(_session_from_raw("new_york", sess_raw["newyork"]))
+    for name, defaults in (("london", london_defaults), ("new_york", ny_defaults)):
+        key = name if name in sess_raw else ("newyork" if name == "new_york" and "newyork" in sess_raw else None)
+        if key is not None:
+            sessions.append(_session_from_raw(name, sess_raw[key], defaults=defaults))
     if not sessions:
-        sessions = [
-            _session_from_raw(
-                "london",
-                {
-                    "or_start": "03:00",
-                    "or_end": "03:05",
-                    "search_end": "08:00",
-                    "force_flat": "08:00",
-                },
-            ),
-            _session_from_raw(
-                "new_york",
-                {
-                    "or_start": "09:30",
-                    "or_end": "09:35",
-                    "search_end": "15:00",
-                    "force_flat": "15:55",
-                },
-            ),
-        ]
+        sessions = _default_sessions(market)
+
     trail = raw.get("trailing_stop") or {}
     risk = raw.get("risk") or {}
     return Mes5OrbConfig(
-        symbol=str(raw.get("symbol", "MES")).upper(),
-        point_value=float(raw.get("point_value", 5.0)),
-        tick_size=float(raw.get("tick_size", 0.25)),
+        symbol=sym,
+        point_value=float(raw.get("point_value", market.point_value)),
+        tick_size=float(raw.get("tick_size", market.tick_size)),
+        exchange=str(raw.get("exchange", market.exchange)).upper(),
         timezone=str(raw.get("timezone", "America/New_York")),
         sessions=tuple(sessions),
         trailing_stop=TrailingStopConfig(

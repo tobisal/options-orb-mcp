@@ -59,6 +59,31 @@ def test_load_mes_config():
     assert cfg.session("new_york") is not None
 
 
+def test_load_other_futures_configs():
+    clear_mes_5orb_config_cache()
+    mnq = load_mes_5orb_config("MNQ")
+    assert mnq.symbol == "MNQ"
+    assert mnq.point_value == 2.0
+    assert mnq.tick_size == 0.25
+    mym = load_mes_5orb_config("MYM")
+    assert mym.exchange == "CBOT"
+    assert mym.point_value == 0.5
+    es = load_mes_5orb_config("ES")
+    assert es.point_value == 50.0
+    nq = load_mes_5orb_config("NQ")
+    assert nq.point_value == 20.0
+    m2k = load_mes_5orb_config("M2K")
+    assert m2k.tick_size == 0.1
+
+
+def test_supported_futures_symbols():
+    from core.strategy.mes_5orb.markets import supported_futures_symbols
+
+    syms = supported_futures_symbols()
+    for s in ("MES", "MNQ", "MYM", "M2K", "ES", "NQ"):
+        assert s in syms
+
+
 def test_opening_range_ny():
     # 2026-01-06 is a Tuesday; EST
     day = _et_to_naive_utc(2026, 1, 6, 9, 30).date()

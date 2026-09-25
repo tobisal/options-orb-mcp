@@ -261,8 +261,9 @@ class AutoTrader:
                          "measure. Set ACCOUNT_MODE=paper to use it.",
             }
         self.symbol = (symbol or get_settings().default_symbol or "MES").upper()
-        if self.symbol != "MES":
-            self.symbol = "MES"
+        from core.strategy.mes_5orb.markets import coerce_futures_symbol
+
+        self.symbol = coerce_futures_symbol(self.symbol)
         self.window = window or "auto"
         self.demo = demo
         self.interval = max(float(interval), self.MIN_INTERVAL)
@@ -1063,7 +1064,7 @@ def main() -> None:
     settings = get_settings()
     host = settings.dashboard_host
     port = settings.dashboard_port
-    print(f"MES 5ORB dashboard -> http://{host}:{port}  (env: {settings.trading_environment()})")
+    print(f"Futures 5ORB dashboard -> http://{host}:{port}  (env: {settings.trading_environment()})")
     uvicorn.run(app, host=host, port=port, log_level="warning")
 
 

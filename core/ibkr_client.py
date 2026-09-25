@@ -638,19 +638,33 @@ class IBKRClient:
             for p in poss
         ]
 
-    # --- MES futures -------------------------------------------------------
+    # --- Equity-index futures (MES/MNQ/MYM/M2K/ES/NQ) -----------------------
+    def _future_cont(self, symbol: str) -> Any:
+        from core.strategy.mes_5orb.markets import get_futures_market
+
+        mkt = get_futures_market(symbol)
+        return iba.ContFuture(mkt.symbol, mkt.exchange, currency="USD")
+
+    def _future_template(self, symbol: str) -> Any:
+        from core.strategy.mes_5orb.markets import get_futures_market
+
+        mkt = get_futures_market(symbol)
+        return iba.Future(symbol=mkt.symbol, exchange=mkt.exchange, currency="USD")
+
     def _mes_cont_future(self) -> Any:
-        return iba.ContFuture("MES", "CME", currency="USD")
+        return self._future_cont("MES")
 
     def _mes_future_template(self) -> Any:
-        return iba.Future(symbol="MES", exchange="CME", currency="USD")
+        return self._future_template("MES")
 
-    async def qualify_mes_future(self) -> Any:
-        """Qualify the nearest MES front-month Future (tradable)."""
-        details = await self.ib.reqContractDetailsAsync(self._mes_future_template())
+    async def qualify_future(self, symbol: str = "MES") -> Any:
+        """Qualify the nearest front-month Future for a supported symbol."""
+        from core.strategy.mes_5orb.markets import coerce_futures_symbol
+
+        symbol = coerce_futures_symbol(symbol)
+        details = await self.ib.reqContractDetailsAsync(self._future_template(symbol))
         if not details:
-            # Fall back to continuous for data; trading may still fail later.
-            return await self._qualify(self._mes_cont_future())
+            return await self._qualify(self._future_cont(symbol))
         today = utcnow().strftime("%Y%m%d")
         candidates = []
         for d in details:
@@ -663,8 +677,12 @@ class IBKRClient:
         candidates.sort(key=lambda c: str(getattr(c, "lastTradeDateOrContractMonth", "") or ""))
         return await self._qualify(candidates[0])
 
-    async def historical_bars_mes(
+    async def qualify_mes_future(self) -> Any:
+        return await self.qualify_future("MES")
+
+    async def historical_bars_future(
         self,
+        symbol: str = "MES",
         *,
         duration: str = "2 D",
         bar_size: str = "5 mins",
@@ -672,11 +690,14 @@ class IBKRClient:
         what_to_show: str = "TRADES",
         end_datetime: str = "",
     ) -> list[Bar]:
-        """Fetch MES futures OHLCV via ContFuture (continuous history)."""
+        """Fetch futures OHLCV via ContFuture (continuous history)."""
+        from core.strategy.mes_5orb.markets import coerce_futures_symbol
+
+        symbol = coerce_futures_symbol(symbol)
         try:
-            contract = await self._qualify(self._mes_cont_future())
+            contract = await self._qualify(self._future_cont(symbol))
         except IBKRUnavailable:
-            contract = await self.qualify_mes_future()
+            contract = await self.qualify_future(symbol)
         end = end_datetime.strip()
         if end and " " in end and not end.upper().endswith("UTC") and " GMT" not in end.upper():
             end = f"{end} UTC"
@@ -704,26 +725,45 @@ class IBKRClient:
             )
         return bars
 
-    async def place_mes_bracket(
+    async def historical_bars_mes(
         self,
+        *,
+        duration: str = "2 D",
+        bar_size: str = "5 mins",
+        use_rth: bool = False,
+        what_to_show: str = "TRADES",
+        end_datetime: str = "",
+    ) -> list[Bar]:
+        return await self.historical_bars_future(
+            "MES",
+            duration=duration,
+            bar_size=bar_size,
+            use_rth=use_rth,
+            what_to_show=what_to_show,
+            end_datetime=end_datetime,
+        )
+
+    async def place_future_bracket(
+        self,
+        symbol: str,
         *,
         side: str,
         contracts: int,
         stop_price: float,
         entry_limit: float | None = None,
     ) -> dict[str, Any]:
-        """Place MES market (or limit) entry with an attached stop.
+        """Place futures market (or limit) entry with an attached stop."""
+        from core.strategy.mes_5orb.markets import coerce_futures_symbol
 
-        ``side`` is BUY or SELL. Trailing is managed in software (modify stop).
-        """
-        contract = await self.qualify_mes_future()
+        symbol = coerce_futures_symbol(symbol)
+        contract = await self.qualify_future(symbol)
         qty = max(int(contracts), 0)
         if qty <= 0:
             return {"ok": False, "error": "No contracts to place."}
         action = side.upper()
         if action not in {"BUY", "SELL"}:
             return {"ok": False, "error": f"Invalid side {side}"}
-        order_ref = f"MES-{utcnow():%Y%m%d%H%M%S}"
+        order_ref = f"{symbol}-{utcnow():%Y%m%d%H%M%S}"
         if entry_limit is not None:
             entry = iba.LimitOrder(action, qty, round(float(entry_limit), 2), tif="DAY")
         else:
@@ -753,21 +793,39 @@ class IBKRClient:
             "stop_trade_id": getattr(getattr(sl_trade, "order", None), "orderId", None),
         }
 
-    async def modify_mes_stop(
+    async def place_mes_bracket(
         self,
+        *,
+        side: str,
+        contracts: int,
+        stop_price: float,
+        entry_limit: float | None = None,
+    ) -> dict[str, Any]:
+        return await self.place_future_bracket(
+            "MES",
+            side=side,
+            contracts=contracts,
+            stop_price=stop_price,
+            entry_limit=entry_limit,
+        )
+
+    async def modify_future_stop(
+        self,
+        symbol: str,
         order_ref: str,
         *,
         stop_price: float,
         contracts: int,
         side: str,
     ) -> dict[str, Any]:
-        """Cancel existing MES stop child and place a new stop at ``stop_price``."""
-        contract = await self.qualify_mes_future()
+        """Cancel existing stop child and place a new stop at ``stop_price``."""
+        from core.strategy.mes_5orb.markets import coerce_futures_symbol
+
+        symbol = coerce_futures_symbol(symbol)
+        contract = await self.qualify_future(symbol)
         stop_ref = f"{order_ref}-STOP"
         self._cancel_working_for_ref(order_ref)
         await asyncio.sleep(0.2)
-        exit_action = "SELL" if side.upper() == "BUY" else "BUY"
-        # If parent ref was BUY (long), exit is SELL
         if side.upper() in {"LONG", "BUY"}:
             exit_action = "SELL"
         else:
@@ -779,24 +837,43 @@ class IBKRClient:
         status = getattr(getattr(trade, "orderStatus", None), "status", "Submitted")
         return {"ok": True, "order_ref": stop_ref, "status": status, "stop_price": stop_price}
 
-    async def close_mes_position(
+    async def modify_mes_stop(
         self,
+        order_ref: str,
+        *,
+        stop_price: float,
+        contracts: int,
+        side: str,
+    ) -> dict[str, Any]:
+        return await self.modify_future_stop(
+            "MES",
+            order_ref,
+            stop_price=stop_price,
+            contracts=contracts,
+            side=side,
+        )
+
+    async def close_future_position(
+        self,
+        symbol: str,
         *,
         contracts: int,
         side: str,
         order_ref: str,
     ) -> dict[str, Any]:
-        """Flatten MES: cancel working orders, market close."""
-        contract = await self.qualify_mes_future()
+        """Flatten futures: cancel working orders, market close."""
+        from core.strategy.mes_5orb.markets import coerce_futures_symbol
+
+        symbol = coerce_futures_symbol(symbol)
+        contract = await self.qualify_future(symbol)
         qty = max(int(contracts), 0)
         if qty <= 0:
             return {"ok": False, "error": "No contracts to close."}
         cancelled = self._cancel_working_for_ref(order_ref)
         await asyncio.sleep(0.25)
-        # Determine flat from positions
         pos = 0.0
         for p in self.ib.positions():
-            if getattr(p.contract, "symbol", "") == "MES" and getattr(p.contract, "secType", "") in {
+            if getattr(p.contract, "symbol", "") == symbol and getattr(p.contract, "secType", "") in {
                 "FUT",
                 "CONTFUT",
             }:
@@ -804,7 +881,6 @@ class IBKRClient:
         already_flat = abs(pos) < 0.01
         if already_flat:
             return {"ok": True, "already_flat": True, "cancelled": cancelled, "status": "Inactive"}
-        # Close opposite to position
         if pos > 0:
             action = "SELL"
             flatten_qty = max(qty, int(round(abs(pos))))
@@ -819,7 +895,11 @@ class IBKRClient:
         try:
             trade = self.ib.placeOrder(contract, close)
         except Exception as exc:
-            return {"ok": False, "error": f"MES flatten rejected: {exc}", "cancelled": cancelled}
+            return {
+                "ok": False,
+                "error": f"{symbol} flatten rejected: {exc}",
+                "cancelled": cancelled,
+            }
         await asyncio.sleep(0.35)
         status = getattr(getattr(trade, "orderStatus", None), "status", "Submitted")
         return {
@@ -829,6 +909,20 @@ class IBKRClient:
             "status": status,
             "order_ref": close.orderRef,
         }
+
+    async def close_mes_position(
+        self,
+        *,
+        contracts: int,
+        side: str,
+        order_ref: str,
+    ) -> dict[str, Any]:
+        return await self.close_future_position(
+            "MES",
+            contracts=contracts,
+            side=side,
+            order_ref=order_ref,
+        )
 
 
 def _clean(x: Any) -> float | None:

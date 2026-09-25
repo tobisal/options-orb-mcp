@@ -1,9 +1,9 @@
 {
-  "_comment": "MES 5ORB break-and-retest. Times America/New_York. point_value=$5/pt, tick=0.25.",
-  "symbol": "MES",
-  "exchange": "CME",
-  "point_value": 5.0,
-  "tick_size": 0.25,
+  "_comment": "MYM 5ORB break-and-retest. Times America/New_York. point_value=$0.50/pt, tick=1.0.",
+  "symbol": "MYM",
+  "exchange": "CBOT",
+  "point_value": 0.5,
+  "tick_size": 1.0,
   "timezone": "America/New_York",
   "sessions": {
     "london": {
@@ -12,8 +12,8 @@
       "search_end": "08:00",
       "force_flat": "08:00",
       "opening_range": {
-        "min_range_points": 0.75,
-        "max_range_points": 6.0
+        "min_range_points": 20.0,
+        "max_range_points": 200.0
       },
       "retest": {
         "tolerance_ticks": 2,
@@ -27,8 +27,8 @@
       "search_end": "15:00",
       "force_flat": "15:55",
       "opening_range": {
-        "min_range_points": 1.0,
-        "max_range_points": 8.0
+        "min_range_points": 30.0,
+        "max_range_points": 300.0
       },
       "retest": {
         "tolerance_ticks": 2,

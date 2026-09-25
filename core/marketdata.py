@@ -18,6 +18,7 @@ from pathlib import Path
 from core.config import REPO_ROOT
 from core.ibkr_client import IBKRClient, IBKRUnavailable
 from core.models import Bar
+from core.strategy.mes_5orb.markets import is_supported_futures
 from core.timeutils import as_naive_utc, utcnow
 
 _BAR_MINUTES = 5
@@ -111,8 +112,10 @@ async def fetch_bars(
     if days > _CHUNK_DAYS:
         return await fetch_bars_range(symbol, days=days, bar_size=bar_size)
     async with IBKRClient() as ib:
-        if symbol.upper() == "MES":
-            return await ib.historical_bars_mes(duration=duration, bar_size=bar_size)
+        if is_supported_futures(symbol):
+            return await ib.historical_bars_future(
+                symbol.upper(), duration=duration, bar_size=bar_size
+            )
         return await ib.historical_bars(symbol, duration=duration, bar_size=bar_size)
 
 
@@ -254,8 +257,9 @@ async def fetch_bars_range(
             if progress:
                 progress(f"IBKR chunk {chunk_i}/{max_chunks}: {_CHUNK_DAYS} D ending {end_str} GMT")
             try:
-                if symbol.upper() == "MES":
-                    chunk = await ib.historical_bars_mes(
+                if is_supported_futures(symbol):
+                    chunk = await ib.historical_bars_future(
+                        symbol.upper(),
                         duration=f"{_CHUNK_DAYS} D",
                         bar_size=bar_size,
                         end_datetime=end_str,

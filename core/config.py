@@ -68,7 +68,8 @@ class Settings(BaseSettings):
     # --- Strategy defaults -------------------------------------------------
     default_symbol: str = Field(default="MES", alias="DEFAULT_SYMBOL")
     default_target_r: float = Field(default=1.5, alias="DEFAULT_TARGET_R")
-    # orb = options vertical ORB; mes_5orb = MES futures break/retest.
+    # orb = options vertical ORB; mes_5orb = futures 5ORB break/retest
+    # (MES/MNQ/MYM/M2K/ES/NQ).
     entry_strategy: str = Field(default="mes_5orb", alias="ENTRY_STRATEGY")
 
     # --- Storage -----------------------------------------------------------

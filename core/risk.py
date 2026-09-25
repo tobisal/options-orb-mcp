@@ -114,7 +114,7 @@ class RiskManager:
         open_count = self.db.open_position_count(environment=env)
         if open_count >= max_concurrent:
             reasons.append(
-                f"MES max concurrent positions reached ({open_count}/{max_concurrent})."
+                f"Futures max concurrent positions reached ({open_count}/{max_concurrent})."
             )
         if open_count >= self.settings.max_open_positions:
             reasons.append(

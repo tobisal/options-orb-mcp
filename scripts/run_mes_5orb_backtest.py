@@ -45,12 +45,17 @@ def load_csv(path: Path) -> list[Bar]:
 
 
 def main() -> int:
-    p = argparse.ArgumentParser(description="MES 5ORB break/retest backtest")
+    p = argparse.ArgumentParser(description="Futures 5ORB break/retest backtest")
+    p.add_argument(
+        "--symbol",
+        default="MES",
+        help="Futures symbol: MES, MNQ, MYM, M2K, ES, NQ (default MES)",
+    )
     p.add_argument(
         "--csv",
         type=Path,
-        default=REPO_ROOT / "data" / "history" / "MES_5mins.csv",
-        help="5-min OHLCV CSV (timestamp,open,high,low,close,volume)",
+        default=None,
+        help="5-min OHLCV CSV (default data/history/{SYMBOL}_5mins.csv)",
     )
     p.add_argument("--out-dir", type=Path, default=REPO_ROOT / "data" / "nightly")
     p.add_argument(
@@ -68,15 +73,16 @@ def main() -> int:
     args = p.parse_args()
 
     clear_mes_5orb_config_cache()
-    cfg = load_mes_5orb_config()
+    cfg = load_mes_5orb_config(args.symbol)
+    csv_path = args.csv or (REPO_ROOT / "data" / "history" / f"{cfg.symbol}_5mins.csv")
 
-    if not args.csv.exists():
-        print(f"CSV not found: {args.csv}", file=sys.stderr)
-        print("Place MES 5-min bars there or pass --csv PATH", file=sys.stderr)
+    if not csv_path.exists():
+        print(f"CSV not found: {csv_path}", file=sys.stderr)
+        print(f"Place {cfg.symbol} 5-min bars there or pass --csv PATH", file=sys.stderr)
         return 1
 
-    bars = load_csv(args.csv)
-    print(f"Loaded {len(bars)} bars from {args.csv}")
+    bars = load_csv(csv_path)
+    print(f"Loaded {len(bars)} bars from {csv_path} ({cfg.symbol})")
     result = run_mes_5orb_backtest(bars, cfg=cfg)
     summary = result.summary()
 
@@ -95,8 +101,8 @@ def main() -> int:
 
     day = datetime.utcnow().strftime("%Y-%m-%d")
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    report_path = args.out_dir / f"mes_5orb_{day}.json"
-    trades_path = args.out_dir / f"mes_5orb_trades_{day}.csv"
+    report_path = args.out_dir / f"{cfg.symbol.lower()}_5orb_{day}.json"
+    trades_path = args.out_dir / f"{cfg.symbol.lower()}_5orb_trades_{day}.csv"
 
     report = {
         "day": day,

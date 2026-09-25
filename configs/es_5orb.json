@@ -1,8 +1,8 @@
 {
-  "_comment": "MES 5ORB break-and-retest. Times America/New_York. point_value=$5/pt, tick=0.25.",
-  "symbol": "MES",
+  "_comment": "ES 5ORB break-and-retest. Times America/New_York. point_value=$50/pt, tick=0.25.",
+  "symbol": "ES",
   "exchange": "CME",
-  "point_value": 5.0,
+  "point_value": 50.0,
   "tick_size": 0.25,
   "timezone": "America/New_York",
   "sessions": {

@@ -1,7 +1,6 @@
-"""Shared trading engine: MES 5ORB break/retest -> futures bracket -> journal.
+"""Shared trading engine: futures 5ORB break/retest -> bracket -> journal.
 
-This build is MES-only. Dashboard auto-trader and execution MCP import these
-functions so paper/live behaviour stays identical.
+Supports CME/CBOT equity-index futures (MES, MNQ, MYM, M2K, ES, NQ).
 """
 
 from __future__ import annotations
@@ -23,6 +22,10 @@ from core.marketdata import fetch_bars_with_fallback
 from core.models import Direction, Regime, SessionWindow, SpreadType, TradeRecord, TradeStatus
 from core.risk import RiskManager
 from core.sessions import active_window
+from core.strategy.mes_5orb.markets import (
+    DEFAULT_FUTURES_SYMBOL,
+    coerce_futures_symbol,
+)
 from core.strategy.mes_5orb.opening_range import to_et
 from core.strategy.mes_5orb.sessions import load_mes_5orb_config
 from core.strategy.mes_5orb.trailing_stop import SwingTrailingStop
@@ -48,17 +51,17 @@ def _mes_session_to_window(session_name: str) -> SessionWindow:
 
 
 async def build_mes_trade_plan(
-    symbol: str = "MES",
+    symbol: str = DEFAULT_FUTURES_SYMBOL,
     window: str = "auto",
     *,
     use_synthetic: bool = False,
     synthetic_seed: int = 42,
     db: Database | None = None,
 ) -> dict[str, Any]:
-    """MES 5ORB signal -> futures plan -> risk sizing. Places no order."""
+    """Futures 5ORB signal -> plan -> risk sizing. Places no order."""
     db = db or Database()
-    cfg = load_mes_5orb_config()
-    symbol = "MES"
+    symbol = coerce_futures_symbol(symbol)
+    cfg = load_mes_5orb_config(symbol)
 
     try:
         bars, source, warning = await fetch_bars_with_fallback(
@@ -73,13 +76,22 @@ async def build_mes_trade_plan(
         return {
             "ok": False,
             "error": str(exc),
-            "hint": "Pass use_synthetic=true for a demo, or place MES_5mins.csv in data/history/.",
+            "hint": (
+                f"Pass use_synthetic=true for a demo, or place {symbol}_5mins.csv "
+                "in data/history/."
+            ),
         }
 
     session_name = None
     if window.lower() not in ("auto", "active", "current"):
-        session_name = "london" if "london" in window.lower() else (
-            "new_york" if "new" in window.lower() or window.lower() in ("ny", "new_york") else None
+        session_name = (
+            "london"
+            if "london" in window.lower()
+            else (
+                "new_york"
+                if "new" in window.lower() or window.lower() in ("ny", "new_york")
+                else None
+            )
         )
 
     signal = evaluate_mes_signal_live(bars, session_name=session_name, cfg=cfg)
@@ -88,6 +100,7 @@ async def build_mes_trade_plan(
         "symbol": symbol,
         "point_value": cfg.point_value,
         "tick_size": cfg.tick_size,
+        "exchange": cfg.exchange,
         "contracts_config": cfg.risk.contracts,
         "max_concurrent": cfg.risk.max_concurrent,
     }
@@ -95,7 +108,7 @@ async def build_mes_trade_plan(
     if not signal.get("ok"):
         return {
             "ok": False,
-            "reason": signal.get("reason", "No MES 5ORB setup"),
+            "reason": signal.get("reason", f"No {symbol} 5ORB setup"),
             "signal": {k: v for k, v in signal.items() if k != "mes_plan"},
             "data_source": source,
             "warning": warning,
@@ -104,6 +117,9 @@ async def build_mes_trade_plan(
 
     mes_plan = signal.get("mes_plan")
     plan_dict = signal.get("plan") or (mes_plan.as_dict() if mes_plan else {})
+    plan_dict["symbol"] = symbol
+    plan_dict["point_value"] = cfg.point_value
+    plan_dict["tick_size"] = cfg.tick_size
     stop_points = float(plan_dict.get("stop_points") or 0)
     rm = RiskManager(db=db)
     win = _mes_session_to_window(str(plan_dict.get("session_name") or "new_york"))
@@ -156,10 +172,10 @@ async def build_trade_plan(
     db: Database | None = None,
     entry_strategy: str | None = None,
 ) -> dict[str, Any]:
-    """MES-only entry point (symbol forced to MES)."""
+    """Futures 5ORB entry point for any supported symbol."""
     _ = target_r, entry_strategy
     return await build_mes_trade_plan(
-        symbol="MES",
+        symbol=symbol,
         window=window,
         use_synthetic=use_synthetic,
         synthetic_seed=synthetic_seed,
@@ -175,7 +191,7 @@ async def place_trade_plan(
     use_synthetic: bool = False,
     db: Database | None = None,
 ) -> dict[str, Any]:
-    """Place an approved MES plan; record it to the journal."""
+    """Place an approved futures plan; record it to the journal."""
     db = db or Database()
     if not preview.get("ok"):
         return preview
@@ -184,39 +200,48 @@ async def place_trade_plan(
 
     plan_dict = dict(preview["plan"])
     settings = get_settings()
+    symbol = coerce_futures_symbol(
+        plan_dict.get("symbol") or symbol or settings.default_symbol
+    )
     direction = Direction(plan_dict.get("direction") or "long")
     session_name = str(plan_dict.get("session_name") or "new_york")
     win = _mes_session_to_window(session_name)
     contracts = int(plan_dict.get("contracts") or 1)
     entry_price = float(plan_dict.get("entry_price") or 0)
     stop_price = float(plan_dict.get("stop_price") or 0)
+    point_value = float(plan_dict.get("point_value") or load_mes_5orb_config(symbol).point_value)
     stop_points = abs(entry_price - stop_price)
-    max_loss = stop_points * float(plan_dict.get("point_value") or 5) * contracts
+    max_loss = stop_points * point_value * contracts
 
     simulate = preview.get("data_source") == "synthetic" or use_synthetic
     side = "BUY" if direction is Direction.LONG else "SELL"
 
     if simulate:
-        order_ref = f"SIM-MES-{utcnow():%Y%m%d%H%M%S}"
+        order_ref = f"SIM-{symbol}-{utcnow():%Y%m%d%H%M%S}"
         environment = f"{settings.trading_environment()}(sim)"
         placement: dict[str, Any] = {"simulated": True, "order_ref": order_ref}
     else:
         try:
             async with IBKRClient(readonly=False) as ib:
-                placement = await ib.place_mes_bracket(
+                placement = await ib.place_future_bracket(
+                    symbol,
                     side=side,
                     contracts=contracts,
                     stop_price=stop_price,
                     entry_limit=None,
                 )
             if not placement.get("ok"):
-                return {"ok": False, "error": placement.get("error", "MES place failed"), **preview}
+                return {
+                    "ok": False,
+                    "error": placement.get("error", f"{symbol} place failed"),
+                    **preview,
+                }
             order_ref = placement["order_ref"]
             environment = settings.trading_environment()
         except IBKRUnavailable as exc:
             if settings.trading_environment() != "PAPER":
                 return {"ok": False, "error": f"Order placement failed: {exc}"}
-            order_ref = f"SIM-MES-{utcnow():%Y%m%d%H%M%S}"
+            order_ref = f"SIM-{symbol}-{utcnow():%Y%m%d%H%M%S}"
             environment = "PAPER(sim)"
             placement = {
                 "simulated": True,
@@ -227,19 +252,21 @@ async def place_trade_plan(
     plan_payload = dict(plan_dict)
     plan_payload["entry_model"] = "mes_5orb"
     plan_payload["instrument"] = "future"
+    plan_payload["symbol"] = symbol
+    plan_payload["point_value"] = point_value
     plan_payload["side"] = side
     plan_payload["use_trailing_stop"] = True
     plan_payload["trail_active"] = False
     plan_payload["original_stop_loss_price"] = stop_price
     plan_payload["stop_loss_price"] = stop_price
 
-    notes = str(plan_dict.get("notes") or "mes_5orb")
+    notes = str(plan_dict.get("notes") or f"{symbol} mes_5orb")
     if placement.get("ibkr_error"):
         notes += f" | IBKR unavailable, simulated paper fill: {placement['ibkr_error']}"
 
     record = TradeRecord(
         environment=environment,
-        symbol="MES",
+        symbol=symbol,
         window=win,
         regime=Regime.TREND,
         spread_type=SpreadType.BULL_CALL if direction is Direction.LONG else SpreadType.BEAR_PUT,
@@ -284,7 +311,6 @@ def _mes_force_flat_due(trade: TradeRecord, cfg, now: datetime | None = None) ->
         session_name = session_name or "new_york"
     sess = cfg.session(session_name) if session_name else None
     if sess is None:
-        # Fallback: map window
         if trade.window is SessionWindow.LONDON:
             sess = cfg.session("london")
         else:
@@ -303,18 +329,15 @@ async def settle_session_exits(
     now_window: SessionWindow | None = None,
     ib: Any = None,
 ) -> list[dict[str, Any]]:
-    """Manage MES trail stops and force-flat at session force_flat times."""
+    """Manage futures trail stops and force-flat at session force_flat times."""
     _ = now_window
-    symbol = "MES"
-    cfg = load_mes_5orb_config()
-    # Do not use equity ORB session_end paper flatten — MES uses force_flat times.
+    symbol = coerce_futures_symbol(symbol)
     closed: list[dict[str, Any]] = []
-
 
     opens = [
         t
         for t in db.query_trades(status=TradeStatus.OPEN, limit=1000)
-        if t.symbol.upper() == "MES"
+        if t.symbol.upper() == symbol
     ]
     if not opens:
         return closed
@@ -333,16 +356,14 @@ async def settle_session_exits(
 
         for trade in opens:
             plan = _parse_plan(trade.plan_json)
-            if plan.get("entry_model") != "mes_5orb" and plan.get("instrument") != "future":
-                # Still treat as MES in this build
-                pass
+            trade_symbol = coerce_futures_symbol(trade.symbol)
+            trade_cfg = load_mes_5orb_config(trade_symbol)
 
             direction = trade.direction
             stop = float(plan.get("stop_loss_price") or trade.entry_price)
-            lag = int(plan.get("trail_pivot_lag") or cfg.trailing_stop.pivot_lag_bars)
-            buffer = float(cfg.trailing_stop.buffer_ticks) * float(cfg.tick_size)
+            lag = int(plan.get("trail_pivot_lag") or trade_cfg.trailing_stop.pivot_lag_bars)
+            buffer = float(trade_cfg.trailing_stop.buffer_ticks) * float(trade_cfg.tick_size)
 
-            # Software trail update on recent bars after entry
             trail = SwingTrailingStop(
                 direction=direction,
                 stop=stop,
@@ -351,7 +372,6 @@ async def settle_session_exits(
             )
             mark = _mes_mark(trade, bars)
             if bars:
-                # Feed last N bars for pivot confirmation
                 for b in bars[-40:]:
                     changed = trail.update(b)
                     if changed is not None:
@@ -361,10 +381,9 @@ async def settle_session_exits(
                             db.update_plan_json(trade.id, plan)
 
             hit = bool(bars) and trail.hit(bars[-1])
-            due_flat = _mes_force_flat_due(trade, cfg)
+            due_flat = _mes_force_flat_due(trade, trade_cfg)
 
             if not hit and not due_flat:
-                # Push stop to broker if trail moved and IBKR-backed
                 if (
                     client is not None
                     and is_ibkr_backed(trade)
@@ -374,7 +393,8 @@ async def settle_session_exits(
                 ):
                     side = "BUY" if direction is Direction.LONG else "SELL"
                     try:
-                        await client.modify_mes_stop(
+                        await client.modify_future_stop(
+                            trade_symbol,
                             trade.order_ref,
                             stop_price=float(plan["stop_loss_price"]),
                             contracts=trade.contracts,
@@ -390,7 +410,8 @@ async def settle_session_exits(
             if is_ibkr_backed(trade) and client is not None and trade.order_ref:
                 side = "BUY" if direction is Direction.LONG else "SELL"
                 try:
-                    result = await client.close_mes_position(
+                    result = await client.close_future_position(
+                        trade_symbol,
                         contracts=trade.contracts,
                         side=side,
                         order_ref=trade.order_ref,

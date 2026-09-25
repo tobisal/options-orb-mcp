@@ -219,19 +219,20 @@ def register_commands(bot: OrbDiscord) -> None:
         )
         return False
 
-    @tree.command(name="help", description="List MES Discord commands")
+    @tree.command(name="help", description="List futures Discord commands")
     async def help_cmd(interaction: discord.Interaction) -> None:
         if not await guard(interaction):
             return
         await interaction.response.send_message(
             clip(
-                "**MES 5ORB remote** (paper). Dashboard must be running.\n"
+                "**Futures 5ORB remote** (paper). Dashboard must be running.\n"
+                "Symbols: MES, MNQ, MYM, M2K, ES, NQ\n"
                 "`/status` account + auto-trade\n"
-                "`/signals` London / New York break-retest state\n"
-                "`/preview` size a MES futures plan (no order)\n"
+                "`/signals [symbol]` London / New York break-retest state\n"
+                "`/preview [window] [symbol]` size a futures plan (no order)\n"
                 "`/positions` open mark-to-market\n"
                 "`/trades` journal\n"
-                "`/auto start|stop|status` paper auto-trader (MES)\n"
+                "`/auto start|stop|status` paper auto-trader\n"
                 "`/optimise` / `/nightly` legacy hooks (options params unused)\n"
                 "Live auto-trade events stream to DISCORD_LOG_CHANNEL_ID."
             ),
@@ -252,17 +253,17 @@ def register_commands(bot: OrbDiscord) -> None:
             return
         await interaction.followup.send(format_status(summary, auto if not auto.get("error") else None))
 
-    @tree.command(name="signals", description="MES 5ORB London / New York state")
-    @app_commands.describe(symbol="Symbol (MES only)")
+    @tree.command(name="signals", description="Futures 5ORB London / New York state")
+    @app_commands.describe(symbol="MES, MNQ, MYM, M2K, ES, or NQ")
     async def signals_cmd(interaction: discord.Interaction, symbol: str = "MES") -> None:
         if not await guard(interaction):
             return
         await interaction.response.defer(thinking=True)
-        data = await bot.api.get("/api/signals", symbol="MES")
+        data = await bot.api.get("/api/signals", symbol=symbol.upper())
         await interaction.followup.send(format_signals(data))
 
-    @tree.command(name="preview", description="Preview MES 5ORB plan (no order)")
-    @app_commands.describe(window="auto, london, or new_york", symbol="MES only")
+    @tree.command(name="preview", description="Preview futures 5ORB plan (no order)")
+    @app_commands.describe(window="auto, london, or new_york", symbol="MES, MNQ, MYM, M2K, ES, or NQ")
     async def preview_cmd(
         interaction: discord.Interaction,
         window: str = "auto",
@@ -272,7 +273,7 @@ def register_commands(bot: OrbDiscord) -> None:
             return
         await interaction.response.defer(thinking=True)
         data = await bot.api.get(
-            "/api/preview", symbol="MES", window=window.lower()
+            "/api/preview", symbol=symbol.upper(), window=window.lower()
         )
         await interaction.followup.send(format_preview(data))
 
@@ -316,7 +317,7 @@ def register_commands(bot: OrbDiscord) -> None:
         await interaction.followup.send(clip("\n".join(lines)))
 
     @auto.command(name="start", description="Start paper auto-trade (dashboard process)")
-    @app_commands.describe(symbol="MES only", window="auto / london / new_york")
+    @app_commands.describe(symbol="MES, MNQ, MYM, M2K, ES, or NQ", window="auto / london / new_york")
     async def auto_start(
         interaction: discord.Interaction,
         symbol: str = "MES",
@@ -333,7 +334,7 @@ def register_commands(bot: OrbDiscord) -> None:
         await interaction.response.defer(thinking=True)
         data = await bot.api.post(
             "/api/autotrade/start",
-            symbol="MES",
+            symbol=symbol.upper(),
             window=window.lower(),
             demo="false",
             interval="60",
