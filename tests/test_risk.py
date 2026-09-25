@@ -56,8 +56,8 @@ def test_futures_risk_pct_1_to_5(tmp_path):
     assert rm.size_futures(10.0, point_value=5.0, risk_pct=5) == 10
     # Clamp above 5% down to 5%.
     assert rm.size_futures(10.0, point_value=5.0, risk_pct=10) == 10
-    # Clamp below 1% up to 1%.
-    assert rm.size_futures(10.0, point_value=5.0, risk_pct=0.5) == 2
+    # Clamp below 1% up to 1% (0.5% → 1%).
+    assert rm.size_futures(10.0, point_value=5.0, risk_pct=0.005) == 2
 
 
 def test_pre_trade_approves_within_budget(tmp_path):
