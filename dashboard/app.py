@@ -217,7 +217,7 @@ class AutoTrader:
         self._db = db
         self._task: asyncio.Task | None = None
         self.running = False
-        self.symbol = "SPY"
+        self.symbol = "MES"
         self.window = "auto"
         self.demo = False
         self.interval = 60.0
@@ -1063,7 +1063,7 @@ def main() -> None:
     settings = get_settings()
     host = settings.dashboard_host
     port = settings.dashboard_port
-    print(f"Options ORB dashboard -> http://{host}:{port}  (env: {settings.trading_environment()})")
+    print(f"MES 5ORB dashboard -> http://{host}:{port}  (env: {settings.trading_environment()})")
     uvicorn.run(app, host=host, port=port, log_level="warning")
 
 

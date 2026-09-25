@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Options ORB - Trading Dashboard</title>
+<title>MES 5ORB - Trading Dashboard</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <style>
   :root {
@@ -98,7 +98,7 @@
 <body>
 <header>
   <div>
-    <h1>Options ORB - Trading Dashboard</h1>
+    <h1>MES 5ORB - Trading Dashboard</h1>
     <div class="sub" id="serverTime">-</div>
   </div>
   <div class="spacer"></div>
@@ -110,7 +110,7 @@
   <div class="grid cards" id="cards"></div>
 
   <div class="panel" id="autoPanel">
-    <h2>Auto-trading <span class="hint">runs the ORB entry loop automatically &middot; paper / simulated only</span></h2>
+    <h2>Auto-trading <span class="hint">MES break/retest loop &middot; paper / simulated only</span></h2>
     <div class="toolbar" style="margin-bottom:12px">
       <button id="autoToggle" class="playbtn idle">&#9654; Start auto-trading</button>
       <span id="autoState" class="badge paper">stopped</span>
@@ -119,7 +119,6 @@
         <option value="auto">Active window</option>
         <option value="new_york">New York</option>
         <option value="london">London</option>
-        <option value="asia">Asia</option>
       </select>
       <label class="check">Every
         <select id="autoInterval">
@@ -172,7 +171,7 @@
   </div>
 
   <div class="panel">
-    <h2>Live signals <span class="hint">current ORB read per session window &middot; times GMT</span></h2>
+    <h2>Live signals <span class="hint">MES 5ORB London / New York &middot; times ET</span></h2>
     <div class="toolbar" style="margin-bottom:14px">
       <select id="sigSymbol"></select>
       <label class="check"><input type="checkbox" id="sigDemo" /> Demo data (offline, no IBKR)</label>
@@ -183,7 +182,7 @@
   </div>
 
   <div class="panel">
-    <h2>Backtesting &amp; simulation <span class="hint">run the ORB spread strategy over historical data and see the simulated result</span></h2>
+    <h2>Backtesting &amp; simulation <span class="hint">MES break/retest over historical 5-min bars</span></h2>
     <div class="toolbar" style="margin-bottom:12px">
       <select id="btSymbol"></select>
       <select id="btWindow">
@@ -360,7 +359,7 @@ async function loadSummary() {
     </div>`).join("");
 
   // Populate symbol selectors once.
-  const symbols = ["SPY", "QQQ", "IWM", "AAPL"];
+  const symbols = ["MES"];
   for (const id of ["sigSymbol", "btSymbol", "autoSymbol", "tickerSymbol"]) {
     const sel = document.getElementById(id);
     if (sel && !sel.dataset.init) {
@@ -379,7 +378,7 @@ function tickerLabel(iso, hours) {
 }
 
 async function loadTicker() {
-  const sym = document.getElementById("tickerSymbol").value || "SPY";
+  const sym = document.getElementById("tickerSymbol").value || "MES";
   const hours = document.getElementById("tickerHours").value;
   const demo = document.getElementById("tickerDemo").checked;
   const note = document.getElementById("tickerNote");
