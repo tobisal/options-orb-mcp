@@ -48,6 +48,18 @@ def test_size_position_basic(tmp_path):
     assert rm.size_position(60.0) == 0  # one contract exceeds budget
 
 
+def test_futures_risk_pct_1_to_5(tmp_path):
+    """Higher risk% allows more contracts for the same stop."""
+    rm = _rm(tmp_path, capital=10_000.0, risk=0.05)
+    # 10 pts × $5 = $50/contract. At 1% budget=$100 → 2 contracts; at 5% → 10.
+    assert rm.size_futures(10.0, point_value=5.0, risk_pct=1) == 2
+    assert rm.size_futures(10.0, point_value=5.0, risk_pct=5) == 10
+    # Clamp above 5% down to 5%.
+    assert rm.size_futures(10.0, point_value=5.0, risk_pct=10) == 10
+    # Clamp below 1% up to 1%.
+    assert rm.size_futures(10.0, point_value=5.0, risk_pct=0.5) == 2
+
+
 def test_pre_trade_approves_within_budget(tmp_path):
     rm = _rm(tmp_path)
     decision = rm.pre_trade_checks(40.0)

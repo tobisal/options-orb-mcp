@@ -128,6 +128,15 @@
           <option value="300">5 min</option>
         </select>
       </label>
+      <label class="check">Risk
+        <select id="autoRisk" title="Risk % of capital per trade">
+          <option value="1">1%</option>
+          <option value="2">2%</option>
+          <option value="3">3%</option>
+          <option value="4">4%</option>
+          <option value="5" selected>5%</option>
+        </select>
+      </label>
       <label class="check"><input type="checkbox" id="autoDemo" /> Demo data (offline)</label>
       <span class="sub" id="autoStats"></span>
     </div>
@@ -892,10 +901,15 @@ function renderAuto(s) {
   state.className = "badge " + (autoRunning ? "live pulse" : "paper");
 
   // Lock config controls while running.
-  ["autoSymbol", "autoWindow", "autoInterval", "autoDemo"].forEach(id => {
+  ["autoSymbol", "autoWindow", "autoInterval", "autoRisk", "autoDemo"].forEach(id => {
     document.getElementById(id).disabled = autoRunning;
   });
 
+  if (s.risk_pct != null && !autoRunning) {
+    const riskEl = document.getElementById("autoRisk");
+    const v = String(Math.round(Number(s.risk_pct)));
+    if ([...riskEl.options].some(o => o.value === v)) riskEl.value = v;
+  }
   document.getElementById("autoStats").textContent = autoRunning
     ? `cycles ${s.cycles} · placed ${s.trades_placed}` + (s.last_cycle_at ? ` · last ${fmtGmtClock(s.last_cycle_at)}` : "")
     : (s.trades_placed ? `last run placed ${s.trades_placed}` : "");
@@ -926,6 +940,7 @@ async function toggleAuto() {
         symbol: document.getElementById("autoSymbol").value,
         window: document.getElementById("autoWindow").value,
         interval: document.getElementById("autoInterval").value,
+        risk_pct: document.getElementById("autoRisk").value,
         demo: document.getElementById("autoDemo").checked,
       });
       const r = await postJSON("/api/autotrade/start?" + p.toString());

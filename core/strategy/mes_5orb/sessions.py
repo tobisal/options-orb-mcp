@@ -64,6 +64,8 @@ class TrailingStopConfig:
 class MesRiskConfig:
     contracts: int = 1
     max_concurrent: int = 1
+    # Percent of capital per trade (1–5). None → Settings.MAX_RISK_PER_TRADE.
+    risk_pct: float | None = None
 
 
 @dataclass(frozen=True)
@@ -189,6 +191,11 @@ def load_mes_5orb_config(symbol: str | None = None) -> Mes5OrbConfig:
         risk=MesRiskConfig(
             contracts=max(int(risk.get("contracts", 1)), 1),
             max_concurrent=max(int(risk.get("max_concurrent", 1)), 1),
+            risk_pct=(
+                float(risk["risk_pct"])
+                if risk.get("risk_pct") not in (None, "")
+                else None
+            ),
         ),
     )
 

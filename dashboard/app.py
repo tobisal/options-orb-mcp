@@ -222,6 +222,7 @@ class AutoTrader:
         self.demo = False
         self.interval = 60.0
         self.target_r: float | None = None
+        self.risk_pct: float | None = None
         self.per_window_limit = 3
         self.started_at: str | None = None
         self.cycles = 0
@@ -241,6 +242,7 @@ class AutoTrader:
             "window": self.window,
             "demo": self.demo,
             "interval": self.interval,
+            "risk_pct": self.risk_pct,
             "started_at": self.started_at,
             "last_cycle_at": self.last_cycle_at,
             "cycles": self.cycles,
@@ -250,7 +252,7 @@ class AutoTrader:
         }
 
     def start(self, *, symbol: str, window: str, demo: bool, interval: float,
-              target_r: float | None) -> dict:
+              target_r: float | None, risk_pct: float | None = None) -> dict:
         if self.running:
             return {"ok": False, "error": "Auto-trading is already running.", **self.status()}
         settings = get_settings()
@@ -262,12 +264,17 @@ class AutoTrader:
             }
         self.symbol = (symbol or get_settings().default_symbol or "MES").upper()
         from core.strategy.mes_5orb.markets import coerce_futures_symbol
+        from core.risk import _as_risk_fraction
 
         self.symbol = coerce_futures_symbol(self.symbol)
         self.window = window or "auto"
         self.demo = demo
         self.interval = max(float(interval), self.MIN_INTERVAL)
         self.target_r = target_r
+        frac = _as_risk_fraction(risk_pct)
+        self.risk_pct = round(frac * 100) if frac is not None else round(
+            settings.max_risk_per_trade * 100
+        )
         self.running = True
         self.started_at = utcnow().isoformat()
         self.cycles = 0
@@ -276,6 +283,7 @@ class AutoTrader:
         self._placed_counts.clear()
         self._add_log(
             f"Auto-trading started - {self.symbol} / {self.window}, "
+            f"risk {self.risk_pct:.0f}%, "
             f"{'demo data' if demo else 'live paper data'}, every {self.interval:.0f}s "
             f"(up to {self.per_window_limit} per window, "
             f"{settings.max_open_positions}/day).",
@@ -294,6 +302,7 @@ class AutoTrader:
                     "demo": self.demo,
                     "interval": self.interval,
                     "target_r": self.target_r,
+                    "risk_pct": self.risk_pct,
                 }
             )
         except OSError as exc:
@@ -380,6 +389,7 @@ class AutoTrader:
             preview = await build_trade_plan(
                 self.symbol, cycle_window, use_synthetic=self.demo,
                 target_r=self.target_r, synthetic_seed=seed, db=self._db,
+                risk_pct=self.risk_pct,
             )
         except Exception as exc:
             self._add_log(f"Signal error: {exc}", "error")
@@ -485,6 +495,8 @@ async def api_summary(_request: Request) -> JSONResponse:
         "starting_capital": settings.starting_capital,
         "risk_budget_per_trade": round(rm.risk_budget_per_trade(), 2),
         "max_risk_per_trade_pct": round(settings.max_risk_per_trade * 100, 2),
+        "risk_pct_choices": [1, 2, 3, 4, 5],
+        "active_risk_pct": _autotrader.risk_pct,
         "daily_loss_limit": round(rm.daily_loss_limit(), 2),
         "daily_realised_pnl": round(realised, 2),
         "daily_kill_switch_tripped": tripped,
@@ -965,6 +977,8 @@ async def api_preview(request: Request) -> JSONResponse:
     seed = int(request.query_params.get("seed", "1") or 1)
     tr = request.query_params.get("target_r")
     target_r = float(tr) if tr not in (None, "") else None
+    rp = request.query_params.get("risk_pct")
+    risk_pct = float(rp) if rp not in (None, "") else None
     try:
         plan = await build_trade_plan(
             symbol,
@@ -973,6 +987,7 @@ async def api_preview(request: Request) -> JSONResponse:
             target_r=target_r,
             synthetic_seed=seed,
             db=_db,
+            risk_pct=risk_pct,
         )
     except Exception as exc:
         return JSONResponse({"ok": False, "error": str(exc)})
@@ -987,12 +1002,14 @@ async def api_autotrade_start(request: Request) -> JSONResponse:
     q = request.query_params
     settings = get_settings()
     tr = q.get("target_r")
+    rp = q.get("risk_pct")
     result = _autotrader.start(
         symbol=q.get("symbol", settings.default_symbol),
         window=q.get("window", "auto"),
         demo=q.get("demo", "false").lower() == "true",
         interval=float(q.get("interval", "60") or 60),
         target_r=float(tr) if tr not in (None, "") else None,
+        risk_pct=float(rp) if rp not in (None, "") else None,
     )
     return JSONResponse(result)
 

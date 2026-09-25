@@ -317,11 +317,16 @@ def register_commands(bot: OrbDiscord) -> None:
         await interaction.followup.send(clip("\n".join(lines)))
 
     @auto.command(name="start", description="Start paper auto-trade (dashboard process)")
-    @app_commands.describe(symbol="MES, MNQ, MYM, M2K, ES, or NQ", window="auto / london / new_york")
+    @app_commands.describe(
+        symbol="MES, MNQ, MYM, M2K, ES, or NQ",
+        window="auto / london / new_york",
+        risk_pct="Risk percent of capital per trade (1-5)",
+    )
     async def auto_start(
         interaction: discord.Interaction,
         symbol: str = "MES",
         window: str = "auto",
+        risk_pct: int = 5,
     ) -> None:
         if not await guard(interaction):
             return
@@ -331,6 +336,7 @@ def register_commands(bot: OrbDiscord) -> None:
                 ephemeral=True,
             )
             return
+        risk_pct = max(1, min(int(risk_pct), 5))
         await interaction.response.defer(thinking=True)
         data = await bot.api.post(
             "/api/autotrade/start",
@@ -338,6 +344,7 @@ def register_commands(bot: OrbDiscord) -> None:
             window=window.lower(),
             demo="false",
             interval="60",
+            risk_pct=str(risk_pct),
         )
         if not data.get("ok") and data.get("error"):
             await interaction.followup.send(clip(str(data["error"])))

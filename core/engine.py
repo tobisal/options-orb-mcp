@@ -57,11 +57,14 @@ async def build_mes_trade_plan(
     use_synthetic: bool = False,
     synthetic_seed: int = 42,
     db: Database | None = None,
+    risk_pct: float | None = None,
 ) -> dict[str, Any]:
     """Futures 5ORB signal -> plan -> risk sizing. Places no order."""
     db = db or Database()
     symbol = coerce_futures_symbol(symbol)
     cfg = load_mes_5orb_config(symbol)
+    # Chosen risk% (1–5) wins; else config; else Settings.MAX_RISK_PER_TRADE.
+    effective_risk = risk_pct if risk_pct is not None else cfg.risk.risk_pct
 
     try:
         bars, source, warning = await fetch_bars_with_fallback(
@@ -103,6 +106,7 @@ async def build_mes_trade_plan(
         "exchange": cfg.exchange,
         "contracts_config": cfg.risk.contracts,
         "max_concurrent": cfg.risk.max_concurrent,
+        "risk_pct": effective_risk,
     }
 
     if not signal.get("ok"):
@@ -129,8 +133,10 @@ async def build_mes_trade_plan(
         requested_contracts=cfg.risk.contracts,
         max_concurrent=cfg.risk.max_concurrent,
         window=win,
+        risk_pct=effective_risk,
     )
     plan_dict["contracts"] = decision.contracts
+    plan_dict["risk_pct"] = effective_risk
     plan_dict["max_loss_usd"] = round(
         stop_points * cfg.point_value * max(decision.contracts, 0), 2
     )
@@ -171,6 +177,7 @@ async def build_trade_plan(
     synthetic_seed: int = 42,
     db: Database | None = None,
     entry_strategy: str | None = None,
+    risk_pct: float | None = None,
 ) -> dict[str, Any]:
     """Futures 5ORB entry point for any supported symbol."""
     _ = target_r, entry_strategy
@@ -180,6 +187,7 @@ async def build_trade_plan(
         use_synthetic=use_synthetic,
         synthetic_seed=synthetic_seed,
         db=db,
+        risk_pct=risk_pct,
     )
 
 

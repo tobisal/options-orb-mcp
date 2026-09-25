@@ -44,6 +44,7 @@
   },
   "risk": {
     "contracts": 1,
-    "max_concurrent": 1
+    "max_concurrent": 1,
+    "risk_pct": 5
   }
 }

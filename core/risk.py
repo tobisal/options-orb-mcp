@@ -21,6 +21,29 @@ from core.timeutils import utcnow
 DEFAULT_ACCT_CCY_PER_USD = 0.79  # ~GBP per USD
 
 
+def _as_risk_fraction(value: float | None) -> float | None:
+    """Normalize risk input to a fraction, clamped to 1%–5%.
+
+    Accepts percent points (1..5) or fractions (0.01..0.05). None / invalid → None.
+    """
+    if value is None:
+        return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    if v <= 0:
+        return None
+    # 1–5 (and above) = percent points; values in (0, 1) = fractions.
+    if v >= 1.0:
+        v = v / 100.0
+    # Choosable band: 1%–5% of capital per trade.
+    return max(0.01, min(v, 0.05))
+
+
+RISK_PCT_CHOICES = (1, 2, 3, 4, 5)  # percent points for UI / Discord
+
+
 @dataclass
 class RiskDecision:
     approved: bool
@@ -50,30 +73,43 @@ class RiskManager:
             self.db = Database()
 
     # --- budgets -----------------------------------------------------------
-    def risk_budget_per_trade(self) -> float:
-        """Account-currency amount permitted at risk on a single trade."""
-        return self.settings.starting_capital * self.settings.max_risk_per_trade
+    def risk_budget_per_trade(self, risk_pct: float | None = None) -> float:
+        """Account-currency amount permitted at risk on a single trade.
+
+        ``risk_pct`` may be a fraction (0.05) or percent points (5). When omitted,
+        ``settings.max_risk_per_trade`` is used.
+        """
+        frac = _as_risk_fraction(risk_pct)
+        if frac is None:
+            frac = self.settings.max_risk_per_trade
+        return self.settings.starting_capital * frac
 
     def daily_loss_limit(self) -> float:
         return self.settings.starting_capital * self.settings.max_daily_loss
 
     # --- sizing ------------------------------------------------------------
+    def size_position(self, per_contract_max_loss_usd: float) -> int:
+        """How many contracts fit inside the per-trade risk budget."""
+        if per_contract_max_loss_usd <= 0:
+            return 0
+        per_contract_acct = per_contract_max_loss_usd * self.acct_ccy_per_usd
+        budget = self.risk_budget_per_trade()
+        return max(int(math.floor(budget / per_contract_acct)), 0)
+
     def size_futures(
         self,
         stop_points: float,
         *,
         point_value: float = 5.0,
         requested_contracts: int | None = None,
+        risk_pct: float | None = None,
     ) -> int:
-        """Size MES (or similar) futures by dollar stop risk.
-
-        Risk per contract (USD) = stop_points × point_value.
-        """
+        """Size futures by dollar stop risk vs the chosen risk budget."""
         if stop_points <= 0 or point_value <= 0:
             return 0
         per_contract_usd = stop_points * point_value
         per_contract_acct = per_contract_usd * self.acct_ccy_per_usd
-        budget = self.risk_budget_per_trade()
+        budget = self.risk_budget_per_trade(risk_pct)
         n = max(int(math.floor(budget / per_contract_acct)), 0)
         if requested_contracts is not None:
             n = min(n, max(int(requested_contracts), 0))
@@ -87,27 +123,31 @@ class RiskManager:
         requested_contracts: int | None = None,
         max_concurrent: int = 1,
         window: SessionWindow | None = None,
+        risk_pct: float | None = None,
     ) -> RiskDecision:
-        """Risk gates for MES futures (stop-distance sizing)."""
+        """Risk gates for futures (stop-distance sizing)."""
         assert self.db is not None
+        _ = window
         reasons: list[str] = []
         reasons.extend(self._live_gate_reasons())
+        budget = self.risk_budget_per_trade(risk_pct)
 
         contracts = self.size_futures(
             stop_points,
             point_value=point_value,
             requested_contracts=requested_contracts,
+            risk_pct=risk_pct,
         )
-        # Prefer configured fixed size when budget allows at least that many.
         if requested_contracts and contracts >= requested_contracts:
             contracts = requested_contracts
         elif requested_contracts and contracts < requested_contracts and contracts > 0:
-            pass  # use what budget allows
+            pass
         elif requested_contracts and contracts == 0:
+            frac = _as_risk_fraction(risk_pct) or self.settings.max_risk_per_trade
             reasons.append(
                 f"Stop risk {stop_points:.2f} pts × ${point_value:.0f} exceeds "
-                f"per-trade budget {self.risk_budget_per_trade():.2f} "
-                f"{self.settings.account_currency}."
+                f"per-trade budget {budget:.2f} {self.settings.account_currency} "
+                f"({frac * 100:.1f}% risk)."
             )
 
         env = self.environment()
@@ -133,7 +173,7 @@ class RiskManager:
         return RiskDecision(
             approved=approved,
             contracts=contracts,
-            risk_budget=self.risk_budget_per_trade(),
+            risk_budget=budget,
             projected_risk=projected,
             reasons=reasons,
         )

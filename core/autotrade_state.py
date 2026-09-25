@@ -35,6 +35,7 @@ def default_state() -> dict[str, Any]:
         "demo": False,
         "interval": 60.0,
         "target_r": None,
+        "risk_pct": round(settings.max_risk_per_trade * 100),
     }
 
 
@@ -51,6 +52,9 @@ def load_state(path: Path | None = None) -> dict[str, Any]:
     if not isinstance(raw, dict):
         return base
     out = {**base, **{k: raw[k] for k in base if k in raw}}
+    # Also pick up risk_pct if present in file but missing from older base merge
+    if "risk_pct" in raw and "risk_pct" not in out:
+        out["risk_pct"] = raw["risk_pct"]
     out["enabled"] = bool(out.get("enabled"))
     out["demo"] = bool(out.get("demo"))
     try:
@@ -65,6 +69,14 @@ def load_state(path: Path | None = None) -> dict[str, Any]:
             out["target_r"] = float(tr)
         except (TypeError, ValueError):
             out["target_r"] = None
+    rp = out.get("risk_pct")
+    if rp in (None, ""):
+        out["risk_pct"] = base["risk_pct"]
+    else:
+        try:
+            out["risk_pct"] = float(rp)
+        except (TypeError, ValueError):
+            out["risk_pct"] = base["risk_pct"]
     out["symbol"] = str(out.get("symbol") or base["symbol"]).upper()
     out["window"] = str(out.get("window") or "auto")
     return out
@@ -75,11 +87,12 @@ def save_state(state: dict[str, Any], path: Path | None = None) -> Path:
     p.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "enabled": bool(state.get("enabled")),
-        "symbol": str(state.get("symbol") or "SPY").upper(),
+        "symbol": str(state.get("symbol") or "MES").upper(),
         "window": str(state.get("window") or "auto"),
         "demo": bool(state.get("demo")),
         "interval": float(state.get("interval") or 60.0),
         "target_r": state.get("target_r"),
+        "risk_pct": state.get("risk_pct"),
     }
     tmp = p.with_suffix(p.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
@@ -114,4 +127,5 @@ def start_kwargs(state: dict[str, Any] | None = None) -> dict[str, Any]:
         "demo": bool(st.get("demo")),
         "interval": float(st.get("interval") or 60.0),
         "target_r": st.get("target_r"),
+        "risk_pct": st.get("risk_pct"),
     }
