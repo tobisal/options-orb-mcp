@@ -338,7 +338,7 @@ async function loadSummary() {
     { label: "Account", value: money(equity), cls: cls((equity || 0) - (s.starting_capital || 0)), sub: isPaper ? "paper · start + realised + open mark" : (s.ibkr_connected ? "IBKR net liq" : "starting capital") },
     { label: "Daily P&L", value: sign(daily), cls: cls(daily), sub: isPaper ? ("today " + sign(s.daily_realised_pnl) + " closed · " + sign(s.open_unrealized_pnl) + " open") : ("realised · limit " + money(s.daily_loss_limit)) },
     { label: "Open P&L", value: s.open_unrealized_pnl == null ? "-" : sign(s.open_unrealized_pnl), cls: cls(s.open_unrealized_pnl || 0), sub: "unrealised mark" },
-    { label: "Risk / trade", value: money(s.risk_budget_per_trade), sub: s.max_risk_per_trade_pct + "% of capital" },
+    { label: "Risk / trade", value: money(s.risk_budget_per_trade), sub: (s.active_risk_pct ?? s.max_risk_per_trade_pct) + "% of equity" },
     { label: "Open positions", value: s.open_positions + " / " + s.max_open_positions, sub: (s.max_open_positions_per_window || 3) + " per window" },
     { label: "Kill switch", value: s.daily_kill_switch_tripped ? "TRIPPED" : "OK", cls: s.daily_kill_switch_tripped ? "neg" : "pos" },
   ];
@@ -361,6 +361,15 @@ async function loadSummary() {
       sel.dataset.init = "1";
     }
   }
+  // Keep Risk dropdown in sync with server preferred risk%.
+  if (s.active_risk_pct != null) {
+    const riskEl = document.getElementById("autoRisk");
+    const v = String(Math.round(Number(s.active_risk_pct)));
+    if (riskEl && [...riskEl.options].some(o => o.value === v) && document.activeElement !== riskEl) {
+      riskEl.value = v;
+    }
+  }
+  window.__lastSummary = s;
 }
 
 function tickerLabel(iso, hours) {
@@ -851,12 +860,13 @@ function renderAuto(s) {
   state.textContent = autoRunning ? "running" : "stopped";
   state.className = "badge " + (autoRunning ? "live pulse" : "paper");
 
-  // Lock config controls while running.
-  ["autoSymbol", "autoWindow", "autoInterval", "autoRisk", "autoDemo"].forEach(id => {
+  // Lock most config while running; risk% stays editable so sizing updates live.
+  ["autoSymbol", "autoWindow", "autoInterval", "autoDemo"].forEach(id => {
     document.getElementById(id).disabled = autoRunning;
   });
+  document.getElementById("autoRisk").disabled = false;
 
-  if (s.risk_pct != null && !autoRunning) {
+  if (s.risk_pct != null) {
     const riskEl = document.getElementById("autoRisk");
     const v = String(Math.round(Number(s.risk_pct)));
     if ([...riskEl.options].some(o => o.value === v)) riskEl.value = v;
@@ -924,6 +934,30 @@ document.getElementById("btRun").addEventListener("click", runBacktest);
 document.getElementById("btOpt").addEventListener("click", runOptimise);
 document.getElementById("autoToggle").addEventListener("click", toggleAuto);
 document.getElementById("autoDefaults").addEventListener("click", useDefaultsForTrading);
+document.getElementById("autoRisk").addEventListener("change", async () => {
+  const pct = document.getElementById("autoRisk").value;
+  const s = window.__lastSummary || {};
+  const equity = s.paper_equity ?? s.equity_for_sizing ?? s.starting_capital ?? 0;
+  const budget = Number(equity) * (Number(pct) / 100);
+  // Instant card update before the round-trip.
+  const cards = document.getElementById("cards");
+  if (cards) {
+    const riskCard = [...cards.querySelectorAll(".card")].find(c =>
+      (c.querySelector(".label") || {}).textContent === "Risk / trade"
+    );
+    if (riskCard) {
+      const val = riskCard.querySelector(".value");
+      const sub = riskCard.querySelectorAll(".label")[1];
+      if (val) val.textContent = money(budget);
+      if (sub) sub.textContent = pct + "% of equity";
+    }
+  }
+  try {
+    await postJSON("/api/autotrade/risk?risk_pct=" + encodeURIComponent(pct));
+    await loadSummary();
+    await loadAuto();
+  } catch (e) { console.error(e); }
+});
 document.getElementById("tickerSymbol").addEventListener("change", loadTicker);
 document.getElementById("tickerHours").addEventListener("change", loadTicker);
 document.getElementById("tickerDemo").addEventListener("change", loadTicker);

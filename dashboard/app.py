@@ -268,6 +268,31 @@ class AutoTrader:
             "strategy_by_window": strategy_by_window(self.symbol, self._db),
         }
 
+    def set_risk_pct(self, risk_pct: float | None) -> dict:
+        """Update risk % (1–5). Works while stopped or running; sizes next entries."""
+        from core.risk import _as_risk_fraction
+
+        settings = get_settings()
+        frac = _as_risk_fraction(risk_pct)
+        self.risk_pct = round(frac * 100) if frac is not None else round(
+            settings.max_risk_per_trade * 100
+        )
+        self._add_log(f"Risk per trade set to {self.risk_pct:.0f}% of equity.", "info")
+        try:
+            st = load_state()
+            st["risk_pct"] = self.risk_pct
+            if self.running:
+                st["enabled"] = True
+                st["symbol"] = self.symbol
+                st["window"] = self.window
+                st["demo"] = self.demo
+                st["interval"] = self.interval
+                st["target_r"] = self.target_r
+            save_state(st)
+        except OSError as exc:
+            _log.warning("could not persist risk_pct: %s", exc)
+        return {"ok": True, **self.status()}
+
     def start(self, *, symbol: str, window: str, demo: bool, interval: float,
               target_r: float | None, risk_pct: float | None = None) -> dict:
         if self.running:
@@ -455,6 +480,12 @@ class AutoTrader:
 
 
 _autotrader = AutoTrader(_db)
+try:
+    _seed_rp = load_state().get("risk_pct")
+    if _seed_rp is not None:
+        _autotrader.risk_pct = float(_seed_rp)
+except Exception:
+    pass
 
 
 async def _run_session_exits() -> None:
@@ -506,14 +537,19 @@ async def api_summary(_request: Request) -> JSONResponse:
     settings = get_settings()
     rm = RiskManager(db=_db)
     tripped, realised = rm.daily_loss_tripped()
+    # Preferred risk%: running autotrader → persisted state → env default.
+    preferred = _autotrader.risk_pct
+    if preferred is None:
+        preferred = load_state().get("risk_pct")
+    if preferred is None:
+        preferred = round(settings.max_risk_per_trade * 100)
     payload = {
         "environment": rm.environment(),
         "account_currency": settings.account_currency,
         "starting_capital": settings.starting_capital,
-        "risk_budget_per_trade": round(rm.risk_budget_per_trade(), 2),
-        "max_risk_per_trade_pct": round(settings.max_risk_per_trade * 100, 2),
         "risk_pct_choices": [1, 2, 3, 4, 5],
-        "active_risk_pct": _autotrader.risk_pct,
+        "active_risk_pct": preferred,
+        "max_risk_per_trade_pct": float(preferred),
         "daily_loss_limit": round(rm.daily_loss_limit(), 2),
         "daily_realised_pnl": round(realised, 2),
         "daily_kill_switch_tripped": tripped,
@@ -550,6 +586,11 @@ async def api_summary(_request: Request) -> JSONResponse:
         environment=rm.environment(),
     )
     payload.update(paper)
+    equity = float(paper.get("paper_equity") or settings.starting_capital)
+    payload["risk_budget_per_trade"] = round(
+        rm.risk_budget_per_trade(preferred, equity=equity), 2
+    )
+    payload["equity_for_sizing"] = round(equity, 2)
     return JSONResponse(payload)
 
 
@@ -1104,6 +1145,18 @@ async def api_autotrade_stop(_request: Request) -> JSONResponse:
     return JSONResponse(await _autotrader.stop())
 
 
+async def api_autotrade_risk(request: Request) -> JSONResponse:
+    """Set risk % (1–5) for the next sized entries; updates the summary card."""
+    q = request.query_params
+    rp = q.get("risk_pct")
+    if rp in (None, ""):
+        return JSONResponse({"ok": False, "error": "risk_pct required (1-5)"})
+    try:
+        return JSONResponse(_autotrader.set_risk_pct(float(rp)))
+    except (TypeError, ValueError) as exc:
+        return JSONResponse({"ok": False, "error": str(exc)})
+
+
 routes = [
     Route("/", index),
     Route("/api/health", api_health),
@@ -1123,6 +1176,7 @@ routes = [
     Route("/api/autotrade/status", api_autotrade_status),
     Route("/api/autotrade/start", api_autotrade_start, methods=["POST"]),
     Route("/api/autotrade/stop", api_autotrade_stop, methods=["POST"]),
+    Route("/api/autotrade/risk", api_autotrade_risk, methods=["POST"]),
 ]
 
 

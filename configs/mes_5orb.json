@@ -43,8 +43,9 @@
     "buffer_ticks": 1
   },
   "risk": {
-    "contracts": 1,
+    "contracts": 20,
     "max_concurrent": 1,
-    "risk_pct": 5
+    "risk_pct": 5,
+    "_comment": "contracts = max size from risk%; risk_pct default 1-5"
   }
 }

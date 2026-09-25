@@ -17,6 +17,7 @@ from core.journal import (
     _journal_close,
     _parse_plan,
     is_ibkr_backed,
+    paper_account_snapshot,
 )
 from core.marketdata import fetch_bars_with_fallback
 from core.models import Direction, Regime, SessionWindow, SpreadType, TradeRecord, TradeStatus
@@ -127,6 +128,14 @@ async def build_mes_trade_plan(
     stop_points = float(plan_dict.get("stop_points") or 0)
     rm = RiskManager(db=db)
     win = _mes_session_to_window(str(plan_dict.get("session_name") or "new_york"))
+    # Size off current paper equity so risk% stays dynamic as the account grows.
+    paper = paper_account_snapshot(
+        db,
+        {},
+        starting_capital=get_settings().starting_capital,
+        environment=rm.environment(),
+    )
+    equity = float(paper.get("paper_equity") or get_settings().starting_capital)
     decision = rm.pre_trade_checks_futures(
         stop_points,
         point_value=cfg.point_value,
@@ -134,9 +143,11 @@ async def build_mes_trade_plan(
         max_concurrent=cfg.risk.max_concurrent,
         window=win,
         risk_pct=effective_risk,
+        equity=equity,
     )
     plan_dict["contracts"] = decision.contracts
     plan_dict["risk_pct"] = effective_risk
+    plan_dict["equity_for_sizing"] = round(equity, 2)
     plan_dict["max_loss_usd"] = round(
         stop_points * cfg.point_value * max(decision.contracts, 0), 2
     )
