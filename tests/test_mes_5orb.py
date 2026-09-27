@@ -233,6 +233,60 @@ def test_backtest_regression_synthetic_day():
     assert s1["trade_count"] == s2["trade_count"]
 
 
+def test_optimise_mes_5orb_grid():
+    from core.backtest_mes import optimise_mes_5orb
+    from core.marketdata import generate_synthetic_bars
+    from dataclasses import replace
+
+    bars = generate_synthetic_bars(days=14, start_price=5800.0, seed=3, bar_minutes=5)
+    clear_mes_5orb_config_cache()
+    cfg = load_mes_5orb_config()
+    # Keep 2 sessions for speed in unit test
+    keep = {"london", "new_york"}
+    cfg = replace(cfg, sessions=tuple(s for s in cfg.sessions if s.name in keep))
+    report = optimise_mes_5orb(
+        bars,
+        cfg=cfg,
+        grid={
+            "target_r": [2.0, 2.5],
+            "scale_fraction": [0.5, 1.0],
+            "stop_buffer_ticks": [1],
+            "tolerance_ticks": [3],
+            "require_rejection_candle": [False],
+        },
+        top_is=4,
+        top_n=3,
+    )
+    assert "error" not in report
+    assert report["combinations_tested"] == 4
+    assert len(report["top"]) >= 1
+    best = report["top"][0]
+    assert best["params"]["entry_model"] == "mes_5orb"
+    assert "target_r" in best["params"]
+    assert "score" in best
+
+
+def test_apply_mes_opt_params():
+    from core.strategy.mes_5orb.sessions import apply_mes_opt_params
+
+    clear_mes_5orb_config_cache()
+    cfg = load_mes_5orb_config()
+    out = apply_mes_opt_params(
+        cfg,
+        {
+            "target_r": 2.5,
+            "scale_fraction": 1.0,
+            "stop_buffer_ticks": 2,
+            "tolerance_ticks": 4,
+            "require_rejection_candle": False,
+        },
+    )
+    assert out.exits.target_r == 2.5
+    assert out.exits.scale_fraction == 1.0
+    assert out.exits.stop_buffer_ticks == 2
+    assert out.sessions[0].retest.tolerance_ticks == 4
+
+
 def test_walk_forward_70_30_split():
     from core.backtest_mes import walk_forward_mes_7030
 

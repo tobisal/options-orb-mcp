@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date, datetime
+from itertools import product
 from typing import Any
 
 from core.analytics import performance_metrics
@@ -15,9 +16,22 @@ from core.strategy.mes_5orb.exits import (
     primary_target,
 )
 from core.strategy.mes_5orb.opening_range import compute_opening_range, to_et
-from core.strategy.mes_5orb.sessions import Mes5OrbConfig, load_mes_5orb_config
+from core.strategy.mes_5orb.sessions import (
+    Mes5OrbConfig,
+    apply_mes_opt_params,
+    load_mes_5orb_config,
+)
 from core.strategy.mes_5orb.signals import SetupState, detect_break_retest
 from core.strategy.mes_5orb.trailing_stop import SwingTrailingStop
+
+# Compact grid for dashboard / Discord (keeps runtime reasonable on 5m history).
+DEFAULT_MES_5ORB_GRID: dict[str, list[Any]] = {
+    "target_r": [1.5, 2.0, 2.5],
+    "scale_fraction": [0.5, 1.0],
+    "stop_buffer_ticks": [1, 2],
+    "tolerance_ticks": [2, 3],
+    "require_rejection_candle": [False],
+}
 
 
 @dataclass
@@ -506,4 +520,174 @@ def evaluate_mes_signal_live(
         "state": setup.state.value,
         "plan": plan.as_dict(),
         "mes_plan": plan,
+    }
+
+
+def mes_opt_score(metrics: dict[str, Any]) -> float:
+    """Rank score used by the futures grid optimiser."""
+    trades = int(metrics.get("trades") or 0)
+    if trades < 2:
+        return -999.0
+    exp = float(metrics.get("expectancy") or 0)
+    pf = min(float(metrics.get("profit_factor") or 0), 5.0)
+    dd = abs(float(metrics.get("max_drawdown") or 0))
+    return exp * (trades**0.5) * (0.5 + 0.5 * min(pf, 3.0) / 3.0) - dd * 0.01
+
+
+def _mes_knob_dict(
+    *,
+    target_r: float,
+    scale_fraction: float,
+    stop_buffer_ticks: int,
+    tolerance_ticks: int,
+    require_rejection_candle: bool,
+) -> dict[str, Any]:
+    return {
+        "target_r": float(target_r),
+        "scale_fraction": float(scale_fraction),
+        "stop_buffer_ticks": int(stop_buffer_ticks),
+        "tolerance_ticks": int(tolerance_ticks),
+        "require_rejection_candle": bool(require_rejection_candle),
+    }
+
+
+def optimise_mes_5orb(
+    bars: list[Bar],
+    *,
+    cfg: Mes5OrbConfig | None = None,
+    grid: dict[str, list[Any]] | None = None,
+    is_fraction: float = 0.70,
+    top_is: int = 8,
+    top_n: int = 8,
+) -> dict[str, Any]:
+    """Grid-search exit/retest knobs with chronological 70/30 walk-forward.
+
+    1. Evaluate every grid combo on in-sample days → IS score.
+    2. Keep the top ``top_is`` by IS score.
+    3. Rank those by out-of-sample score (honest selection).
+    """
+    cfg = cfg or load_mes_5orb_config()
+    grid = grid or DEFAULT_MES_5ORB_GRID
+    days = _trading_days(bars)
+    if len(days) < 4:
+        return {
+            "error": f"Need at least 4 trading days for walk-forward optimise, have {len(days)}.",
+            "is_fraction": is_fraction,
+        }
+
+    split = max(1, int(len(days) * is_fraction))
+    if split >= len(days):
+        split = len(days) - 1
+    is_days = set(days[:split])
+    oos_days = set(days[split:])
+    is_bars = _bars_on_days(bars, is_days)
+    oos_bars = _bars_on_days(bars, oos_days)
+
+    keys = list(grid.keys())
+    combos = list(product(*[grid[k] for k in keys]))
+    rows: list[dict[str, Any]] = []
+
+    for combo in combos:
+        knobs = dict(zip(keys, combo))
+        # Fill defaults from base config for any missing keys.
+        knobs = {
+            "target_r": knobs.get("target_r", cfg.exits.target_r),
+            "scale_fraction": knobs.get("scale_fraction", cfg.exits.scale_fraction),
+            "stop_buffer_ticks": knobs.get(
+                "stop_buffer_ticks", cfg.exits.stop_buffer_ticks
+            ),
+            "tolerance_ticks": knobs.get(
+                "tolerance_ticks",
+                cfg.sessions[0].retest.tolerance_ticks if cfg.sessions else 3,
+            ),
+            "require_rejection_candle": knobs.get(
+                "require_rejection_candle",
+                cfg.sessions[0].retest.require_rejection_candle if cfg.sessions else False,
+            ),
+        }
+        trial_cfg = apply_mes_opt_params(cfg, knobs)
+        is_m = run_mes_5orb_backtest(is_bars, cfg=trial_cfg).summary()["combined"]
+        oos_m = run_mes_5orb_backtest(oos_bars, cfg=trial_cfg).summary()["combined"]
+        rows.append(
+            {
+                "params": _mes_knob_dict(**knobs),
+                "is_score": round(mes_opt_score(is_m), 4),
+                "oos_score": round(mes_opt_score(oos_m), 4),
+                "is_metrics": is_m,
+                "oos_metrics": oos_m,
+            }
+        )
+
+    rows.sort(key=lambda r: r["is_score"], reverse=True)
+    shortlist = rows[: max(int(top_is), 1)]
+    shortlist.sort(key=lambda r: r["oos_score"], reverse=True)
+    ranked = shortlist[: max(int(top_n), 1)]
+
+    best = ranked[0] if ranked else None
+    baseline_knobs = _mes_knob_dict(
+        target_r=cfg.exits.target_r,
+        scale_fraction=cfg.exits.scale_fraction,
+        stop_buffer_ticks=cfg.exits.stop_buffer_ticks,
+        tolerance_ticks=(
+            cfg.sessions[0].retest.tolerance_ticks if cfg.sessions else 3
+        ),
+        require_rejection_candle=(
+            cfg.sessions[0].retest.require_rejection_candle if cfg.sessions else False
+        ),
+    )
+    baseline_row = next(
+        (
+            r
+            for r in rows
+            if r["params"] == baseline_knobs
+        ),
+        None,
+    )
+
+    top_payload = []
+    for i, r in enumerate(ranked):
+        top_payload.append(
+            {
+                "rank": i + 1,
+                "label": (
+                    f"{r['params']['target_r']}R · "
+                    f"{int(r['params']['scale_fraction'] * 100)}% · "
+                    f"buf {r['params']['stop_buffer_ticks']} · "
+                    f"tol {r['params']['tolerance_ticks']}"
+                ),
+                "params": {
+                    "entry_model": "mes_5orb",
+                    "symbol": cfg.symbol,
+                    "optimise": "grid_walk_forward_70_30",
+                    **r["params"],
+                },
+                "score": r["oos_score"],
+                "is_score": r["is_score"],
+                "metrics": r["oos_metrics"],
+                "is_metrics": r["is_metrics"],
+            }
+        )
+
+    return {
+        "method": "grid_walk_forward_70_30",
+        "is_fraction": is_fraction,
+        "oos_fraction": round(1.0 - is_fraction, 4),
+        "total_trading_days": len(days),
+        "is_days": len(is_days),
+        "oos_days": len(oos_days),
+        "day_start": days[0].isoformat(),
+        "is_end": days[split - 1].isoformat(),
+        "oos_start": days[split].isoformat(),
+        "day_end": days[-1].isoformat(),
+        "combinations_tested": len(rows),
+        "grid": grid,
+        "baseline_params": baseline_knobs,
+        "baseline": baseline_row,
+        "best": best,
+        "top": top_payload,
+        "walk_forward_note": (
+            "Grid fitted on the first 70% of trading days; candidates are ranked "
+            "by out-of-sample score on the last 30%. Use 'Use for trading' to "
+            "apply the chosen exit/retest knobs."
+        ),
     }

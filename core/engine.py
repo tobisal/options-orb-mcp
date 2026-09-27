@@ -23,6 +23,7 @@ from core.marketdata import fetch_bars_with_fallback
 from core.models import Direction, Regime, SessionWindow, SpreadType, TradeRecord, TradeStatus
 from core.risk import RiskManager
 from core.sessions import active_window
+from core.mes_active import resolve_mes_5orb_config
 from core.strategy.mes_5orb.exits import hit_stop, hit_target
 from core.strategy.mes_5orb.markets import (
     DEFAULT_FUTURES_SYMBOL,
@@ -65,7 +66,7 @@ async def build_mes_trade_plan(
     """Futures 5ORB signal -> plan -> risk sizing. Places no order."""
     db = db or Database()
     symbol = coerce_futures_symbol(symbol)
-    cfg = load_mes_5orb_config(symbol)
+    cfg, _chosen = resolve_mes_5orb_config(symbol, db)
     # Chosen risk% (1–5) wins; else config; else Settings.MAX_RISK_PER_TRADE.
     effective_risk = risk_pct if risk_pct is not None else cfg.risk.risk_pct
 
@@ -408,7 +409,7 @@ async def settle_session_exits(
         for trade in opens:
             plan = _parse_plan(trade.plan_json)
             trade_symbol = coerce_futures_symbol(trade.symbol)
-            trade_cfg = load_mes_5orb_config(trade_symbol)
+            trade_cfg, _ = resolve_mes_5orb_config(trade_symbol, db)
 
             direction = trade.direction
             stop = float(plan.get("stop_loss_price") or trade.entry_price)

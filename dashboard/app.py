@@ -32,13 +32,18 @@ from core.active_params import (
 )
 from core.analytics import daily_revenue, monte_carlo, performance_metrics, summarize
 from core.autotrade_state import load_state, save_state, should_autostart, start_kwargs
-from core.backtest_mes import run_mes_5orb_backtest, walk_forward_mes_7030
+from core.backtest_mes import (
+    optimise_mes_5orb,
+    run_mes_5orb_backtest,
+    walk_forward_mes_7030,
+)
 from core.config import get_settings
 from core.db import Database, is_tradable_orb_params
 from core.engine import build_trade_plan, place_trade_plan, resolve_window, settle_session_exits
 from core.ibkr_client import IBKRClient, IBKRUnavailable
 from core.journal import close_open_paper_trades, mark_open_trade, paper_account_snapshot
 from core.marketdata import fetch_bars_with_fallback
+from core.mes_active import resolve_mes_5orb_config
 from core.models import Regime, SessionWindow, TradeStatus
 from core.risk import RiskManager
 from core.strategy.mes_5orb.markets import coerce_futures_symbol, is_supported_futures
@@ -877,7 +882,7 @@ async def api_backtest(request: Request) -> JSONResponse:
         )
 
     clear_mes_5orb_config_cache()
-    cfg = load_mes_5orb_config(symbol)
+    cfg, _chosen = resolve_mes_5orb_config(symbol, _db)
     bars = _filter_bars_for_window(bars, window)
 
     def _run():
@@ -931,7 +936,7 @@ async def api_backtest(request: Request) -> JSONResponse:
 
 
 async def api_optimise(request: Request) -> JSONResponse:
-    """70/30 walk-forward report for the chosen futures symbol (no options grid)."""
+    """Grid-search 5ORB exit knobs with chronological 70/30 walk-forward ranking."""
     q = request.query_params
     settings = get_settings()
     symbol = coerce_futures_symbol(q.get("symbol", settings.default_symbol))
@@ -939,6 +944,8 @@ async def api_optimise(request: Request) -> JSONResponse:
     demo = q.get("demo", "false").lower() == "true"
     lookback_days = max(int(q.get("lookback_days", "60") or 60), 10)
     seed = int(q.get("seed", "3") or 3)
+    top_n = max(min(int(q.get("top_n", "8") or 8), 20), 1)
+    top_is = max(min(int(q.get("top_is", "8") or 8), 24), 1)
 
     try:
         bars, source, warning = await _load_history(
@@ -956,57 +963,45 @@ async def api_optimise(request: Request) -> JSONResponse:
     cfg = load_mes_5orb_config(symbol)
 
     def _run():
-        wf = walk_forward_mes_7030(bars, cfg=cfg, is_fraction=0.70)
-        params = {
-            "entry_model": "mes_5orb",
-            "symbol": cfg.symbol,
-            "walk_forward": "70/30",
-            "point_value": cfg.point_value,
-        }
+        report = optimise_mes_5orb(
+            bars,
+            cfg=cfg,
+            is_fraction=0.70,
+            top_is=top_is,
+            top_n=top_n,
+        )
+        wf_best = None
+        top = report.get("top") or []
+        if top and "error" not in report:
+            from core.strategy.mes_5orb.sessions import apply_mes_opt_params
 
-        def _metrics(period: dict | None) -> dict:
-            if not period:
-                return {}
-            summary = period.get("summary") or {}
-            combined = dict(summary.get("combined") or {})
-            if "trades" not in combined:
-                combined["trades"] = period.get("trade_count") or combined.get("trades") or 0
-            return combined
-
-        oos_m = _metrics(wf.get("out_of_sample") if isinstance(wf, dict) else None)
-        is_m = _metrics(wf.get("in_sample") if isinstance(wf, dict) else None)
-        metrics = oos_m if oos_m.get("trades") else is_m
-        return wf, params, metrics, is_m, oos_m
+            best_cfg = apply_mes_opt_params(cfg, top[0]["params"])
+            wf_best = walk_forward_mes_7030(bars, cfg=best_cfg, is_fraction=0.70)
+        return report, wf_best
 
     try:
-        wf, params, metrics, is_m, oos_m = await anyio.to_thread.run_sync(_run)
+        report, wf_best = await anyio.to_thread.run_sync(_run)
     except Exception as exc:
-        return JSONResponse({"error": f"Walk-forward failed: {exc}"})
+        return JSONResponse({"error": f"Optimise failed: {exc}"})
 
+    if report.get("error"):
+        return JSONResponse({"error": report["error"], "hint": report.get("walk_forward_note")})
+
+    top = report.get("top") or []
+    best = top[0] if top else None
+    metrics = (best or {}).get("metrics") or {}
     persisted_id = None
-    if metrics and int(metrics.get("trades") or 0) > 0:
+    if best and int(metrics.get("trades") or 0) > 0:
         persisted_id = _db.insert_backtest(
-            label=f"walk-forward 70/30 {symbol} {window.value}",
+            label=(
+                f"optimise 5ORB {symbol} "
+                f"(best of {report.get('combinations_tested')})"
+            ),
             symbol=symbol,
             window=window,
-            params=params,
+            params=best["params"],
             metrics=metrics,
         )
-
-    top = [
-        {
-            "params": params,
-            "score": round(_mes_score(oos_m), 4),
-            "metrics": oos_m,
-            "label": "out_of_sample",
-        },
-        {
-            "params": {**params, "split": "in_sample"},
-            "score": round(_mes_score(is_m), 4),
-            "metrics": is_m,
-            "label": "in_sample",
-        },
-    ]
 
     return JSONResponse(
         {
@@ -1016,10 +1011,16 @@ async def api_optimise(request: Request) -> JSONResponse:
             "warning": warning,
             "lookback_days": lookback_days,
             "bars_analysed": len(bars),
+            "combinations_tested": report.get("combinations_tested"),
             "top": top,
             "persisted_id": persisted_id,
-            "walk_forward_70_30": wf,
-            "note": "Futures 5ORB uses chronological 70/30 walk-forward (no options grid).",
+            "walk_forward_70_30": wf_best,
+            "baseline_params": report.get("baseline_params"),
+            "grid": report.get("grid"),
+            "note": report.get("walk_forward_note"),
+            "method": report.get("method"),
+            "is_days": report.get("is_days"),
+            "oos_days": report.get("oos_days"),
         }
     )
 

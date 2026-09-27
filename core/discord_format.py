@@ -145,17 +145,24 @@ def format_optimise(payload: dict[str, Any]) -> str:
     top = payload.get("top") or []
     lines = [
         f"**Optimise** {payload.get('symbol')} {payload.get('window')}  "
-        f"{payload.get('combinations_tested')} combos  "
-        f"{payload.get('distinct_outcomes')} distinct"
+        f"{payload.get('combinations_tested') or len(top)} combos  "
+        f"{payload.get('method') or 'grid'}"
     ]
     for i, row in enumerate(top[:5], start=1):
         p = row.get("params") or {}
         m = row.get("metrics") or {}
-        lines.append(
-            f"{i}. OR {p.get('opening_range_minutes')}m buf {p.get('breakout_buffer_atr')} "
-            f"str {p.get('min_strength')}  score {row.get('score')}  "
-            f"n={m.get('trades')} exp {m.get('expectancy')}"
-        )
+        if p.get("target_r") is not None:
+            lines.append(
+                f"{i}. {p.get('target_r')}R scale {p.get('scale_fraction')} "
+                f"buf {p.get('stop_buffer_ticks')} tol {p.get('tolerance_ticks')}  "
+                f"score {row.get('score')}  n={m.get('trades')} exp {m.get('expectancy')}"
+            )
+        else:
+            lines.append(
+                f"{i}. OR {p.get('opening_range_minutes')}m buf {p.get('breakout_buffer_atr')} "
+                f"str {p.get('min_strength')}  score {row.get('score')}  "
+                f"n={m.get('trades')} exp {m.get('expectancy')}"
+            )
     if payload.get("persisted_id"):
         lines.append(f"Saved as backtest #{payload['persisted_id']} (not applied until you select it).")
     return clip("\n".join(lines))

@@ -209,7 +209,7 @@
       </label>
       <label class="check"><input type="checkbox" id="btDemo" /> Demo data (offline, no IBKR)</label>
       <button id="btRun" class="primary">Run backtest</button>
-      <button id="btOpt">Walk-forward 70/30</button>
+      <button id="btOpt">Optimise (grid 70/30)</button>
       <span class="sub" id="btNote"></span>
     </div>
     <div class="sub mut" style="margin-bottom:12px">Uses the futures 5ORB break/retest rules for the selected symbol (config in configs/*_5orb.json).</div>
@@ -793,39 +793,50 @@ async function useDefaultsForTrading() {
 
 async function runOptimise() {
   const note = document.getElementById("btNote");
-  note.textContent = "running 70/30 walk-forward...";
+  note.textContent = "running grid optimise (70/30 walk-forward)...";
   try {
     const j = await getJSON("/api/optimise?" + backtestQuery() + "&top_n=8");
     if (j.error) { note.textContent = ""; document.getElementById("btResult").innerHTML = `<div class="empty">${j.error}${j.hint ? " - " + j.hint : ""}</div>`; return; }
-    note.textContent = `source: ${j.data_source}${j.note ? " · " + j.note : ""}`;
+    note.textContent = `source: ${j.data_source} · ${j.combinations_tested || "?"} combos${j.note ? " · " + j.note : ""}`;
     const top = j.top || [];
     const rows = top.map((r, i) => {
       const m = r.metrics || {};
+      const p = r.params || {};
+      const paramStr = p.target_r != null
+        ? `${p.target_r}R · ${Math.round((p.scale_fraction || 0) * 100)}% · buf ${p.stop_buffer_ticks} · tol ${p.tolerance_ticks}`
+        : (r.label || i + 1);
       return `<tr>
-        <td>${r.label || i + 1}</td>
+        <td>${r.rank || i + 1}</td>
+        <td class="mut">${paramStr}</td>
         <td>${m.trades ?? "-"}</td>
         <td>${m.win_rate !== undefined ? pct(m.win_rate) : "-"}</td>
         <td class="${cls(m.expectancy)}">${m.expectancy !== undefined ? sign(m.expectancy) : "-"}</td>
         <td class="${cls(m.total_pnl)}">${m.total_pnl !== undefined ? sign(m.total_pnl) : "-"}</td>
         <td>${fmt(r.score)}</td>
+        <td>${(r.rank === 1 || i === 0) && j.persisted_id ? `<button data-id="${j.persisted_id}" class="optUseBtn">Use</button>` : ""}</td>
       </tr>`;
     }).join("");
     document.getElementById("btResult").innerHTML =
-      `<h2 style="margin-top:18px;font-size:13px">Walk-forward 70/30</h2>
-       <div style="overflow-x:auto"><table><thead><tr><th>Split</th><th>Trades</th><th>Win%</th><th>Expectancy</th><th>Total P&L</th><th>Score</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+      `<h2 style="margin-top:18px;font-size:13px">Optimise — ranked by OOS score</h2>
+       <div style="overflow-x:auto"><table><thead><tr><th>#</th><th>Params</th><th>OOS Trades</th><th>Win%</th><th>Expectancy</th><th>Total P&L</th><th>OOS Score</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`;
+    document.querySelectorAll(".optUseBtn").forEach(b => b.addEventListener("click", () => {
+      selectForTrading({ backtest_id: b.dataset.id });
+    }));
     await loadOptimisations();
   } catch (e) { note.textContent = "error: " + e; }
 }
 
 async function loadOptimisations() {
   const d = await getJSON("/api/optimisations?limit=50");
-  if (!d.runs || !d.runs.length) { document.getElementById("optHistory").innerHTML = `<div class="empty">No walk-forward runs saved yet. Click "Walk-forward 70/30" above.</div>`; return; }
+  if (!d.runs || !d.runs.length) { document.getElementById("optHistory").innerHTML = `<div class="empty">No optimise runs saved yet. Click "Optimise (grid 70/30)" above.</div>`; return; }
   const rows = d.runs.map(r => {
     const m = r.metrics || {};
     const p = r.params || {};
-    const paramStr = p.entry_model
-      ? `${p.symbol || r.symbol} ${p.walk_forward || "5ORB"}`
-      : `OR ${p.opening_range_minutes}m, buf ${fmt(p.breakout_buffer_atr)}`;
+    const paramStr = p.target_r != null
+      ? `${p.symbol || r.symbol} ${p.target_r}R · ${Math.round((p.scale_fraction || 0) * 100)}% · buf ${p.stop_buffer_ticks} · tol ${p.tolerance_ticks}`
+      : (p.entry_model
+        ? `${p.symbol || r.symbol} ${p.walk_forward || p.optimise || "5ORB"}`
+        : `OR ${p.opening_range_minutes}m, buf ${fmt(p.breakout_buffer_atr)}`);
     const useBtn = `<button data-id="${r.id}" class="histUseBtn">Use for trading</button>`;
     return `<tr class="${r.is_active ? "best-row" : ""}">
       <td class="mut">${fmtGmt(r.created_at)}</td>

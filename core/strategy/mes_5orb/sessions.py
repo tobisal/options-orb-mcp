@@ -245,3 +245,40 @@ def load_mes_5orb_config(symbol: str | None = None) -> Mes5OrbConfig:
 
 def clear_mes_5orb_config_cache() -> None:
     load_mes_5orb_config.cache_clear()
+
+
+def apply_mes_opt_params(cfg: Mes5OrbConfig, params: dict[str, Any] | None) -> Mes5OrbConfig:
+    """Overlay optimiser knobs (exits / retest) onto a loaded futures config."""
+    from dataclasses import replace
+
+    if not params:
+        return cfg
+    exits_kw: dict[str, Any] = {}
+    if params.get("target_r") is not None:
+        exits_kw["target_r"] = float(params["target_r"])
+    if params.get("scale_fraction") is not None:
+        exits_kw["scale_fraction"] = min(max(float(params["scale_fraction"]), 0.0), 1.0)
+    if params.get("stop_buffer_ticks") is not None:
+        exits_kw["stop_buffer_ticks"] = int(params["stop_buffer_ticks"])
+    if params.get("use_hod_lod_target") is not None:
+        exits_kw["use_hod_lod_target"] = bool(params["use_hod_lod_target"])
+    if params.get("move_stop_to_be") is not None:
+        exits_kw["move_stop_to_be"] = bool(params["move_stop_to_be"])
+    if params.get("runner_trail") is not None:
+        exits_kw["runner_trail"] = bool(params["runner_trail"])
+    exits = replace(cfg.exits, **exits_kw) if exits_kw else cfg.exits
+
+    tol = params.get("tolerance_ticks")
+    rej = params.get("require_rejection_candle")
+    sessions = cfg.sessions
+    if tol is not None or rej is not None:
+        updated = []
+        for s in cfg.sessions:
+            rt_kw: dict[str, Any] = {}
+            if tol is not None:
+                rt_kw["tolerance_ticks"] = int(tol)
+            if rej is not None:
+                rt_kw["require_rejection_candle"] = bool(rej)
+            updated.append(replace(s, retest=replace(s.retest, **rt_kw)))
+        sessions = tuple(updated)
+    return replace(cfg, exits=exits, sessions=sessions)
