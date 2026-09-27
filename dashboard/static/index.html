@@ -902,6 +902,7 @@ async function useDefaultsForTrading() {
   const r = await postJSON("/api/strategy/clear?symbol=" + encodeURIComponent(symbol));
   if (r.error) { alert(r.error); return; }
   if (r.strategy_by_window) renderStrategyLine(r.strategy_by_window);
+  if (r.mes_params) fillCustomParams(r.mes_params);
   await Promise.all([loadSummary(), loadOptimisations(), loadSignals()]);
 }
 
