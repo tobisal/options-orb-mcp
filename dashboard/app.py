@@ -122,6 +122,79 @@ def _resolve_window(window: str) -> SessionWindow:
     return SessionWindow(w)
 
 
+def _mes_params_payload(symbol: str, db: Database | None = None) -> dict[str, Any]:
+    """JSON description of resolved 5ORB exit/retest knobs for the UI."""
+    clear_mes_5orb_config_cache()
+    base = load_mes_5orb_config(symbol)
+    cfg, found = resolve_mes_5orb_config(symbol, db or _db)
+    retest = cfg.sessions[0].retest if cfg.sessions else None
+    base_rt = base.sessions[0].retest if base.sessions else None
+    return {
+        "symbol": cfg.symbol,
+        "source": "selected" if found else "defaults",
+        "label": (found or {}).get("label"),
+        "params": {
+            "entry_model": "mes_5orb",
+            "symbol": cfg.symbol,
+            "target_r": cfg.exits.target_r,
+            "scale_fraction": cfg.exits.scale_fraction,
+            "stop_buffer_ticks": cfg.exits.stop_buffer_ticks,
+            "tolerance_ticks": retest.tolerance_ticks if retest else 3,
+            "require_rejection_candle": (
+                retest.require_rejection_candle if retest else False
+            ),
+            "use_hod_lod_target": cfg.exits.use_hod_lod_target,
+            "move_stop_to_be": cfg.exits.move_stop_to_be,
+            "runner_trail": cfg.exits.runner_trail,
+        },
+        "defaults": {
+            "target_r": base.exits.target_r,
+            "scale_fraction": base.exits.scale_fraction,
+            "stop_buffer_ticks": base.exits.stop_buffer_ticks,
+            "tolerance_ticks": base_rt.tolerance_ticks if base_rt else 3,
+            "require_rejection_candle": (
+                base_rt.require_rejection_candle if base_rt else False
+            ),
+        },
+    }
+
+
+def _parse_mes_custom_params(
+    q, *, symbol: str
+) -> dict[str, Any] | None:
+    """Build tradable mes_5orb params from query knobs. None if no knobs present."""
+    keys = (
+        "target_r",
+        "scale_fraction",
+        "stop_buffer_ticks",
+        "tolerance_ticks",
+        "require_rejection_candle",
+        "use_hod_lod_target",
+        "move_stop_to_be",
+        "runner_trail",
+    )
+    if not any(q.get(k) not in (None, "") for k in keys):
+        return None
+    params: dict[str, Any] = {
+        "entry_model": "mes_5orb",
+        "symbol": symbol,
+        "source": "custom",
+    }
+    if q.get("target_r") not in (None, ""):
+        params["target_r"] = float(q.get("target_r"))
+    if q.get("scale_fraction") not in (None, ""):
+        params["scale_fraction"] = min(max(float(q.get("scale_fraction")), 0.0), 1.0)
+    if q.get("stop_buffer_ticks") not in (None, ""):
+        params["stop_buffer_ticks"] = int(q.get("stop_buffer_ticks"))
+    if q.get("tolerance_ticks") not in (None, ""):
+        params["tolerance_ticks"] = int(q.get("tolerance_ticks"))
+    for flag in ("require_rejection_candle", "use_hod_lod_target", "move_stop_to_be", "runner_trail"):
+        raw = q.get(flag)
+        if raw not in (None, ""):
+            params[flag] = str(raw).lower() in ("1", "true", "yes", "on")
+    return params
+
+
 def _mes_score(metrics: dict[str, Any]) -> float:
     """Simple rank score for futures runs (expectancy + win rate − drawdown)."""
     if not metrics or int(metrics.get("trades") or 0) == 0:
@@ -570,6 +643,7 @@ async def api_summary(_request: Request) -> JSONResponse:
         "server_time": utcnow().isoformat() + "Z",
         "session_hours_gmt": describe_windows_gmt(),
         "strategy_by_window": strategy_by_window(settings.default_symbol, _db),
+        "mes_params": _mes_params_payload(settings.default_symbol, _db),
     }
     connected, acct, note = await _ibkr_fetch("account", lambda ib: ib.account_summary())
     payload["ibkr_connected"] = connected
@@ -1037,7 +1111,7 @@ async def api_optimisations(request: Request) -> JSONResponse:
 
 
 async def api_strategy_select(request: Request) -> JSONResponse:
-    """Record the selected futures symbol/window as active (params are config-driven)."""
+    """Select an optimised or custom mes_5orb parameter set for trading."""
     q = request.query_params
     settings = get_settings()
     symbol = coerce_futures_symbol(q.get("symbol") or settings.default_symbol)
@@ -1054,13 +1128,53 @@ async def api_strategy_select(request: Request) -> JSONResponse:
             backtest_id = run["id"]
         else:
             window = _resolve_window(q.get("window", "new_york"))
-            params = {"entry_model": "mes_5orb", "symbol": symbol}
-            backtest_id = None
-            label = f"selected {symbol} {window.value}"
+            custom = _parse_mes_custom_params(q, symbol=symbol)
+            if custom is not None:
+                # Fill missing knobs from current JSON defaults so the set is complete.
+                base = _mes_params_payload(symbol, _db)["defaults"]
+                params = {
+                    "entry_model": "mes_5orb",
+                    "symbol": symbol,
+                    "source": "custom",
+                    "target_r": custom.get("target_r", base["target_r"]),
+                    "scale_fraction": custom.get(
+                        "scale_fraction", base["scale_fraction"]
+                    ),
+                    "stop_buffer_ticks": custom.get(
+                        "stop_buffer_ticks", base["stop_buffer_ticks"]
+                    ),
+                    "tolerance_ticks": custom.get(
+                        "tolerance_ticks", base["tolerance_ticks"]
+                    ),
+                    "require_rejection_candle": custom.get(
+                        "require_rejection_candle",
+                        base["require_rejection_candle"],
+                    ),
+                }
+                for flag in ("use_hod_lod_target", "move_stop_to_be", "runner_trail"):
+                    if flag in custom:
+                        params[flag] = custom[flag]
+                label = (
+                    f"custom {symbol} {params['target_r']}R · "
+                    f"{int(params['scale_fraction'] * 100)}% · "
+                    f"buf {params['stop_buffer_ticks']} · "
+                    f"tol {params['tolerance_ticks']}"
+                )
+                backtest_id = _db.insert_backtest(
+                    label=label,
+                    symbol=symbol,
+                    window=window,
+                    params=params,
+                    metrics={"trades": 0, "note": "manual custom params"},
+                )
+            else:
+                params = {"entry_model": "mes_5orb", "symbol": symbol}
+                backtest_id = None
+                label = f"selected {symbol} {window.value}"
         chosen = _db.set_active_strategy(
             symbol, window, params=params, backtest_id=backtest_id, label=label
         )
-    except (ValueError, KeyError) as exc:
+    except (ValueError, KeyError, TypeError) as exc:
         return JSONResponse({"ok": False, "error": str(exc)})
     cfg, found = resolve_trading_config(symbol, window, _db)
     return JSONResponse(
@@ -1071,8 +1185,17 @@ async def api_strategy_select(request: Request) -> JSONResponse:
             "chosen": chosen,
             "strategy": strategy_payload(cfg, found),
             "strategy_by_window": strategy_by_window(symbol, _db),
+            "mes_params": _mes_params_payload(symbol, _db),
         }
     )
+
+
+async def api_mes_params(request: Request) -> JSONResponse:
+    """Current / default 5ORB exit knobs for the custom-params panel."""
+    q = request.query_params
+    settings = get_settings()
+    symbol = coerce_futures_symbol(q.get("symbol") or settings.default_symbol)
+    return JSONResponse(_mes_params_payload(symbol, _db))
 
 
 async def api_strategy_clear(request: Request) -> JSONResponse:
@@ -1092,6 +1215,7 @@ async def api_strategy_clear(request: Request) -> JSONResponse:
             "symbol": symbol,
             "window": window.value if window else "all",
             "strategy_by_window": strategy_by_window(symbol, _db),
+            "mes_params": _mes_params_payload(symbol, _db),
         }
     )
 
@@ -1171,6 +1295,7 @@ routes = [
     Route("/api/backtest", api_backtest),
     Route("/api/optimise", api_optimise),
     Route("/api/optimisations", api_optimisations),
+    Route("/api/mes_params", api_mes_params),
     Route("/api/strategy/select", api_strategy_select, methods=["POST"]),
     Route("/api/strategy/clear", api_strategy_clear, methods=["POST"]),
     Route("/api/preview", api_preview),

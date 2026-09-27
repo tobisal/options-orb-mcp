@@ -68,7 +68,27 @@
   input[type=number] {
     background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
     border-radius: 6px; padding: 5px 8px; font-size: 13px; margin-left: 6px;
+    width: 72px;
   }
+  .param-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 10px 14px;
+    margin: 10px 0 12px;
+  }
+  .param-grid label {
+    display: flex; flex-direction: column; gap: 4px;
+    color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .4px;
+  }
+  .param-grid label input, .param-grid label select {
+    margin-left: 0; width: 100%; text-transform: none; letter-spacing: 0; font-size: 13px;
+  }
+  .param-grid label.check-row {
+    flex-direction: row; align-items: center; text-transform: none; font-size: 13px;
+    letter-spacing: 0; margin-top: 18px;
+  }
+  .param-grid label.check-row input { width: auto; }
+  #cpNote { color: var(--muted); font-size: 12px; }
   details summary { list-style: revert; }
   .playbtn { font-weight: 700; font-size: 14px; padding: 9px 16px; }
   .playbtn.idle { background: rgba(63,185,80,.15); border-color: rgba(63,185,80,.5); color: var(--green); }
@@ -213,6 +233,35 @@
       <span class="sub" id="btNote"></span>
     </div>
     <div class="sub mut" style="margin-bottom:12px">Uses the futures 5ORB break/retest rules for the selected symbol (config in configs/*_5orb.json).</div>
+
+    <details id="customParams" open style="margin-bottom:14px;border:1px solid var(--border);border-radius:10px;padding:12px 14px;background:var(--panel-2)">
+      <summary style="cursor:pointer;font-weight:600;font-size:13px">Custom params <span class="hint">apply your own exit / retest knobs for trading</span></summary>
+      <div class="param-grid">
+        <label>Target R
+          <input type="number" id="cpTargetR" min="0.5" max="5" step="0.5" value="2" />
+        </label>
+        <label>Scale at TP
+          <select id="cpScale">
+            <option value="0.5">50% + runner</option>
+            <option value="1">100% at target</option>
+          </select>
+        </label>
+        <label>OR stop buffer (ticks)
+          <input type="number" id="cpStopBuf" min="0" max="4" step="1" value="1" />
+        </label>
+        <label>Retest tolerance (ticks)
+          <input type="number" id="cpTol" min="1" max="6" step="1" value="3" />
+        </label>
+        <label class="check-row"><input type="checkbox" id="cpReject" /> Require rejection candle</label>
+      </div>
+      <div class="toolbar">
+        <button id="cpApply" class="primary" type="button">Apply for trading</button>
+        <button id="cpLoad" type="button">Reload current</button>
+        <button id="cpDefaults" type="button">Reset to config defaults</button>
+        <span id="cpNote"></span>
+      </div>
+    </details>
+
     <div id="btMetrics" class="grid cards" style="margin-bottom:6px"></div>
     <canvas id="simChart" height="90" style="display:none"></canvas>
     <div id="btResult"></div>
@@ -295,7 +344,68 @@ function fmtStrategy(st) {
   if (!st || !st.params) return "";
   const p = st.params;
   const src = st.source === "selected" ? "selected" : "defaults";
+  if (p.entry_model === "mes_5orb" || p.target_r != null && p.scale_fraction != null && p.opening_range_minutes == null) {
+    return `${src} ${p.target_r}R · ${Math.round((p.scale_fraction || 0) * 100)}% · buf ${p.stop_buffer_ticks} · tol ${p.tolerance_ticks}`;
+  }
   return `${src} OR ${p.opening_range_minutes}m buf ${fmt(p.breakout_buffer_atr)} str ${fmt(p.min_strength)} TR ${fmt(p.target_r)}`;
+}
+
+function fillCustomParams(mp) {
+  if (!mp || !mp.params) return;
+  const p = mp.params;
+  document.getElementById("cpTargetR").value = p.target_r ?? 2;
+  document.getElementById("cpScale").value = String(p.scale_fraction ?? 0.5);
+  document.getElementById("cpStopBuf").value = p.stop_buffer_ticks ?? 1;
+  document.getElementById("cpTol").value = p.tolerance_ticks ?? 3;
+  document.getElementById("cpReject").checked = !!p.require_rejection_candle;
+  const note = document.getElementById("cpNote");
+  const src = mp.source === "selected" ? "active" : "config defaults";
+  note.textContent = `${mp.symbol}: ${src}` + (mp.label ? ` · ${mp.label}` : "");
+}
+
+function customParamsQuery() {
+  const p = new URLSearchParams({
+    symbol: document.getElementById("btSymbol").value,
+    window: document.getElementById("btWindow").value,
+    target_r: document.getElementById("cpTargetR").value,
+    scale_fraction: document.getElementById("cpScale").value,
+    stop_buffer_ticks: document.getElementById("cpStopBuf").value,
+    tolerance_ticks: document.getElementById("cpTol").value,
+    require_rejection_candle: document.getElementById("cpReject").checked ? "true" : "false",
+  });
+  return p;
+}
+
+async function loadCustomParams() {
+  const symbol = document.getElementById("btSymbol").value;
+  const mp = await getJSON("/api/mes_params?symbol=" + encodeURIComponent(symbol));
+  if (mp && !mp.error) fillCustomParams(mp);
+}
+
+async function applyCustomParams() {
+  const note = document.getElementById("cpNote");
+  note.textContent = "applying…";
+  try {
+    const r = await postJSON("/api/strategy/select?" + customParamsQuery().toString());
+    if (r.error || r.ok === false) {
+      note.textContent = r.error || "apply failed";
+      return;
+    }
+    if (r.mes_params) fillCustomParams(r.mes_params);
+    if (r.strategy_by_window) renderStrategyLine(r.strategy_by_window);
+    note.textContent = `applied for ${r.symbol} ${r.window}` + (r.chosen && r.chosen.label ? ` · ${r.chosen.label}` : "");
+    await loadOptimisations();
+  } catch (e) {
+    note.textContent = "error: " + e;
+  }
+}
+
+async function resetCustomParamsToDefaults() {
+  const symbol = document.getElementById("btSymbol").value;
+  const mp = await getJSON("/api/mes_params?symbol=" + encodeURIComponent(symbol));
+  if (!mp || mp.error || !mp.defaults) return;
+  fillCustomParams({ ...mp, source: "defaults", label: null, params: { ...mp.params, ...mp.defaults } });
+  document.getElementById("cpNote").textContent = `${mp.symbol}: form reset to config defaults (not applied yet)`;
 }
 
 function renderStrategyLine(byWindow) {
@@ -321,6 +431,7 @@ async function loadSummary() {
     hours.textContent = "Session hours: " + s.session_hours_gmt + ". Up to 3 trades per window (max 9/day). Entries use the set you choose, or the nightly 23:30 GMT optimiser pick. Exits are managed separately.";
   }
   renderStrategyLine(s.strategy_by_window);
+  if (s.mes_params) fillCustomParams(s.mes_params);
 
   const env = document.getElementById("envBadge");
   env.textContent = s.environment;
@@ -780,7 +891,10 @@ async function useFormForTrading() {
     symbol: document.getElementById("btSymbol").value,
     window: document.getElementById("btWindow").value,
   });
-  if (r && r.ok) document.getElementById("btNote").textContent = `now trading ${r.symbol} ${r.window}`;
+  if (r && r.ok) {
+    document.getElementById("btNote").textContent = `now trading ${r.symbol} ${r.window}`;
+    if (r.mes_params) fillCustomParams(r.mes_params);
+  }
 }
 
 async function useDefaultsForTrading() {
@@ -943,6 +1057,10 @@ async function refreshAll() {
 document.getElementById("sigBtn").addEventListener("click", loadSignals);
 document.getElementById("btRun").addEventListener("click", runBacktest);
 document.getElementById("btOpt").addEventListener("click", runOptimise);
+document.getElementById("cpApply").addEventListener("click", applyCustomParams);
+document.getElementById("cpLoad").addEventListener("click", loadCustomParams);
+document.getElementById("cpDefaults").addEventListener("click", resetCustomParamsToDefaults);
+document.getElementById("btSymbol").addEventListener("change", loadCustomParams);
 document.getElementById("autoToggle").addEventListener("click", toggleAuto);
 document.getElementById("autoDefaults").addEventListener("click", useDefaultsForTrading);
 document.getElementById("autoRisk").addEventListener("change", async () => {
