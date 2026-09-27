@@ -61,6 +61,21 @@ class TrailingStopConfig:
 
 
 @dataclass(frozen=True)
+class ExitPolicyConfig:
+    """Classic 5m ORB: SL = break of OR; TP = 2R or HOD with runners."""
+
+    stop_mode: str = "or_extreme"
+    stop_buffer_ticks: int = 1
+    target_r: float = 2.0
+    # Fraction closed at primary target (2R/HOD); remainder is the runner.
+    scale_fraction: float = 0.5
+    use_hod_lod_target: bool = True
+    # After scale: move stop to breakeven, trail runner with swings.
+    move_stop_to_be: bool = True
+    runner_trail: bool = True
+
+
+@dataclass(frozen=True)
 class MesRiskConfig:
     contracts: int = 1
     max_concurrent: int = 2
@@ -80,6 +95,7 @@ class Mes5OrbConfig:
     timezone: str = "America/New_York"
     sessions: tuple[MesSession, ...] = ()
     trailing_stop: TrailingStopConfig = field(default_factory=TrailingStopConfig)
+    exits: ExitPolicyConfig = field(default_factory=ExitPolicyConfig)
     risk: MesRiskConfig = field(default_factory=MesRiskConfig)
 
     def session(self, name: str) -> MesSession | None:
@@ -183,7 +199,10 @@ def load_mes_5orb_config(symbol: str | None = None) -> Mes5OrbConfig:
         sessions = _default_sessions(market)
 
     trail = raw.get("trailing_stop") or {}
+    exits_raw = raw.get("exits") or {}
     risk = raw.get("risk") or {}
+    scale = float(exits_raw.get("scale_fraction", 0.5))
+    scale = min(max(scale, 0.0), 1.0)
     return Mes5OrbConfig(
         symbol=sym,
         point_value=float(raw.get("point_value", market.point_value)),
@@ -195,6 +214,20 @@ def load_mes_5orb_config(symbol: str | None = None) -> Mes5OrbConfig:
             method=str(trail.get("method", "swing_low")),
             pivot_lag_bars=int(trail.get("pivot_lag_bars", 2)),
             buffer_ticks=int(trail.get("buffer_ticks", 1)),
+        ),
+        exits=ExitPolicyConfig(
+            stop_mode=str(exits_raw.get("stop_mode", "or_extreme")),
+            stop_buffer_ticks=int(
+                exits_raw.get(
+                    "stop_buffer_ticks",
+                    trail.get("buffer_ticks", 1),
+                )
+            ),
+            target_r=float(exits_raw.get("target_r", 2.0)),
+            scale_fraction=scale,
+            use_hod_lod_target=bool(exits_raw.get("use_hod_lod_target", True)),
+            move_stop_to_be=bool(exits_raw.get("move_stop_to_be", True)),
+            runner_trail=bool(exits_raw.get("runner_trail", True)),
         ),
         risk=MesRiskConfig(
             contracts=max(int(risk.get("contracts", 1)), 1),

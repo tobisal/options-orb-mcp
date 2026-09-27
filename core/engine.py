@@ -23,6 +23,7 @@ from core.marketdata import fetch_bars_with_fallback
 from core.models import Direction, Regime, SessionWindow, SpreadType, TradeRecord, TradeStatus
 from core.risk import RiskManager
 from core.sessions import active_window
+from core.strategy.mes_5orb.exits import hit_stop, hit_target
 from core.strategy.mes_5orb.markets import (
     DEFAULT_FUTURES_SYMBOL,
     coerce_futures_symbol,
@@ -292,14 +293,27 @@ async def place_trade_plan(
     plan_payload["symbol"] = symbol
     plan_payload["point_value"] = point_value
     plan_payload["side"] = side
-    plan_payload["use_trailing_stop"] = True
+    plan_payload["stop_mode"] = plan_dict.get("stop_mode") or "or_extreme"
+    plan_payload["use_trailing_stop"] = bool(plan_dict.get("use_trailing_stop", True))
     plan_payload["trail_active"] = False
+    plan_payload["scaled_out"] = False
     plan_payload["original_stop_loss_price"] = stop_price
     plan_payload["stop_loss_price"] = stop_price
+    if plan_dict.get("target_price") is not None:
+        plan_payload["target_price"] = float(plan_dict["target_price"])
+        plan_payload["target_label"] = str(plan_dict.get("target_label") or "2R")
+        plan_payload["scale_fraction"] = float(plan_dict.get("scale_fraction") or 0.5)
 
     notes = str(plan_dict.get("notes") or f"{symbol} mes_5orb")
     if placement.get("ibkr_error"):
         notes += f" | IBKR unavailable, simulated paper fill: {placement['ibkr_error']}"
+
+    target_r = float(plan_dict.get("target_r") or 2.0)
+    max_profit = (
+        abs(float(plan_dict["target_price"]) - entry_price) * point_value * contracts
+        if plan_dict.get("target_price") is not None
+        else 0.0
+    )
 
     record = TradeRecord(
         environment=environment,
@@ -311,8 +325,8 @@ async def place_trade_plan(
         contracts=contracts,
         entry_price=entry_price,
         max_loss=max_loss,
-        max_profit=0.0,
-        target_r=0.0,
+        max_profit=max_profit,
+        target_r=target_r,
         status=TradeStatus.OPEN,
         signal_strength=1.0,
         order_ref=order_ref,
@@ -398,17 +412,65 @@ async def settle_session_exits(
 
             direction = trade.direction
             stop = float(plan.get("stop_loss_price") or trade.entry_price)
+            entry_px = float(trade.entry_price)
+            target_px = plan.get("target_price")
+            target_px_f = float(target_px) if target_px is not None else None
+            scale_frac = float(plan.get("scale_fraction") if plan.get("scale_fraction") is not None else trade_cfg.exits.scale_fraction)
+            scaled = bool(plan.get("scaled_out"))
             lag = int(plan.get("trail_pivot_lag") or trade_cfg.trailing_stop.pivot_lag_bars)
             buffer = float(trade_cfg.trailing_stop.buffer_ticks) * float(trade_cfg.tick_size)
+            use_trail = bool(plan.get("use_trailing_stop", trade_cfg.exits.runner_trail))
 
+            mark = _mes_mark(trade, bars)
+            last = bars[-1] if bars else None
+            due_flat = _mes_force_flat_due(trade, trade_cfg)
+
+            # Primary 2R / HOD scale-out → BE + optional swing trail on runner.
+            if (
+                last is not None
+                and not scaled
+                and target_px_f is not None
+                and hit_target(direction, last, target_px_f)
+            ):
+                plan["scaled_out"] = True
+                plan["scale_fill_price"] = target_px_f
+                if trade_cfg.exits.move_stop_to_be:
+                    plan["stop_loss_price"] = entry_px
+                    stop = entry_px
+                plan["trail_active"] = use_trail
+                if trade.id:
+                    db.update_plan_json(trade.id, plan)
+                if scale_frac >= 1.0 - 1e-9:
+                    reason = f"target_{plan.get('target_label') or '2R'}"
+                    exit_px = target_px_f
+                    if is_ibkr_backed(trade) and client is not None and trade.order_ref:
+                        side = "BUY" if direction is Direction.LONG else "SELL"
+                        try:
+                            result = await client.close_future_position(
+                                trade_symbol,
+                                contracts=trade.contracts,
+                                side=side,
+                                order_ref=trade.order_ref,
+                            )
+                        except IBKRUnavailable:
+                            continue
+                        if not result.get("ok"):
+                            continue
+                    closed.append(
+                        _journal_close(db, trade, exit_px, reason, bars=bars)
+                    )
+                    continue
+                # Partial: keep runner open; IBKR full-close not done here.
+                scaled = True
+
+            stop = float(plan.get("stop_loss_price") or stop)
             trail = SwingTrailingStop(
                 direction=direction,
                 stop=stop,
                 pivot_lag=lag,
                 buffer=buffer,
             )
-            mark = _mes_mark(trade, bars)
-            if bars:
+            if bars and scaled and use_trail:
                 for b in bars[-40:]:
                     changed = trail.update(b)
                     if changed is not None:
@@ -416,9 +478,12 @@ async def settle_session_exits(
                         plan["trail_active"] = True
                         if trade.id:
                             db.update_plan_json(trade.id, plan)
+                stop = trail.stop
 
-            hit = bool(bars) and trail.hit(bars[-1])
-            due_flat = _mes_force_flat_due(trade, trade_cfg)
+            hit = bool(last) and (
+                hit_stop(direction, last, stop)
+                or (scaled and use_trail and trail.hit(last))
+            )
 
             if not hit and not due_flat:
                 if (
@@ -426,7 +491,7 @@ async def settle_session_exits(
                     and is_ibkr_backed(trade)
                     and trade.order_ref
                     and plan.get("trail_active")
-                    and abs(float(plan.get("stop_loss_price") or 0) - stop) > 1e-9
+                    and abs(float(plan.get("stop_loss_price") or 0) - float(plan.get("original_stop_loss_price") or stop)) > 1e-9
                 ):
                     side = "BUY" if direction is Direction.LONG else "SELL"
                     try:
@@ -441,8 +506,17 @@ async def settle_session_exits(
                         pass
                 continue
 
-            reason = "trailing_stop" if hit else "force_flat"
-            exit_px = trail.stop if hit else mark
+            if hit:
+                if not scaled:
+                    reason = "or_stop"
+                elif abs(stop - entry_px) < float(trade_cfg.tick_size):
+                    reason = "breakeven_stop"
+                else:
+                    reason = "trailing_stop"
+                exit_px = stop
+            else:
+                reason = "force_flat"
+                exit_px = mark
 
             if is_ibkr_backed(trade) and client is not None and trade.order_ref:
                 side = "BUY" if direction is Direction.LONG else "SELL"

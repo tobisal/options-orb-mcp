@@ -8,6 +8,12 @@ from typing import Any
 
 from core.analytics import performance_metrics
 from core.models import Bar, Direction
+from core.strategy.mes_5orb.exits import (
+    build_exit_levels,
+    hit_stop,
+    hit_target,
+    primary_target,
+)
 from core.strategy.mes_5orb.opening_range import compute_opening_range, to_et
 from core.strategy.mes_5orb.sessions import Mes5OrbConfig, load_mes_5orb_config
 from core.strategy.mes_5orb.signals import SetupState, detect_break_retest
@@ -161,7 +167,7 @@ def run_mes_5orb_backtest(
     *,
     cfg: Mes5OrbConfig | None = None,
 ) -> MesBacktestResult:
-    """Day × session event loop: OR → break → retest → trail → force_flat.
+    """Day × session: OR → break → retest → OR stop / 2R|HOD scale → runner trail.
 
     Supports multiple OR windows per day and same-session re-entry after an exit.
     """
@@ -169,11 +175,14 @@ def run_mes_5orb_backtest(
     result = MesBacktestResult(config=cfg)
     contracts = cfg.risk.contracts
     tick = cfg.tick_size
-    buffer = cfg.trailing_stop.buffer_ticks * tick
+    exits = cfg.exits
+    buffer_ticks = exits.stop_buffer_ticks
     lag = cfg.trailing_stop.pivot_lag_bars
+    trail_buffer = cfg.trailing_stop.buffer_ticks * tick
     max_open = cfg.risk.max_concurrent
     allow_reentry = cfg.risk.allow_reentry
     max_per_session = cfg.risk.max_entries_per_session
+    scale_frac = exits.scale_fraction
 
     for day in _trading_days(bars):
         open_count = 0
@@ -195,77 +204,138 @@ def run_mes_5orb_backtest(
                     orb,
                     tick_size=tick,
                     after_bar_index=after_i,
+                    stop_buffer_ticks=buffer_ticks,
                 )
                 if setup is None or setup.state is not SetupState.RETESTED:
                     break
                 if setup.entry_bar_index is None or setup.entry_price is None:
                     break
 
-                entry_bar = bars[setup.entry_bar_index]
-                if setup.direction is Direction.LONG:
-                    init_stop = entry_bar.low - buffer
-                else:
-                    init_stop = entry_bar.high + buffer
-
                 entry_i = setup.entry_bar_index
                 entry_px = float(setup.entry_price)
-                risk_pts = abs(entry_px - init_stop)
-                if risk_pts <= 0:
+                levels = build_exit_levels(
+                    setup.direction,
+                    entry_px,
+                    orb,
+                    bars,
+                    tick_size=tick,
+                    buffer_ticks=buffer_ticks,
+                    target_r=exits.target_r,
+                    entry_index=entry_i,
+                )
+                if levels is None:
                     after_i = entry_i
                     continue
 
-                trail = SwingTrailingStop(
-                    direction=setup.direction,
-                    stop=init_stop,
-                    pivot_lag=lag,
-                    buffer=buffer,
+                init_stop = levels.stop
+                risk_pts = levels.risk_points
+                target_px, target_label = primary_target(
+                    levels,
+                    setup.direction,
+                    use_hod_lod=exits.use_hod_lod_target,
                 )
+
                 open_count += 1
                 entries_this_session += 1
 
-                exit_px = entry_px
-                exit_reason = "force_flat"
-                exit_ts = bars[entry_i].ts
                 manage = [
                     b
                     for b in bars[entry_i + 1 :]
                     if to_et(b.ts).date() == day
                     and to_et(b.ts).time() <= session.force_flat
                 ]
+
+                # Weighted exit: scale at 2R/HOD, runner trails / force_flat / stop.
+                scale_hit = False
+                scale_px = target_px
+                runner_frac = 1.0 - scale_frac if scale_frac < 1.0 else 0.0
+                stop = init_stop
+                trail: SwingTrailingStop | None = None
+                exit_px = entry_px
+                exit_reason = "force_flat"
+                exit_ts = bars[entry_i].ts
                 exit_bar_i = entry_i
+                stop_final = init_stop
+
                 for bi, b in enumerate(manage):
-                    trail.update(b)
-                    if trail.hit(b) or (
-                        (setup.direction is Direction.LONG and b.close < trail.stop)
-                        or (setup.direction is Direction.SHORT and b.close > trail.stop)
-                    ):
-                        exit_px = trail.stop
-                        exit_reason = "trailing_stop"
+                    # 1) Hard stop (OR extreme, then BE / trail after scale)
+                    if hit_stop(setup.direction, b, stop):
+                        exit_px = stop
+                        exit_reason = "or_stop" if not scale_hit else (
+                            "breakeven_stop" if abs(stop - entry_px) < tick else "trailing_stop"
+                        )
                         exit_ts = b.ts
                         exit_bar_i = entry_i + 1 + bi
+                        stop_final = stop
+                        if scale_hit and runner_frac > 0:
+                            # Blended: scale_frac @ scale_px + runner @ stop
+                            exit_px = scale_frac * scale_px + runner_frac * stop
+                            exit_reason = f"scale_{target_label}+{exit_reason}"
                         break
+
+                    # 2) Primary target (2R or HOD/LOD)
+                    if not scale_hit and hit_target(setup.direction, b, target_px):
+                        scale_hit = True
+                        scale_px = target_px
+                        if scale_frac >= 1.0 - 1e-9:
+                            exit_px = target_px
+                            exit_reason = f"target_{target_label}"
+                            exit_ts = b.ts
+                            exit_bar_i = entry_i + 1 + bi
+                            stop_final = stop
+                            break
+                        if exits.move_stop_to_be:
+                            stop = entry_px
+                        if exits.runner_trail:
+                            trail = SwingTrailingStop(
+                                direction=setup.direction,
+                                stop=stop,
+                                pivot_lag=lag,
+                                buffer=trail_buffer,
+                            )
+                        continue
+
+                    # 3) Runner management
+                    if scale_hit and trail is not None:
+                        trail.update(b)
+                        stop = trail.stop
+                        if trail.hit(b) or hit_stop(setup.direction, b, stop):
+                            exit_px = scale_frac * scale_px + runner_frac * stop
+                            exit_reason = f"scale_{target_label}+trailing_stop"
+                            exit_ts = b.ts
+                            exit_bar_i = entry_i + 1 + bi
+                            stop_final = stop
+                            break
                 else:
                     if manage:
-                        exit_px = manage[-1].close
-                        exit_ts = manage[-1].ts
-                        exit_reason = "force_flat"
+                        last = manage[-1]
+                        runner_px = last.close
+                        exit_ts = last.ts
                         exit_bar_i = entry_i + len(manage)
+                        stop_final = stop if trail is None else trail.stop
+                        if scale_hit and runner_frac > 0:
+                            exit_px = scale_frac * scale_px + runner_frac * runner_px
+                            exit_reason = f"scale_{target_label}+force_flat"
+                        elif scale_hit:
+                            exit_px = scale_px
+                            exit_reason = f"target_{target_label}"
+                        else:
+                            exit_px = runner_px
+                            exit_reason = "force_flat"
                     else:
                         exit_px = entry_px
                         exit_ts = bars[entry_i].ts
                         exit_reason = "force_flat"
                         exit_bar_i = entry_i
+                        stop_final = init_stop
 
                 if setup.direction is Direction.LONG:
                     points = exit_px - entry_px
                 else:
                     points = entry_px - exit_px
-                # Size uses config max contracts; live path applies risk%.
-                size = max(int(contracts), 1)
-                # Cap display size for backtest to 1 lot when contracts is a ceiling
-                # of 20 — use 1 for historical PnL comparability unless risk_pct sizing
-                # is wired into backtest later.
+                # Historical PnL on 1 lot for comparability (live uses risk%).
                 size = 1
+                _ = contracts
                 pnl = points * cfg.point_value * size
                 r_mult = points / risk_pts if risk_pts else 0.0
 
@@ -280,7 +350,7 @@ def run_mes_5orb_backtest(
                         exit_price=exit_px,
                         exit_reason=exit_reason,
                         stop_initial=init_stop,
-                        stop_final=trail.stop,
+                        stop_final=stop_final,
                         points=points,
                         pnl_usd=pnl,
                         r_multiple=r_mult,
@@ -354,7 +424,13 @@ def evaluate_mes_signal_live(
             "or_low": orb.low,
         }
 
-    setup = detect_break_retest(bars, sess, orb, tick_size=cfg.tick_size)
+    setup = detect_break_retest(
+        bars,
+        sess,
+        orb,
+        tick_size=cfg.tick_size,
+        stop_buffer_ticks=cfg.exits.stop_buffer_ticks,
+    )
     if setup is None:
         return {
             "ok": False,
@@ -375,19 +451,36 @@ def evaluate_mes_signal_live(
             "state": setup.state.value,
         }
 
-    buffer = cfg.trailing_stop.buffer_ticks * cfg.tick_size
-    entry_bar = bars[setup.entry_bar_index]  # type: ignore[index]
-    if setup.direction is Direction.LONG:
-        stop = entry_bar.low - buffer
-    else:
-        stop = entry_bar.high + buffer
+    entry_i = int(setup.entry_bar_index)  # type: ignore[arg-type]
+    entry_px = float(setup.entry_price)
+    levels = build_exit_levels(
+        setup.direction,
+        entry_px,
+        orb,
+        bars,
+        tick_size=cfg.tick_size,
+        buffer_ticks=cfg.exits.stop_buffer_ticks,
+        target_r=cfg.exits.target_r,
+        entry_index=entry_i,
+    )
+    if levels is None:
+        return {
+            "ok": False,
+            "reason": "mes_5orb: invalid OR stop / risk",
+            "session": sess.name,
+        }
+    target_px, target_label = primary_target(
+        levels,
+        setup.direction,
+        use_hod_lod=cfg.exits.use_hod_lod_target,
+    )
 
     plan = MesTradePlan(
         symbol=cfg.symbol,
         session_name=sess.name,
         direction=setup.direction,
-        entry_price=float(setup.entry_price),
-        stop_price=stop,
+        entry_price=entry_px,
+        stop_price=levels.stop,
         contracts=cfg.risk.contracts,
         break_level=setup.break_level,
         or_high=orb.high,
@@ -396,8 +489,14 @@ def evaluate_mes_signal_live(
         tick_size=cfg.tick_size,
         as_of=as_of,
         notes=setup.notes,
+        target_price=target_px,
+        target_label=target_label,
+        target_r=cfg.exits.target_r,
+        scale_fraction=cfg.exits.scale_fraction,
+        use_trailing_stop=cfg.exits.runner_trail,
         trail_pivot_lag=cfg.trailing_stop.pivot_lag_bars,
         trail_buffer_ticks=cfg.trailing_stop.buffer_ticks,
+        stop_mode=cfg.exits.stop_mode,
     )
     return {
         "ok": True,

@@ -7,6 +7,7 @@ from datetime import date
 from enum import Enum
 
 from core.models import Bar, Direction
+from core.strategy.mes_5orb.exits import or_stop_price
 from core.strategy.mes_5orb.opening_range import OpeningRange, to_et
 from core.strategy.mes_5orb.sessions import MesSession
 
@@ -73,10 +74,12 @@ def detect_break_retest(
     *,
     tick_size: float = 0.25,
     after_bar_index: int | None = None,
+    stop_buffer_ticks: int = 1,
 ) -> BreakRetestSetup | None:
     """Scan post-OR bars for break then valid retest confirmation.
 
     ``after_bar_index`` skips bars at/before that global index (same-session re-entry).
+    Stop is the far side of the 5m OR (break of the range).
     Returns a setup ready for entry (state=RETESTED) or None / INVALID.
     """
     if orb.skipped or orb.high <= orb.low:
@@ -132,11 +135,11 @@ def detect_break_retest(
 
         if break_dir is Direction.LONG and bar.close < orb.low:
             setup.state = SetupState.INVALID
-            setup.notes = "close back inside OR"
+            setup.notes = "close back through OR low"
             return setup
         if break_dir is Direction.SHORT and bar.close > orb.high:
             setup.state = SetupState.INVALID
-            setup.notes = "close back inside OR"
+            setup.notes = "close back through OR high"
             return setup
 
         if break_dir is Direction.LONG:
@@ -149,7 +152,12 @@ def detect_break_retest(
                 setup.retest_bar_index = global_i
                 setup.entry_bar_index = global_i
                 setup.entry_price = bar.close
-                setup.initial_stop = bar.low - tick_size
+                setup.initial_stop = or_stop_price(
+                    Direction.LONG,
+                    orb,
+                    tick_size=tick_size,
+                    buffer_ticks=stop_buffer_ticks,
+                )
                 setup.notes = "long retest confirmed"
                 return setup
         else:
@@ -162,7 +170,12 @@ def detect_break_retest(
                 setup.retest_bar_index = global_i
                 setup.entry_bar_index = global_i
                 setup.entry_price = bar.close
-                setup.initial_stop = bar.high + tick_size
+                setup.initial_stop = or_stop_price(
+                    Direction.SHORT,
+                    orb,
+                    tick_size=tick_size,
+                    buffer_ticks=stop_buffer_ticks,
+                )
                 setup.notes = "short retest confirmed"
                 return setup
 

@@ -93,5 +93,14 @@
     "risk_pct": 5,
     "allow_reentry": true,
     "max_entries_per_session": 3
+  },
+  "exits": {
+    "stop_mode": "or_extreme",
+    "stop_buffer_ticks": 1,
+    "target_r": 2.0,
+    "scale_fraction": 0.5,
+    "use_hod_lod_target": true,
+    "move_stop_to_be": true,
+    "runner_trail": true
   }
 }

@@ -63,6 +63,9 @@ def test_load_mes_config():
     assert cfg.risk.allow_reentry is True
     assert cfg.risk.max_entries_per_session >= 2
     assert cfg.risk.max_concurrent >= 1
+    assert cfg.exits.stop_mode == "or_extreme"
+    assert cfg.exits.target_r == 2.0
+    assert 0 < cfg.exits.scale_fraction <= 1.0
     # Midday OR should be preferred over earlier London when both would be active
     # only one is active at 12:30 ET.
     active = cfg.active_sessions_at(time(12, 30))
@@ -136,6 +139,44 @@ def test_break_and_retest_long():
     assert setup.state is SetupState.RETESTED
     assert setup.direction is Direction.LONG
     assert setup.entry_price == 101.4
+    # Classic ORB: stop is break of the 5m OR (OR low − buffer)
+    assert setup.initial_stop == orb.low - 0.25
+
+
+def test_or_stop_and_2r_levels():
+    from core.strategy.mes_5orb.exits import build_exit_levels, primary_target
+    from core.strategy.mes_5orb.opening_range import OpeningRange
+
+    day = _et_to_naive_utc(2026, 1, 6, 9, 30).date()
+    orb = OpeningRange(
+        session_name="new_york",
+        day=day,
+        high=101.0,
+        low=100.0,
+        mid=100.5,
+        bar_count=1,
+    )
+    bars = [
+        _bar(_et_to_naive_utc(2026, 1, 6, 9, 30), 100.2, 101.0, 100.0, 100.5),
+        _bar(_et_to_naive_utc(2026, 1, 6, 9, 40), 101.5, 101.8, 100.9, 101.4),
+    ]
+    levels = build_exit_levels(
+        Direction.LONG,
+        101.4,
+        orb,
+        bars,
+        tick_size=0.25,
+        buffer_ticks=1,
+        target_r=2.0,
+        entry_index=1,
+    )
+    assert levels is not None
+    assert levels.stop == 100.0 - 0.25
+    risk = 101.4 - levels.stop
+    assert abs(levels.target_2r - (101.4 + 2 * risk)) < 1e-9
+    tgt, label = primary_target(levels, Direction.LONG, use_hod_lod=False)
+    assert label == "2R"
+    assert tgt == levels.target_2r
 
 
 def test_swing_trail_ratchets_up_never_down():

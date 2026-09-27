@@ -1,5 +1,5 @@
 {
-  "_comment": "MES 5ORB break-and-retest. Multiple OR windows for more trades. Times America/New_York.",
+  "_comment": "MES 5m ORB break+retest. SL=OR extreme. TP=2R/HOD with runners. Multi-OR day.",
   "symbol": "MES",
   "exchange": "CME",
   "point_value": 5.0,
@@ -86,6 +86,15 @@
     "method": "swing_low",
     "pivot_lag_bars": 2,
     "buffer_ticks": 1
+  },
+  "exits": {
+    "stop_mode": "or_extreme",
+    "stop_buffer_ticks": 1,
+    "target_r": 2.0,
+    "scale_fraction": 0.5,
+    "use_hod_lod_target": true,
+    "move_stop_to_be": true,
+    "runner_trail": true
   },
   "risk": {
     "contracts": 20,
