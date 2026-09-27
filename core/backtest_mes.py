@@ -161,124 +161,136 @@ def run_mes_5orb_backtest(
     *,
     cfg: Mes5OrbConfig | None = None,
 ) -> MesBacktestResult:
-    """Day × session event loop: OR → break → retest → trail → force_flat."""
+    """Day × session event loop: OR → break → retest → trail → force_flat.
+
+    Supports multiple OR windows per day and same-session re-entry after an exit.
+    """
     cfg = cfg or load_mes_5orb_config()
     result = MesBacktestResult(config=cfg)
     contracts = cfg.risk.contracts
     tick = cfg.tick_size
     buffer = cfg.trailing_stop.buffer_ticks * tick
     lag = cfg.trailing_stop.pivot_lag_bars
-    open_trade_active = False  # max_concurrent=1 across sessions
+    max_open = cfg.risk.max_concurrent
+    allow_reentry = cfg.risk.allow_reentry
+    max_per_session = cfg.risk.max_entries_per_session
 
     for day in _trading_days(bars):
+        open_count = 0
         for session in cfg.sessions:
-            if cfg.risk.max_concurrent <= 1 and open_trade_active:
-                # Still allow evaluation after prior session forced flat same day
-                pass
-
             orb = compute_opening_range(bars, session, day)
             if orb is None or orb.skipped:
                 continue
 
-            setup = detect_break_retest(bars, session, orb, tick_size=tick)
-            if setup is None or setup.state is not SetupState.RETESTED:
-                continue
-            if setup.entry_bar_index is None or setup.entry_price is None:
-                continue
-            if setup.initial_stop is None:
-                continue
+            entries_this_session = 0
+            after_i: int | None = None
 
-            # Initial stop = retest bar extreme ± buffer ticks
-            entry_bar = bars[setup.entry_bar_index]
-            buffer = cfg.trailing_stop.buffer_ticks * tick
-            if setup.direction is Direction.LONG:
-                init_stop = entry_bar.low - buffer
-            else:
-                init_stop = entry_bar.high + buffer
-
-            if cfg.risk.max_concurrent <= 1 and open_trade_active:
-                continue
-
-            entry_i = setup.entry_bar_index
-            entry_px = float(setup.entry_price)
-            risk_pts = abs(entry_px - init_stop)
-            if risk_pts <= 0:
-                continue
-
-            trail = SwingTrailingStop(
-                direction=setup.direction,
-                stop=init_stop,
-                pivot_lag=lag,
-                buffer=buffer,
-            )
-            open_trade_active = True
-
-            exit_px = entry_px
-            exit_reason = "force_flat"
-            exit_ts = bars[entry_i].ts
-            # Manage on subsequent bars until force_flat inclusive
-            manage = [
-                b
-                for b in bars[entry_i + 1 :]
-                if to_et(b.ts).date() == day
-                and to_et(b.ts).time() <= session.force_flat
-            ]
-            for b in manage:
-                trail.update(b)
-                if trail.hit(b):
-                    exit_px = trail.stop
-                    exit_reason = "trailing_stop"
-                    exit_ts = b.ts
+            while entries_this_session < max_per_session:
+                if open_count >= max_open:
                     break
-                # Also check if close hits stop before confirmed trail
-                if setup.direction is Direction.LONG and b.close < trail.stop:
-                    exit_px = trail.stop
-                    exit_reason = "trailing_stop"
-                    exit_ts = b.ts
-                    break
-                if setup.direction is Direction.SHORT and b.close > trail.stop:
-                    exit_px = trail.stop
-                    exit_reason = "trailing_stop"
-                    exit_ts = b.ts
-                    break
-            else:
-                if manage:
-                    exit_px = manage[-1].close
-                    exit_ts = manage[-1].ts
-                    exit_reason = "force_flat"
-                else:
-                    exit_px = entry_px
-                    exit_ts = bars[entry_i].ts
-                    exit_reason = "force_flat"
 
-            if setup.direction is Direction.LONG:
-                points = exit_px - entry_px
-            else:
-                points = entry_px - exit_px
-            pnl = points * cfg.point_value * contracts
-            r_mult = points / risk_pts if risk_pts else 0.0
-
-            result.trades.append(
-                MesTradeResult(
-                    session_name=session.name,
-                    day=day.isoformat(),
-                    direction=setup.direction.value,
-                    entry_time=_iso(bars[entry_i].ts),
-                    entry_price=entry_px,
-                    exit_time=_iso(exit_ts),
-                    exit_price=exit_px,
-                    exit_reason=exit_reason,
-                    stop_initial=init_stop,
-                    stop_final=trail.stop,
-                    points=points,
-                    pnl_usd=pnl,
-                    r_multiple=r_mult,
-                    contracts=contracts,
+                setup = detect_break_retest(
+                    bars,
+                    session,
+                    orb,
+                    tick_size=tick,
+                    after_bar_index=after_i,
                 )
-            )
-            open_trade_active = False  # flattened before next session same day usually
+                if setup is None or setup.state is not SetupState.RETESTED:
+                    break
+                if setup.entry_bar_index is None or setup.entry_price is None:
+                    break
 
-        open_trade_active = False  # new day
+                entry_bar = bars[setup.entry_bar_index]
+                if setup.direction is Direction.LONG:
+                    init_stop = entry_bar.low - buffer
+                else:
+                    init_stop = entry_bar.high + buffer
+
+                entry_i = setup.entry_bar_index
+                entry_px = float(setup.entry_price)
+                risk_pts = abs(entry_px - init_stop)
+                if risk_pts <= 0:
+                    after_i = entry_i
+                    continue
+
+                trail = SwingTrailingStop(
+                    direction=setup.direction,
+                    stop=init_stop,
+                    pivot_lag=lag,
+                    buffer=buffer,
+                )
+                open_count += 1
+                entries_this_session += 1
+
+                exit_px = entry_px
+                exit_reason = "force_flat"
+                exit_ts = bars[entry_i].ts
+                manage = [
+                    b
+                    for b in bars[entry_i + 1 :]
+                    if to_et(b.ts).date() == day
+                    and to_et(b.ts).time() <= session.force_flat
+                ]
+                exit_bar_i = entry_i
+                for bi, b in enumerate(manage):
+                    trail.update(b)
+                    if trail.hit(b) or (
+                        (setup.direction is Direction.LONG and b.close < trail.stop)
+                        or (setup.direction is Direction.SHORT and b.close > trail.stop)
+                    ):
+                        exit_px = trail.stop
+                        exit_reason = "trailing_stop"
+                        exit_ts = b.ts
+                        exit_bar_i = entry_i + 1 + bi
+                        break
+                else:
+                    if manage:
+                        exit_px = manage[-1].close
+                        exit_ts = manage[-1].ts
+                        exit_reason = "force_flat"
+                        exit_bar_i = entry_i + len(manage)
+                    else:
+                        exit_px = entry_px
+                        exit_ts = bars[entry_i].ts
+                        exit_reason = "force_flat"
+                        exit_bar_i = entry_i
+
+                if setup.direction is Direction.LONG:
+                    points = exit_px - entry_px
+                else:
+                    points = entry_px - exit_px
+                # Size uses config max contracts; live path applies risk%.
+                size = max(int(contracts), 1)
+                # Cap display size for backtest to 1 lot when contracts is a ceiling
+                # of 20 — use 1 for historical PnL comparability unless risk_pct sizing
+                # is wired into backtest later.
+                size = 1
+                pnl = points * cfg.point_value * size
+                r_mult = points / risk_pts if risk_pts else 0.0
+
+                result.trades.append(
+                    MesTradeResult(
+                        session_name=session.name,
+                        day=day.isoformat(),
+                        direction=setup.direction.value,
+                        entry_time=_iso(bars[entry_i].ts),
+                        entry_price=entry_px,
+                        exit_time=_iso(exit_ts),
+                        exit_price=exit_px,
+                        exit_reason=exit_reason,
+                        stop_initial=init_stop,
+                        stop_final=trail.stop,
+                        points=points,
+                        pnl_usd=pnl,
+                        r_multiple=r_mult,
+                        contracts=size,
+                    )
+                )
+                open_count = max(open_count - 1, 0)
+                after_i = exit_bar_i
+                if not allow_reentry:
+                    break
 
     return result
 
@@ -302,19 +314,18 @@ def evaluate_mes_signal_live(
     et = to_et(as_of)
     day = et.date()
 
-    # Pick session whose OR has started and before force_flat
+    # Prefer the most recently started session still active (supports multi-OR day).
     sess = None
     if session_name:
         sess = cfg.session(session_name)
     else:
-        for s in cfg.sessions:
-            if s.or_start <= et.time() < s.force_flat:
-                sess = s
-                break
+        active = cfg.active_sessions_at(et.time())
+        if active:
+            sess = max(active, key=lambda s: s.or_start)
     if sess is None:
         return {
             "ok": False,
-            "reason": "mes_5orb: outside London/NY session windows",
+            "reason": "mes_5orb: outside session windows",
             "as_of": as_of.isoformat(),
         }
 

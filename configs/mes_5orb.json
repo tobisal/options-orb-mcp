@@ -1,5 +1,5 @@
 {
-  "_comment": "MES 5ORB break-and-retest. Times America/New_York. point_value=$5/pt, tick=0.25.",
+  "_comment": "MES 5ORB break-and-retest. Multiple OR windows for more trades. Times America/New_York.",
   "symbol": "MES",
   "exchange": "CME",
   "point_value": 5.0,
@@ -9,31 +9,76 @@
     "london": {
       "or_start": "03:00",
       "or_end": "03:05",
-      "search_end": "08:00",
-      "force_flat": "08:00",
+      "search_end": "05:55",
+      "force_flat": "05:55",
       "opening_range": {
-        "min_range_points": 0.75,
-        "max_range_points": 6.0
+        "min_range_points": 0.5,
+        "max_range_points": 8.0
       },
       "retest": {
-        "tolerance_ticks": 2,
-        "timeout_bars": 12,
-        "require_rejection_candle": true
+        "tolerance_ticks": 3,
+        "timeout_bars": 24,
+        "require_rejection_candle": false
+      }
+    },
+    "london_mid": {
+      "or_start": "06:00",
+      "or_end": "06:05",
+      "search_end": "08:55",
+      "force_flat": "08:55",
+      "opening_range": {
+        "min_range_points": 0.5,
+        "max_range_points": 8.0
+      },
+      "retest": {
+        "tolerance_ticks": 3,
+        "timeout_bars": 24,
+        "require_rejection_candle": false
       }
     },
     "new_york": {
       "or_start": "09:30",
       "or_end": "09:35",
-      "search_end": "15:00",
-      "force_flat": "15:55",
+      "search_end": "11:55",
+      "force_flat": "11:55",
       "opening_range": {
-        "min_range_points": 1.0,
-        "max_range_points": 8.0
+        "min_range_points": 0.75,
+        "max_range_points": 10.0
       },
       "retest": {
-        "tolerance_ticks": 2,
-        "timeout_bars": 12,
-        "require_rejection_candle": true
+        "tolerance_ticks": 3,
+        "timeout_bars": 24,
+        "require_rejection_candle": false
+      }
+    },
+    "ny_mid": {
+      "or_start": "12:00",
+      "or_end": "12:05",
+      "search_end": "14:25",
+      "force_flat": "14:25",
+      "opening_range": {
+        "min_range_points": 0.75,
+        "max_range_points": 10.0
+      },
+      "retest": {
+        "tolerance_ticks": 3,
+        "timeout_bars": 24,
+        "require_rejection_candle": false
+      }
+    },
+    "ny_pm": {
+      "or_start": "14:30",
+      "or_end": "14:35",
+      "search_end": "15:55",
+      "force_flat": "15:55",
+      "opening_range": {
+        "min_range_points": 0.75,
+        "max_range_points": 10.0
+      },
+      "retest": {
+        "tolerance_ticks": 3,
+        "timeout_bars": 24,
+        "require_rejection_candle": false
       }
     }
   },
@@ -44,8 +89,10 @@
   },
   "risk": {
     "contracts": 20,
-    "max_concurrent": 1,
+    "max_concurrent": 2,
     "risk_pct": 5,
-    "_comment": "contracts = max size from risk%; risk_pct default 1-5"
+    "allow_reentry": true,
+    "max_entries_per_session": 3,
+    "_comment": "contracts = max size from risk%; up to 3 entries per OR window after stops"
   }
 }

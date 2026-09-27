@@ -63,9 +63,12 @@ class TrailingStopConfig:
 @dataclass(frozen=True)
 class MesRiskConfig:
     contracts: int = 1
-    max_concurrent: int = 1
+    max_concurrent: int = 2
     # Percent of capital per trade (1–5). None → Settings.MAX_RISK_PER_TRADE.
     risk_pct: float | None = None
+    # After a stop/force_flat, allow another break/retest in the same session.
+    allow_reentry: bool = True
+    max_entries_per_session: int = 3
 
 
 @dataclass(frozen=True)
@@ -89,6 +92,10 @@ class Mes5OrbConfig:
         if key == "london":
             return next((s for s in self.sessions if s.name == "london"), None)
         return None
+
+    def active_sessions_at(self, t: time) -> list[MesSession]:
+        """Sessions whose OR has started and force_flat has not yet passed."""
+        return [s for s in self.sessions if s.or_start <= t < s.force_flat]
 
 
 def _session_from_raw(name: str, raw: dict[str, Any], *, defaults: OpeningRangeFilter) -> MesSession:
@@ -167,10 +174,11 @@ def load_mes_5orb_config(symbol: str | None = None) -> Mes5OrbConfig:
     london_defaults = OpeningRangeFilter(market.london_min_range, market.london_max_range)
     ny_defaults = OpeningRangeFilter(market.ny_min_range, market.ny_max_range)
     sessions: list[MesSession] = []
-    for name, defaults in (("london", london_defaults), ("new_york", ny_defaults)):
-        key = name if name in sess_raw else ("newyork" if name == "new_york" and "newyork" in sess_raw else None)
-        if key is not None:
-            sessions.append(_session_from_raw(name, sess_raw[key], defaults=defaults))
+    if sess_raw:
+        # Load every session block (london, london_mid, new_york, ny_mid, …).
+        for name in sorted(sess_raw.keys(), key=lambda n: str(sess_raw[n].get("or_start", "99:99"))):
+            defaults = ny_defaults if ("new_york" in name or name.startswith("ny")) else london_defaults
+            sessions.append(_session_from_raw(name, sess_raw[name], defaults=defaults))
     if not sessions:
         sessions = _default_sessions(market)
 
@@ -190,12 +198,14 @@ def load_mes_5orb_config(symbol: str | None = None) -> Mes5OrbConfig:
         ),
         risk=MesRiskConfig(
             contracts=max(int(risk.get("contracts", 1)), 1),
-            max_concurrent=max(int(risk.get("max_concurrent", 1)), 1),
+            max_concurrent=max(int(risk.get("max_concurrent", 2)), 1),
             risk_pct=(
                 float(risk["risk_pct"])
                 if risk.get("risk_pct") not in (None, "")
                 else None
             ),
+            allow_reentry=bool(risk.get("allow_reentry", True)),
+            max_entries_per_session=max(int(risk.get("max_entries_per_session", 3)), 1),
         ),
     )
 

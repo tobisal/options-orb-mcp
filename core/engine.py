@@ -46,7 +46,8 @@ def resolve_window(window: str) -> SessionWindow:
 
 
 def _mes_session_to_window(session_name: str) -> SessionWindow:
-    if session_name == "london":
+    name = (session_name or "").lower()
+    if name.startswith("london"):
         return SessionWindow.LONDON
     return SessionWindow.NEW_YORK
 
@@ -88,15 +89,32 @@ async def build_mes_trade_plan(
 
     session_name = None
     if window.lower() not in ("auto", "active", "current"):
-        session_name = (
-            "london"
-            if "london" in window.lower()
-            else (
-                "new_york"
-                if "new" in window.lower() or window.lower() in ("ny", "new_york")
-                else None
-            )
-        )
+        w = window.lower().replace(" ", "_").replace("-", "_")
+        aliases = {
+            "london": "london",
+            "london_mid": "london_mid",
+            "londonmid": "london_mid",
+            "new_york": "new_york",
+            "newyork": "new_york",
+            "ny": "new_york",
+            "ny_mid": "ny_mid",
+            "nymid": "ny_mid",
+            "ny_pm": "ny_pm",
+            "nypm": "ny_pm",
+            "afternoon": "ny_pm",
+        }
+        if w in aliases:
+            session_name = aliases[w]
+        elif "london_mid" in w or w.endswith("_mid") and "london" in w:
+            session_name = "london_mid"
+        elif "ny_pm" in w or "nypm" in w:
+            session_name = "ny_pm"
+        elif "ny_mid" in w or "nymid" in w:
+            session_name = "ny_mid"
+        elif "london" in w:
+            session_name = "london"
+        elif "new" in w or w.startswith("ny"):
+            session_name = "new_york"
 
     signal = evaluate_mes_signal_live(bars, session_name=session_name, cfg=cfg)
     strategy = {

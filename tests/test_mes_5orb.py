@@ -54,9 +54,19 @@ def test_load_mes_config():
     cfg = load_mes_5orb_config()
     assert cfg.symbol == "MES"
     assert cfg.point_value == 5.0
-    assert len(cfg.sessions) == 2
+    assert len(cfg.sessions) >= 5
     assert cfg.session("london") is not None
+    assert cfg.session("london_mid") is not None
     assert cfg.session("new_york") is not None
+    assert cfg.session("ny_mid") is not None
+    assert cfg.session("ny_pm") is not None
+    assert cfg.risk.allow_reentry is True
+    assert cfg.risk.max_entries_per_session >= 2
+    assert cfg.risk.max_concurrent >= 1
+    # Midday OR should be preferred over earlier London when both would be active
+    # only one is active at 12:30 ET.
+    active = cfg.active_sessions_at(time(12, 30))
+    assert any(s.name == "ny_mid" for s in active)
 
 
 def test_load_other_futures_configs():

@@ -72,15 +72,19 @@ def detect_break_retest(
     orb: OpeningRange,
     *,
     tick_size: float = 0.25,
+    after_bar_index: int | None = None,
 ) -> BreakRetestSetup | None:
     """Scan post-OR bars for break then valid retest confirmation.
 
+    ``after_bar_index`` skips bars at/before that global index (same-session re-entry).
     Returns a setup ready for entry (state=RETESTED) or None / INVALID.
     """
     if orb.skipped or orb.high <= orb.low:
         return None
 
     post = _bars_after_or(bars, session, orb.day)
+    if after_bar_index is not None:
+        post = [(i, b) for i, b in post if i > after_bar_index]
     if not post:
         return None
 
@@ -120,14 +124,12 @@ def detect_break_retest(
         notes=f"break {break_dir.value} @ {break_level:.2f}",
     )
 
-    # Scan for retest after break bar
     for offset, (global_i, bar) in enumerate(post[break_idx_local + 1 :], start=1):
         if offset > timeout:
             setup.state = SetupState.INVALID
             setup.notes = "retest timeout"
             return setup
 
-        # Invalidate if close back inside OR
         if break_dir is Direction.LONG and bar.close < orb.low:
             setup.state = SetupState.INVALID
             setup.notes = "close back inside OR"
@@ -138,7 +140,6 @@ def detect_break_retest(
             return setup
 
         if break_dir is Direction.LONG:
-            # Touch: low within tolerance of break_level from above
             touched = bar.low <= break_level + tol and bar.low >= break_level - tol
             held = bar.low >= break_level - tol
             closed_ok = bar.close >= break_level
@@ -148,7 +149,7 @@ def detect_break_retest(
                 setup.retest_bar_index = global_i
                 setup.entry_bar_index = global_i
                 setup.entry_price = bar.close
-                setup.initial_stop = bar.low - tick_size  # buffer applied by caller too
+                setup.initial_stop = bar.low - tick_size
                 setup.notes = "long retest confirmed"
                 return setup
         else:
