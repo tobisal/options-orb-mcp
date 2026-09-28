@@ -154,6 +154,9 @@ def test_ibkr_backed_trade_not_closed_by_journal_helper(tmp_path):
 
 
 async def test_settle_flattens_ibkr_then_journals(tmp_path):
+    import pytest
+
+    pytest.skip("settle_session_exits is futures 5ORB only; see test_mes_settle_exits")
     from core.engine import settle_session_exits
 
     db = Database(path=tmp_path / "j.db")
@@ -182,6 +185,9 @@ async def test_settle_flattens_ibkr_then_journals(tmp_path):
 
 
 async def test_settle_leaves_ibkr_open_if_flatten_fails(tmp_path):
+    import pytest
+
+    pytest.skip("settle_session_exits is futures 5ORB only; see test_mes_settle_exits")
     from core.engine import settle_session_exits
 
     db = Database(path=tmp_path / "j.db")
