@@ -425,23 +425,47 @@ async def settle_session_exits(
             mark = _mes_mark(trade, bars)
             last = bars[-1] if bars else None
             due_flat = _mes_force_flat_due(trade, trade_cfg)
+            full_exit_at_target = scale_frac >= 1.0 - 1e-9
 
-            # Primary 2R / HOD scale-out → BE + optional swing trail on runner.
+            # Recovery: prior cycle marked full scale-out but failed to close.
+            if (
+                scaled
+                and full_exit_at_target
+                and plan.get("scale_fill_price") is not None
+            ):
+                exit_px = float(plan["scale_fill_price"])
+                reason = f"target_{plan.get('target_label') or '2R'}"
+                if is_ibkr_backed(trade) and client is not None and trade.order_ref:
+                    side = "BUY" if direction is Direction.LONG else "SELL"
+                    try:
+                        result = await client.close_future_position(
+                            trade_symbol,
+                            contracts=trade.contracts,
+                            side=side,
+                            order_ref=trade.order_ref,
+                        )
+                    except IBKRUnavailable:
+                        continue
+                    if not result.get("ok"):
+                        continue
+                    rec = _journal_close(db, trade, exit_px, reason, bars=bars)
+                    rec["ibkr"] = True
+                    closed.append(rec)
+                elif not is_ibkr_backed(trade):
+                    closed.append(
+                        _journal_close(db, trade, exit_px, reason, bars=bars)
+                    )
+                continue
+
+            # Primary 2R / HOD hit.
             if (
                 last is not None
                 and not scaled
                 and target_px_f is not None
                 and hit_target(direction, last, target_px_f)
             ):
-                plan["scaled_out"] = True
-                plan["scale_fill_price"] = target_px_f
-                if trade_cfg.exits.move_stop_to_be:
-                    plan["stop_loss_price"] = entry_px
-                    stop = entry_px
-                plan["trail_active"] = use_trail
-                if trade.id:
-                    db.update_plan_json(trade.id, plan)
-                if scale_frac >= 1.0 - 1e-9:
+                if full_exit_at_target:
+                    # Full take-profit: do NOT move stop to BE or mark scaled until closed.
                     reason = f"target_{plan.get('target_label') or '2R'}"
                     exit_px = target_px_f
                     if is_ibkr_backed(trade) and client is not None and trade.order_ref:
@@ -454,14 +478,46 @@ async def settle_session_exits(
                                 order_ref=trade.order_ref,
                             )
                         except IBKRUnavailable:
+                            # Remember intent so the next cycle can finish the close.
+                            plan["pending_full_target"] = True
+                            plan["scale_fill_price"] = target_px_f
+                            plan["scaled_out"] = True
+                            if trade.id:
+                                db.update_plan_json(trade.id, plan)
                             continue
                         if not result.get("ok"):
+                            plan["pending_full_target"] = True
+                            plan["scale_fill_price"] = target_px_f
+                            plan["scaled_out"] = True
+                            if trade.id:
+                                db.update_plan_json(trade.id, plan)
                             continue
-                    closed.append(
-                        _journal_close(db, trade, exit_px, reason, bars=bars)
-                    )
+                        plan["scaled_out"] = True
+                        plan["scale_fill_price"] = target_px_f
+                        if trade.id:
+                            db.update_plan_json(trade.id, plan)
+                        rec = _journal_close(db, trade, exit_px, reason, bars=bars)
+                        rec["ibkr"] = True
+                        closed.append(rec)
+                    else:
+                        plan["scaled_out"] = True
+                        plan["scale_fill_price"] = target_px_f
+                        if trade.id:
+                            db.update_plan_json(trade.id, plan)
+                        closed.append(
+                            _journal_close(db, trade, exit_px, reason, bars=bars)
+                        )
                     continue
-                # Partial: keep runner open; IBKR full-close not done here.
+
+                # Partial scale: take marker, move stop to BE, trail runner.
+                plan["scaled_out"] = True
+                plan["scale_fill_price"] = target_px_f
+                if trade_cfg.exits.move_stop_to_be:
+                    plan["stop_loss_price"] = entry_px
+                    stop = entry_px
+                plan["trail_active"] = use_trail
+                if trade.id:
+                    db.update_plan_json(trade.id, plan)
                 scaled = True
 
             stop = float(plan.get("stop_loss_price") or stop)
@@ -471,7 +527,7 @@ async def settle_session_exits(
                 pivot_lag=lag,
                 buffer=buffer,
             )
-            if bars and scaled and use_trail:
+            if bars and scaled and use_trail and not full_exit_at_target:
                 for b in bars[-40:]:
                     changed = trail.update(b)
                     if changed is not None:
@@ -483,7 +539,7 @@ async def settle_session_exits(
 
             hit = bool(last) and (
                 hit_stop(direction, last, stop)
-                or (scaled and use_trail and trail.hit(last))
+                or (scaled and use_trail and not full_exit_at_target and trail.hit(last))
             )
 
             if not hit and not due_flat:
@@ -492,7 +548,12 @@ async def settle_session_exits(
                     and is_ibkr_backed(trade)
                     and trade.order_ref
                     and plan.get("trail_active")
-                    and abs(float(plan.get("stop_loss_price") or 0) - float(plan.get("original_stop_loss_price") or stop)) > 1e-9
+                    and not full_exit_at_target
+                    and abs(
+                        float(plan.get("stop_loss_price") or 0)
+                        - float(plan.get("original_stop_loss_price") or stop)
+                    )
+                    > 1e-9
                 ):
                     side = "BUY" if direction is Direction.LONG else "SELL"
                     try:

@@ -143,6 +143,34 @@ def test_break_and_retest_long():
     assert setup.initial_stop == orb.low - 0.25
 
 
+def test_primary_target_ignores_tiny_lod():
+    from core.strategy.mes_5orb.exits import ExitLevels, primary_target
+
+    # Short: 7 pts risk, 2R=14 pts. Tiny LOD only 1.5 pts away must not win.
+    levels = ExitLevels(
+        stop=7776.75,
+        risk_points=7.0,
+        target_2r=7755.75,
+        hod_at_entry=7780.0,
+        lod_at_entry=7768.0,
+    )
+    tgt, label = primary_target(levels, Direction.SHORT, use_hod_lod=True)
+    assert label == "2R"
+    assert tgt == 7755.75
+
+    # Meaningful LOD (≥1R) still preferred when nearer than 2R.
+    levels2 = ExitLevels(
+        stop=7776.75,
+        risk_points=7.0,
+        target_2r=7755.75,
+        hod_at_entry=7780.0,
+        lod_at_entry=7762.0,  # 7.75 pts = >1R from entry 7769.75
+    )
+    tgt2, label2 = primary_target(levels2, Direction.SHORT, use_hod_lod=True)
+    assert label2 == "LOD"
+    assert tgt2 == 7762.0
+
+
 def test_or_stop_and_2r_levels():
     from core.strategy.mes_5orb.exits import build_exit_levels, primary_target
     from core.strategy.mes_5orb.opening_range import OpeningRange

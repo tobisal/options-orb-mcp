@@ -101,19 +101,21 @@ def primary_target(
     direction: Direction,
     *,
     use_hod_lod: bool = True,
+    min_r_for_hod_lod: float = 1.0,
 ) -> tuple[float, str]:
-    """Usually 2R; use prior HOD/LOD when it is a nearer target beyond entry."""
+    """Usually 2R; use prior HOD/LOD only when it is at least ``min_r_for_hod_lod`` R."""
     t2 = levels.target_2r
-    if not use_hod_lod:
+    if not use_hod_lod or levels.risk_points <= 0:
         return t2, "2R"
+    min_move = max(float(min_r_for_hod_lod), 0.0) * levels.risk_points
     if direction is Direction.LONG:
         entry = levels.stop + levels.risk_points
         hod = levels.hod_at_entry
-        if hod is not None and entry < hod <= t2:
+        if hod is not None and entry < hod <= t2 and (hod - entry) >= min_move:
             return hod, "HOD"
     else:
         entry = levels.stop - levels.risk_points
         lod = levels.lod_at_entry
-        if lod is not None and t2 <= lod < entry:
+        if lod is not None and t2 <= lod < entry and (entry - lod) >= min_move:
             return lod, "LOD"
     return t2, "2R"
