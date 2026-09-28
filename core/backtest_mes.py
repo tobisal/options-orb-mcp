@@ -9,6 +9,11 @@ from typing import Any
 
 from core.analytics import performance_metrics
 from core.models import Bar, Direction
+from core.strategy.mes_5orb.asia_range import (
+    AsiaSetupState,
+    compute_asia_range,
+    detect_asia_judas,
+)
 from core.strategy.mes_5orb.exits import (
     build_exit_levels,
     hit_stop,
@@ -102,7 +107,19 @@ def _trading_days(bars: list[Bar]) -> list[date]:
 
 
 def _bars_on_days(bars: list[Bar], days: set[date]) -> list[Bar]:
-    return [b for b in bars if to_et(b.ts).date() in days]
+    """Bars on ``days``, plus prior-evening Asia range bars (20:00+) for lookback."""
+    from datetime import timedelta
+
+    lookback = {d - timedelta(days=1) for d in days}
+    out: list[Bar] = []
+    for b in bars:
+        et = to_et(b.ts)
+        d = et.date()
+        if d in days:
+            out.append(b)
+        elif d in lookback and et.time().hour >= 20:
+            out.append(b)
+    return out
 
 
 def walk_forward_mes_7030(
@@ -163,17 +180,103 @@ def walk_forward_mes_7030(
     }
 
 
-def _force_flat_bars(
-    bars: list[Bar], day: date, force_flat_time
-) -> list[Bar]:
-    out: list[Bar] = []
-    for b in bars:
-        et = to_et(b.ts)
-        if et.date() != day:
+def _manage_scaled_exit(
+    *,
+    direction: Direction,
+    entry_px: float,
+    init_stop: float,
+    target_px: float,
+    target_label: str,
+    manage: list[Bar],
+    entry_i: int,
+    entry_ts: datetime,
+    exits,
+    lag: int,
+    trail_buffer: float,
+    tick: float,
+    scale_frac: float,
+) -> tuple[float, datetime, str, float, int]:
+    """Scale at primary TP, runner BE/trail / force_flat / stop. Returns exit fields."""
+    scale_hit = False
+    scale_px = target_px
+    runner_frac = 1.0 - scale_frac if scale_frac < 1.0 else 0.0
+    stop = init_stop
+    trail: SwingTrailingStop | None = None
+    exit_px = entry_px
+    exit_reason = "force_flat"
+    exit_ts = entry_ts
+    exit_bar_i = entry_i
+    stop_final = init_stop
+
+    for bi, b in enumerate(manage):
+        if hit_stop(direction, b, stop):
+            exit_px = stop
+            exit_reason = "or_stop" if not scale_hit else (
+                "breakeven_stop" if abs(stop - entry_px) < tick else "trailing_stop"
+            )
+            exit_ts = b.ts
+            exit_bar_i = entry_i + 1 + bi
+            stop_final = stop
+            if scale_hit and runner_frac > 0:
+                exit_px = scale_frac * scale_px + runner_frac * stop
+                exit_reason = f"scale_{target_label}+{exit_reason}"
+            break
+
+        if not scale_hit and hit_target(direction, b, target_px):
+            scale_hit = True
+            scale_px = target_px
+            if scale_frac >= 1.0 - 1e-9:
+                exit_px = target_px
+                exit_reason = f"target_{target_label}"
+                exit_ts = b.ts
+                exit_bar_i = entry_i + 1 + bi
+                stop_final = stop
+                break
+            if exits.move_stop_to_be:
+                stop = entry_px
+            if exits.runner_trail:
+                trail = SwingTrailingStop(
+                    direction=direction,
+                    stop=stop,
+                    pivot_lag=lag,
+                    buffer=trail_buffer,
+                )
             continue
-        if et.time() <= force_flat_time:
-            out.append(b)
-    return sorted(out, key=lambda x: x.ts)
+
+        if scale_hit and trail is not None:
+            trail.update(b)
+            stop = trail.stop
+            if trail.hit(b) or hit_stop(direction, b, stop):
+                exit_px = scale_frac * scale_px + runner_frac * stop
+                exit_reason = f"scale_{target_label}+trailing_stop"
+                exit_ts = b.ts
+                exit_bar_i = entry_i + 1 + bi
+                stop_final = stop
+                break
+    else:
+        if manage:
+            last = manage[-1]
+            runner_px = last.close
+            exit_ts = last.ts
+            exit_bar_i = entry_i + len(manage)
+            stop_final = stop if trail is None else trail.stop
+            if scale_hit and runner_frac > 0:
+                exit_px = scale_frac * scale_px + runner_frac * runner_px
+                exit_reason = f"scale_{target_label}+force_flat"
+            elif scale_hit:
+                exit_px = scale_px
+                exit_reason = f"target_{target_label}"
+            else:
+                exit_px = runner_px
+                exit_reason = "force_flat"
+        else:
+            exit_px = entry_px
+            exit_ts = entry_ts
+            exit_reason = "force_flat"
+            exit_bar_i = entry_i
+            stop_final = init_stop
+
+    return exit_px, exit_ts, exit_reason, stop_final, exit_bar_i
 
 
 def run_mes_5orb_backtest(
@@ -184,6 +287,7 @@ def run_mes_5orb_backtest(
     """Day × session: OR → break → retest → OR stop / 2R|HOD scale → runner trail.
 
     Supports multiple OR windows per day and same-session re-entry after an exit.
+    When ``cfg.asia_range.enabled``, also runs ICT Asian Range Judas sweep+reclaim.
     """
     cfg = cfg or load_mes_5orb_config()
     result = MesBacktestResult(config=cfg)
@@ -197,9 +301,95 @@ def run_mes_5orb_backtest(
     allow_reentry = cfg.risk.allow_reentry
     max_per_session = cfg.risk.max_entries_per_session
     scale_frac = exits.scale_fraction
+    asia_cfg = cfg.asia_range
 
     for day in _trading_days(bars):
         open_count = 0
+
+        # --- ICT Asian Range Judas (London/NY search) ---
+        if asia_cfg.enabled:
+            ar = compute_asia_range(bars, day, asia_cfg)
+            if ar is not None and not ar.skipped:
+                setup = detect_asia_judas(
+                    bars, ar, asia_cfg, tick_size=tick
+                )
+                if (
+                    setup is not None
+                    and setup.state is AsiaSetupState.RECLAIMED
+                    and setup.entry_bar_index is not None
+                    and setup.entry_price is not None
+                    and setup.initial_stop is not None
+                    and setup.target_price is not None
+                    and open_count < max_open
+                ):
+                    entry_i = setup.entry_bar_index
+                    entry_px = float(setup.entry_price)
+                    init_stop = float(setup.initial_stop)
+                    target_px = float(setup.target_price)
+                    risk_pts = abs(entry_px - init_stop)
+                    if risk_pts > 0:
+                        open_count += 1
+                        manage = [
+                            b
+                            for b in bars[entry_i + 1 :]
+                            if to_et(b.ts).date() == day
+                            and to_et(b.ts).time() <= asia_cfg.force_flat
+                        ]
+                        # Asia primer prefers partials; use asia scale_fraction, light trail.
+                        asia_scale = asia_cfg.scale_fraction
+                        # Temporarily disable aggressive runner trail for Asia if scale < 1
+                        # (primer: partials > trail). Still allow BE after scale.
+                        from dataclasses import replace
+
+                        asia_exits = replace(
+                            exits,
+                            move_stop_to_be=True,
+                            runner_trail=False,
+                            scale_fraction=asia_scale,
+                        )
+                        exit_px, exit_ts, exit_reason, stop_final, _ = _manage_scaled_exit(
+                            direction=setup.direction,
+                            entry_px=entry_px,
+                            init_stop=init_stop,
+                            target_px=target_px,
+                            target_label=setup.target_label,
+                            manage=manage,
+                            entry_i=entry_i,
+                            entry_ts=bars[entry_i].ts,
+                            exits=asia_exits,
+                            lag=lag,
+                            trail_buffer=trail_buffer,
+                            tick=tick,
+                            scale_frac=asia_scale,
+                        )
+                        if setup.direction is Direction.LONG:
+                            points = exit_px - entry_px
+                        else:
+                            points = entry_px - exit_px
+                        size = 1
+                        _ = contracts
+                        pnl = points * cfg.point_value * size
+                        r_mult = points / risk_pts if risk_pts else 0.0
+                        result.trades.append(
+                            MesTradeResult(
+                                session_name="asia",
+                                day=day.isoformat(),
+                                direction=setup.direction.value,
+                                entry_time=_iso(bars[entry_i].ts),
+                                entry_price=entry_px,
+                                exit_time=_iso(exit_ts),
+                                exit_price=exit_px,
+                                exit_reason=exit_reason,
+                                stop_initial=init_stop,
+                                stop_final=stop_final,
+                                points=points,
+                                pnl_usd=pnl,
+                                r_multiple=r_mult,
+                                contracts=size,
+                            )
+                        )
+                        open_count = max(open_count - 1, 0)
+
         for session in cfg.sessions:
             orb = compute_opening_range(bars, session, day)
             if orb is None or orb.skipped:
@@ -259,89 +449,21 @@ def run_mes_5orb_backtest(
                     and to_et(b.ts).time() <= session.force_flat
                 ]
 
-                # Weighted exit: scale at 2R/HOD, runner trails / force_flat / stop.
-                scale_hit = False
-                scale_px = target_px
-                runner_frac = 1.0 - scale_frac if scale_frac < 1.0 else 0.0
-                stop = init_stop
-                trail: SwingTrailingStop | None = None
-                exit_px = entry_px
-                exit_reason = "force_flat"
-                exit_ts = bars[entry_i].ts
-                exit_bar_i = entry_i
-                stop_final = init_stop
-
-                for bi, b in enumerate(manage):
-                    # 1) Hard stop (OR extreme, then BE / trail after scale)
-                    if hit_stop(setup.direction, b, stop):
-                        exit_px = stop
-                        exit_reason = "or_stop" if not scale_hit else (
-                            "breakeven_stop" if abs(stop - entry_px) < tick else "trailing_stop"
-                        )
-                        exit_ts = b.ts
-                        exit_bar_i = entry_i + 1 + bi
-                        stop_final = stop
-                        if scale_hit and runner_frac > 0:
-                            # Blended: scale_frac @ scale_px + runner @ stop
-                            exit_px = scale_frac * scale_px + runner_frac * stop
-                            exit_reason = f"scale_{target_label}+{exit_reason}"
-                        break
-
-                    # 2) Primary target (2R or HOD/LOD)
-                    if not scale_hit and hit_target(setup.direction, b, target_px):
-                        scale_hit = True
-                        scale_px = target_px
-                        if scale_frac >= 1.0 - 1e-9:
-                            exit_px = target_px
-                            exit_reason = f"target_{target_label}"
-                            exit_ts = b.ts
-                            exit_bar_i = entry_i + 1 + bi
-                            stop_final = stop
-                            break
-                        if exits.move_stop_to_be:
-                            stop = entry_px
-                        if exits.runner_trail:
-                            trail = SwingTrailingStop(
-                                direction=setup.direction,
-                                stop=stop,
-                                pivot_lag=lag,
-                                buffer=trail_buffer,
-                            )
-                        continue
-
-                    # 3) Runner management
-                    if scale_hit and trail is not None:
-                        trail.update(b)
-                        stop = trail.stop
-                        if trail.hit(b) or hit_stop(setup.direction, b, stop):
-                            exit_px = scale_frac * scale_px + runner_frac * stop
-                            exit_reason = f"scale_{target_label}+trailing_stop"
-                            exit_ts = b.ts
-                            exit_bar_i = entry_i + 1 + bi
-                            stop_final = stop
-                            break
-                else:
-                    if manage:
-                        last = manage[-1]
-                        runner_px = last.close
-                        exit_ts = last.ts
-                        exit_bar_i = entry_i + len(manage)
-                        stop_final = stop if trail is None else trail.stop
-                        if scale_hit and runner_frac > 0:
-                            exit_px = scale_frac * scale_px + runner_frac * runner_px
-                            exit_reason = f"scale_{target_label}+force_flat"
-                        elif scale_hit:
-                            exit_px = scale_px
-                            exit_reason = f"target_{target_label}"
-                        else:
-                            exit_px = runner_px
-                            exit_reason = "force_flat"
-                    else:
-                        exit_px = entry_px
-                        exit_ts = bars[entry_i].ts
-                        exit_reason = "force_flat"
-                        exit_bar_i = entry_i
-                        stop_final = init_stop
+                exit_px, exit_ts, exit_reason, stop_final, exit_bar_i = _manage_scaled_exit(
+                    direction=setup.direction,
+                    entry_px=entry_px,
+                    init_stop=init_stop,
+                    target_px=target_px,
+                    target_label=target_label,
+                    manage=manage,
+                    entry_i=entry_i,
+                    entry_ts=bars[entry_i].ts,
+                    exits=exits,
+                    lag=lag,
+                    trail_buffer=trail_buffer,
+                    tick=tick,
+                    scale_frac=scale_frac,
+                )
 
                 if setup.direction is Direction.LONG:
                     points = exit_px - entry_px
@@ -390,7 +512,7 @@ def evaluate_mes_signal_live(
     cfg: Mes5OrbConfig | None = None,
     as_of: datetime | None = None,
 ) -> dict[str, Any]:
-    """Live/paper signal snapshot for one active MES session."""
+    """Live/paper signal snapshot for one active MES session (5ORB or Asia Judas)."""
     from core.strategy.mes_5orb.plan import MesTradePlan
 
     cfg = cfg or load_mes_5orb_config()
@@ -398,15 +520,31 @@ def evaluate_mes_signal_live(
     et = to_et(as_of)
     day = et.date()
 
+    # Asia Judas takes priority when enabled and we're in its search window,
+    # or when the caller explicitly asks for session "asia".
+    asia_cfg = cfg.asia_range
+    want_asia = (session_name or "").lower() in ("asia", "asian", "asia_range")
+    in_asia_window = (
+        asia_cfg.enabled
+        and asia_cfg.search_start <= et.time() < asia_cfg.force_flat
+    )
+    if want_asia or (session_name is None and in_asia_window):
+        asia_sig = _evaluate_asia_live(bars, cfg=cfg, as_of=as_of)
+        if asia_sig.get("ok") or want_asia:
+            return asia_sig
+        # Fall through to 5ORB if Asia has no setup yet and session wasn't forced.
+
     # Prefer the most recently started session still active (supports multi-OR day).
     sess = None
-    if session_name:
+    if session_name and not want_asia:
         sess = cfg.session(session_name)
     else:
         active = cfg.active_sessions_at(et.time())
         if active:
             sess = max(active, key=lambda s: s.or_start)
     if sess is None:
+        if asia_cfg.enabled and in_asia_window:
+            return _evaluate_asia_live(bars, cfg=cfg, as_of=as_of)
         return {
             "ok": False,
             "reason": "mes_5orb: outside session windows",
@@ -520,6 +658,105 @@ def evaluate_mes_signal_live(
         "state": setup.state.value,
         "plan": plan.as_dict(),
         "mes_plan": plan,
+    }
+
+
+def _evaluate_asia_live(
+    bars: list[Bar],
+    *,
+    cfg: Mes5OrbConfig,
+    as_of: datetime,
+) -> dict[str, Any]:
+    """Live snapshot for ICT Asian Range Judas sweep + reclaim."""
+    from core.strategy.mes_5orb.plan import MesTradePlan
+
+    asia_cfg = cfg.asia_range
+    et = to_et(as_of)
+    day = et.date()
+    if not asia_cfg.enabled:
+        return {"ok": False, "reason": "asia_range: disabled", "session": "asia"}
+
+    ar = compute_asia_range(bars, day, asia_cfg)
+    if ar is None:
+        return {
+            "ok": False,
+            "reason": "asia_range: no Asia bars yet (need prior 20:00–00:00 ET)",
+            "session": "asia",
+        }
+    if ar.skipped:
+        return {
+            "ok": False,
+            "reason": f"asia_range: skipped — {ar.skip_reason}",
+            "session": "asia",
+            "or_high": ar.high,
+            "or_low": ar.low,
+            "asia_eq": ar.eq,
+        }
+
+    if et.time() < asia_cfg.search_start:
+        return {
+            "ok": False,
+            "reason": (
+                f"asia_range: waiting for search "
+                f"{asia_cfg.search_start.strftime('%H:%M')} ET "
+                f"(ARH={ar.high:.2f} ARL={ar.low:.2f} EQ={ar.eq:.2f})"
+            ),
+            "session": "asia",
+            "or_high": ar.high,
+            "or_low": ar.low,
+            "asia_eq": ar.eq,
+            "midnight_open": ar.midnight_open,
+        }
+
+    setup = detect_asia_judas(bars, ar, asia_cfg, tick_size=cfg.tick_size)
+    if setup is None or setup.state is not AsiaSetupState.RECLAIMED:
+        return {
+            "ok": False,
+            "reason": "asia_range: waiting for Judas sweep + reclaim",
+            "session": "asia",
+            "or_high": ar.high,
+            "or_low": ar.low,
+            "asia_eq": ar.eq,
+            "midnight_open": ar.midnight_open,
+        }
+
+    entry_px = float(setup.entry_price)  # type: ignore[arg-type]
+    stop_px = float(setup.initial_stop)  # type: ignore[arg-type]
+    target_px = float(setup.target_price)  # type: ignore[arg-type]
+    plan = MesTradePlan(
+        symbol=cfg.symbol,
+        session_name="asia",
+        direction=setup.direction,
+        entry_price=entry_px,
+        stop_price=stop_px,
+        contracts=cfg.risk.contracts,
+        break_level=setup.sweep_extreme,
+        or_high=ar.high,
+        or_low=ar.low,
+        point_value=cfg.point_value,
+        tick_size=cfg.tick_size,
+        as_of=as_of,
+        notes=setup.notes,
+        target_price=target_px,
+        target_label=setup.target_label,
+        target_r=asia_cfg.target_r,
+        scale_fraction=asia_cfg.scale_fraction,
+        use_trailing_stop=False,
+        trail_pivot_lag=cfg.trailing_stop.pivot_lag_bars,
+        trail_buffer_ticks=cfg.trailing_stop.buffer_ticks,
+        stop_mode="asia_sweep",
+    )
+    return {
+        "ok": True,
+        "session": "asia",
+        "or_high": ar.high,
+        "or_low": ar.low,
+        "asia_eq": ar.eq,
+        "midnight_open": ar.midnight_open,
+        "state": setup.state.value,
+        "plan": plan.as_dict(),
+        "mes_plan": plan,
+        "entry_model": "asia_judas",
     }
 
 

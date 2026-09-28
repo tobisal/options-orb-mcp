@@ -1,5 +1,12 @@
 """Futures 5-minute ORB break-and-retest strategy package."""
 
+from core.strategy.mes_5orb.asia_range import (
+    AsiaJudasSetup,
+    AsiaRange,
+    AsiaRangeConfig,
+    compute_asia_range,
+    detect_asia_judas,
+)
 from core.strategy.mes_5orb.markets import (
     DEFAULT_FUTURES_SYMBOL,
     FUTURES_MARKETS,
@@ -15,6 +22,9 @@ from core.strategy.mes_5orb.signals import BreakRetestSetup, SetupState, detect_
 from core.strategy.mes_5orb.trailing_stop import SwingTrailingStop
 
 __all__ = [
+    "AsiaJudasSetup",
+    "AsiaRange",
+    "AsiaRangeConfig",
     "BreakRetestSetup",
     "DEFAULT_FUTURES_SYMBOL",
     "FUTURES_MARKETS",
@@ -25,7 +35,9 @@ __all__ = [
     "SetupState",
     "SwingTrailingStop",
     "coerce_futures_symbol",
+    "compute_asia_range",
     "compute_opening_range",
+    "detect_asia_judas",
     "detect_break_retest",
     "get_futures_market",
     "is_supported_futures",

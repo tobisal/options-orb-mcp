@@ -49,7 +49,7 @@ def resolve_window(window: str) -> SessionWindow:
 
 def _mes_session_to_window(session_name: str) -> SessionWindow:
     name = (session_name or "").lower()
-    if name.startswith("london"):
+    if name.startswith("london") or name in ("asia", "asian", "asia_range"):
         return SessionWindow.LONDON
     return SessionWindow.NEW_YORK
 

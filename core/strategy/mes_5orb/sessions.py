@@ -9,6 +9,7 @@ from functools import lru_cache
 from typing import Any
 
 from core.config import REPO_ROOT
+from core.strategy.mes_5orb.asia_range import AsiaRangeConfig, asia_config_from_raw
 from core.strategy.mes_5orb.markets import (
     DEFAULT_FUTURES_SYMBOL,
     coerce_futures_symbol,
@@ -97,6 +98,7 @@ class Mes5OrbConfig:
     trailing_stop: TrailingStopConfig = field(default_factory=TrailingStopConfig)
     exits: ExitPolicyConfig = field(default_factory=ExitPolicyConfig)
     risk: MesRiskConfig = field(default_factory=MesRiskConfig)
+    asia_range: AsiaRangeConfig = field(default_factory=AsiaRangeConfig)
 
     def session(self, name: str) -> MesSession | None:
         key = name.lower().replace(" ", "_")
@@ -203,6 +205,7 @@ def load_mes_5orb_config(symbol: str | None = None) -> Mes5OrbConfig:
     risk = raw.get("risk") or {}
     scale = float(exits_raw.get("scale_fraction", 0.5))
     scale = min(max(scale, 0.0), 1.0)
+    asia = asia_config_from_raw(raw.get("asia_range") or {})
     return Mes5OrbConfig(
         symbol=sym,
         point_value=float(raw.get("point_value", market.point_value)),
@@ -240,6 +243,7 @@ def load_mes_5orb_config(symbol: str | None = None) -> Mes5OrbConfig:
             allow_reentry=bool(risk.get("allow_reentry", True)),
             max_entries_per_session=max(int(risk.get("max_entries_per_session", 3)), 1),
         ),
+        asia_range=asia,
     )
 
 
