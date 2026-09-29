@@ -34,6 +34,8 @@ def _parse_hhmm(s: str) -> time:
 class OpeningRangeFilter:
     min_range_points: float = 0.75
     max_range_points: float = 6.0
+    # Optional: skip if OR width / mid > this fraction (Edgeful-style % filter).
+    max_range_pct: float | None = None
 
 
 @dataclass(frozen=True)
@@ -44,14 +46,17 @@ class RetestConfig:
 
 
 @dataclass(frozen=True)
-class MesSession:
-    name: str
-    or_start: time
-    or_end: time
-    search_end: time
-    force_flat: time
-    opening_range: OpeningRangeFilter = field(default_factory=OpeningRangeFilter)
-    retest: RetestConfig = field(default_factory=RetestConfig)
+class EntryConfig:
+    """Entry model + direction / calendar filters (Edgeful-inspired knobs)."""
+
+    # retest | close_break | fib_macd
+    mode: str = "retest"
+    # both | long | short
+    allowed_directions: str = "both"
+    # If True: first opposite close vs allowed direction invalidates the window.
+    skip_if_opposite_first: bool = False
+    # Monday=0 … Sunday=6; None = all days.
+    allowed_weekdays: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -67,13 +72,35 @@ class ExitPolicyConfig:
 
     stop_mode: str = "or_extreme"
     stop_buffer_ticks: int = 1
-    target_r: float = 2.0
+    target_r: float = 2.5
+    # r_multiple = target_r × risk; or_fraction = target_or_fraction × OR width.
+    target_mode: str = "r_multiple"
+    target_or_fraction: float = 0.5
+    # Cap stop distance from entry (points). None = full OR extreme.
+    max_stop_points: float | None = None
     # Fraction closed at primary target (2R/HOD); remainder is the runner.
-    scale_fraction: float = 0.5
+    scale_fraction: float = 1.0
     use_hod_lod_target: bool = True
     # After scale: move stop to breakeven, trail runner with swings.
     move_stop_to_be: bool = True
     runner_trail: bool = True
+
+
+@dataclass(frozen=True)
+class MesSession:
+    name: str
+    or_start: time
+    or_end: time
+    search_end: time
+    force_flat: time
+    opening_range: OpeningRangeFilter = field(default_factory=OpeningRangeFilter)
+    retest: RetestConfig = field(default_factory=RetestConfig)
+    entry: EntryConfig = field(default_factory=EntryConfig)
+    enabled: bool = True
+    # Optional per-session exit override; None → Mes5OrbConfig.exits.
+    exits: ExitPolicyConfig | None = None
+    # Optional override of risk.max_entries_per_session for this OR window.
+    max_entries: int | None = None
 
 
 @dataclass(frozen=True)
@@ -84,7 +111,7 @@ class MesRiskConfig:
     risk_pct: float | None = None
     # After a stop/force_flat, allow another break/retest in the same session.
     allow_reentry: bool = True
-    max_entries_per_session: int = 3
+    max_entries_per_session: int = 2
 
 
 @dataclass(frozen=True)
@@ -112,13 +139,78 @@ class Mes5OrbConfig:
         return None
 
     def active_sessions_at(self, t: time) -> list[MesSession]:
-        """Sessions whose OR has started and force_flat has not yet passed."""
-        return [s for s in self.sessions if s.or_start <= t < s.force_flat]
+        """Enabled sessions whose OR has started and force_flat has not yet passed."""
+        return [
+            s
+            for s in self.sessions
+            if s.enabled and s.or_start <= t < s.force_flat
+        ]
+
+
+def _exit_policy_from_raw(
+    exits_raw: dict[str, Any] | None,
+    *,
+    defaults: ExitPolicyConfig | None = None,
+) -> ExitPolicyConfig:
+    """Parse an exits block; missing keys fall back to ``defaults`` or class defaults."""
+    base = defaults or ExitPolicyConfig()
+    raw = exits_raw or {}
+    scale = float(raw.get("scale_fraction", base.scale_fraction))
+    scale = min(max(scale, 0.0), 1.0)
+    target_mode = str(raw.get("target_mode", base.target_mode)).lower().strip()
+    if target_mode not in ("r_multiple", "or_fraction"):
+        target_mode = base.target_mode
+    max_stop = raw.get("max_stop_points", base.max_stop_points)
+    return ExitPolicyConfig(
+        stop_mode=str(raw.get("stop_mode", base.stop_mode)),
+        stop_buffer_ticks=int(raw.get("stop_buffer_ticks", base.stop_buffer_ticks)),
+        target_r=float(raw.get("target_r", base.target_r)),
+        target_mode=target_mode,
+        target_or_fraction=float(raw.get("target_or_fraction", base.target_or_fraction)),
+        max_stop_points=(
+            float(max_stop) if max_stop not in (None, "") else None
+        ),
+        scale_fraction=scale,
+        use_hod_lod_target=bool(raw.get("use_hod_lod_target", base.use_hod_lod_target)),
+        move_stop_to_be=bool(raw.get("move_stop_to_be", base.move_stop_to_be)),
+        runner_trail=bool(raw.get("runner_trail", base.runner_trail)),
+    )
+
+
+def resolve_session_exits(cfg: Mes5OrbConfig, session: MesSession) -> ExitPolicyConfig:
+    """Per-session exits if set, else global config exits."""
+    return session.exits if session.exits is not None else cfg.exits
+
+
+def resolve_session_max_entries(cfg: Mes5OrbConfig, session: MesSession) -> int:
+    """Per-session max entries if set, else global risk cap."""
+    if session.max_entries is not None:
+        return max(int(session.max_entries), 1)
+    return max(int(cfg.risk.max_entries_per_session), 1)
 
 
 def _session_from_raw(name: str, raw: dict[str, Any], *, defaults: OpeningRangeFilter) -> MesSession:
     or_raw = raw.get("opening_range") or {}
     rt_raw = raw.get("retest") or {}
+    en_raw = raw.get("entry") or {}
+    max_pct = or_raw.get("max_range_pct")
+    weekdays_raw = en_raw.get("allowed_weekdays")
+    weekdays: tuple[int, ...] | None = None
+    if weekdays_raw is not None:
+        weekdays = tuple(int(d) for d in weekdays_raw)
+    mode = str(en_raw.get("mode", "retest")).lower().strip()
+    if mode not in ("retest", "close_break", "fib_macd"):
+        mode = "retest"
+    dirs = str(en_raw.get("allowed_directions", "both")).lower().strip()
+    if dirs not in ("both", "long", "short"):
+        dirs = "both"
+    sess_exits = None
+    if raw.get("exits"):
+        sess_exits = _exit_policy_from_raw(raw.get("exits") or {})
+    max_entries_raw = raw.get("max_entries")
+    max_entries = (
+        max(int(max_entries_raw), 1) if max_entries_raw not in (None, "") else None
+    )
     return MesSession(
         name=name,
         or_start=_parse_hhmm(str(raw.get("or_start", "09:30"))),
@@ -128,12 +220,22 @@ def _session_from_raw(name: str, raw: dict[str, Any], *, defaults: OpeningRangeF
         opening_range=OpeningRangeFilter(
             min_range_points=float(or_raw.get("min_range_points", defaults.min_range_points)),
             max_range_points=float(or_raw.get("max_range_points", defaults.max_range_points)),
+            max_range_pct=(float(max_pct) if max_pct not in (None, "") else None),
         ),
         retest=RetestConfig(
             tolerance_ticks=int(rt_raw.get("tolerance_ticks", 2)),
             timeout_bars=int(rt_raw.get("timeout_bars", 12)),
             require_rejection_candle=bool(rt_raw.get("require_rejection_candle", True)),
         ),
+        entry=EntryConfig(
+            mode=mode,
+            allowed_directions=dirs,
+            skip_if_opposite_first=bool(en_raw.get("skip_if_opposite_first", False)),
+            allowed_weekdays=weekdays,
+        ),
+        enabled=bool(raw.get("enabled", True)),
+        exits=sess_exits,
+        max_entries=max_entries,
     )
 
 
@@ -203,9 +305,15 @@ def load_mes_5orb_config(symbol: str | None = None) -> Mes5OrbConfig:
     trail = raw.get("trailing_stop") or {}
     exits_raw = raw.get("exits") or {}
     risk = raw.get("risk") or {}
-    scale = float(exits_raw.get("scale_fraction", 0.5))
-    scale = min(max(scale, 0.0), 1.0)
     asia = asia_config_from_raw(raw.get("asia_range") or {})
+    global_exits = _exit_policy_from_raw(
+        {
+            **exits_raw,
+            "stop_buffer_ticks": exits_raw.get(
+                "stop_buffer_ticks", trail.get("buffer_ticks", 1)
+            ),
+        }
+    )
     return Mes5OrbConfig(
         symbol=sym,
         point_value=float(raw.get("point_value", market.point_value)),
@@ -218,20 +326,7 @@ def load_mes_5orb_config(symbol: str | None = None) -> Mes5OrbConfig:
             pivot_lag_bars=int(trail.get("pivot_lag_bars", 2)),
             buffer_ticks=int(trail.get("buffer_ticks", 1)),
         ),
-        exits=ExitPolicyConfig(
-            stop_mode=str(exits_raw.get("stop_mode", "or_extreme")),
-            stop_buffer_ticks=int(
-                exits_raw.get(
-                    "stop_buffer_ticks",
-                    trail.get("buffer_ticks", 1),
-                )
-            ),
-            target_r=float(exits_raw.get("target_r", 2.0)),
-            scale_fraction=scale,
-            use_hod_lod_target=bool(exits_raw.get("use_hod_lod_target", True)),
-            move_stop_to_be=bool(exits_raw.get("move_stop_to_be", True)),
-            runner_trail=bool(exits_raw.get("runner_trail", True)),
-        ),
+        exits=global_exits,
         risk=MesRiskConfig(
             contracts=max(int(risk.get("contracts", 1)), 1),
             max_concurrent=max(int(risk.get("max_concurrent", 2)), 1),
@@ -241,7 +336,7 @@ def load_mes_5orb_config(symbol: str | None = None) -> Mes5OrbConfig:
                 else None
             ),
             allow_reentry=bool(risk.get("allow_reentry", True)),
-            max_entries_per_session=max(int(risk.get("max_entries_per_session", 3)), 1),
+            max_entries_per_session=max(int(risk.get("max_entries_per_session", 2)), 1),
         ),
         asia_range=asia,
     )
@@ -251,38 +346,126 @@ def clear_mes_5orb_config_cache() -> None:
     load_mes_5orb_config.cache_clear()
 
 
+def _apply_exit_knobs(
+    base: ExitPolicyConfig, params: dict[str, Any], *, prefix: str = ""
+) -> ExitPolicyConfig:
+    """Overlay exit knobs; ``prefix`` e.g. ``london_`` / ``ny_`` for session keys."""
+    from dataclasses import replace
+
+    def _get(key: str) -> Any:
+        if prefix:
+            scoped = params.get(f"{prefix}{key}")
+            if scoped is not None:
+                return scoped
+        return params.get(key)
+
+    kw: dict[str, Any] = {}
+    if _get("target_r") is not None:
+        kw["target_r"] = float(_get("target_r"))
+    if _get("scale_fraction") is not None:
+        kw["scale_fraction"] = min(max(float(_get("scale_fraction")), 0.0), 1.0)
+    if _get("stop_buffer_ticks") is not None:
+        kw["stop_buffer_ticks"] = int(_get("stop_buffer_ticks"))
+    if _get("use_hod_lod_target") is not None:
+        kw["use_hod_lod_target"] = bool(_get("use_hod_lod_target"))
+    if _get("move_stop_to_be") is not None:
+        kw["move_stop_to_be"] = bool(_get("move_stop_to_be"))
+    if _get("runner_trail") is not None:
+        kw["runner_trail"] = bool(_get("runner_trail"))
+    return replace(base, **kw) if kw else base
+
+
+def _session_opt_prefix(session_name: str) -> str:
+    if session_name == "london":
+        return "london_"
+    if session_name == "new_york":
+        return "ny_"
+    return f"{session_name}_"
+
+
 def apply_mes_opt_params(cfg: Mes5OrbConfig, params: dict[str, Any] | None) -> Mes5OrbConfig:
-    """Overlay optimiser knobs (exits / retest) onto a loaded futures config."""
+    """Overlay optimiser knobs (exits / retest / risk / asia / per-session) onto a config.
+
+    Global keys (``target_r``, ``tolerance_ticks``, …) update ``cfg.exits`` and all
+    sessions' retest. Session-scoped keys (``london_target_r``, ``ny_tolerance_ticks``,
+    …) write onto that session's ``exits`` / ``retest`` / ``entry`` / ``max_entries``
+    without clobbering the other open.
+    """
     from dataclasses import replace
 
     if not params:
         return cfg
-    exits_kw: dict[str, Any] = {}
-    if params.get("target_r") is not None:
-        exits_kw["target_r"] = float(params["target_r"])
-    if params.get("scale_fraction") is not None:
-        exits_kw["scale_fraction"] = min(max(float(params["scale_fraction"]), 0.0), 1.0)
-    if params.get("stop_buffer_ticks") is not None:
-        exits_kw["stop_buffer_ticks"] = int(params["stop_buffer_ticks"])
-    if params.get("use_hod_lod_target") is not None:
-        exits_kw["use_hod_lod_target"] = bool(params["use_hod_lod_target"])
-    if params.get("move_stop_to_be") is not None:
-        exits_kw["move_stop_to_be"] = bool(params["move_stop_to_be"])
-    if params.get("runner_trail") is not None:
-        exits_kw["runner_trail"] = bool(params["runner_trail"])
-    exits = replace(cfg.exits, **exits_kw) if exits_kw else cfg.exits
+    exits = _apply_exit_knobs(cfg.exits, params)
+
+    risk_kw: dict[str, Any] = {}
+    if params.get("allow_reentry") is not None:
+        risk_kw["allow_reentry"] = bool(params["allow_reentry"])
+    if params.get("max_entries_per_session") is not None:
+        risk_kw["max_entries_per_session"] = max(int(params["max_entries_per_session"]), 1)
+    risk = replace(cfg.risk, **risk_kw) if risk_kw else cfg.risk
+
+    asia = cfg.asia_range
+    asia_kw: dict[str, Any] = {}
+    if params.get("asia_target_r") is not None:
+        asia_kw["target_r"] = float(params["asia_target_r"])
+    if params.get("asia_scale_fraction") is not None:
+        asia_kw["scale_fraction"] = min(
+            max(float(params["asia_scale_fraction"]), 0.0), 1.0
+        )
+    if asia_kw:
+        asia = replace(asia, **asia_kw)
 
     tol = params.get("tolerance_ticks")
     rej = params.get("require_rejection_candle")
-    sessions = cfg.sessions
-    if tol is not None or rej is not None:
-        updated = []
-        for s in cfg.sessions:
-            rt_kw: dict[str, Any] = {}
-            if tol is not None:
-                rt_kw["tolerance_ticks"] = int(tol)
-            if rej is not None:
-                rt_kw["require_rejection_candle"] = bool(rej)
-            updated.append(replace(s, retest=replace(s.retest, **rt_kw)))
-        sessions = tuple(updated)
-    return replace(cfg, exits=exits, sessions=sessions)
+    timeout = params.get("timeout_bars")
+    updated: list[MesSession] = []
+    for s in cfg.sessions:
+        prefix = _session_opt_prefix(s.name)
+        sess = s
+        rt_kw: dict[str, Any] = {}
+        if tol is not None:
+            rt_kw["tolerance_ticks"] = int(tol)
+        if rej is not None:
+            rt_kw["require_rejection_candle"] = bool(rej)
+        if timeout is not None:
+            rt_kw["timeout_bars"] = max(int(timeout), 1)
+        if params.get(f"{prefix}tolerance_ticks") is not None:
+            rt_kw["tolerance_ticks"] = int(params[f"{prefix}tolerance_ticks"])
+        if params.get(f"{prefix}require_rejection_candle") is not None:
+            rt_kw["require_rejection_candle"] = bool(
+                params[f"{prefix}require_rejection_candle"]
+            )
+        if params.get(f"{prefix}timeout_bars") is not None:
+            rt_kw["timeout_bars"] = max(int(params[f"{prefix}timeout_bars"]), 1)
+        if rt_kw:
+            sess = replace(sess, retest=replace(sess.retest, **rt_kw))
+
+        weekdays = params.get(f"{prefix}allowed_weekdays")
+        if weekdays is not None:
+            sess = replace(
+                sess,
+                entry=replace(
+                    sess.entry,
+                    allowed_weekdays=tuple(int(d) for d in weekdays),
+                ),
+            )
+
+        if params.get(f"{prefix}max_entries") is not None:
+            sess = replace(sess, max_entries=max(int(params[f"{prefix}max_entries"]), 1))
+
+        if any(
+            params.get(f"{prefix}{k}") is not None
+            for k in (
+                "target_r",
+                "scale_fraction",
+                "stop_buffer_ticks",
+                "use_hod_lod_target",
+                "move_stop_to_be",
+                "runner_trail",
+            )
+        ):
+            base_ex = sess.exits if sess.exits is not None else exits
+            sess = replace(sess, exits=_apply_exit_knobs(base_ex, params, prefix=prefix))
+        updated.append(sess)
+
+    return replace(cfg, exits=exits, risk=risk, asia_range=asia, sessions=tuple(updated))

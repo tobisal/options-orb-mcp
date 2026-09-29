@@ -63,18 +63,24 @@ def compute_opening_range(
     filt = session.opening_range
     skipped = False
     reason = ""
+    mid = (high + low) / 2.0
     if width < filt.min_range_points:
         skipped = True
         reason = f"OR width {width:.2f} < min {filt.min_range_points}"
     elif width > filt.max_range_points:
         skipped = True
         reason = f"OR width {width:.2f} > max {filt.max_range_points}"
+    elif filt.max_range_pct is not None and mid > 0:
+        pct = width / mid
+        if pct > float(filt.max_range_pct):
+            skipped = True
+            reason = f"OR pct {pct:.4f} > max {filt.max_range_pct}"
     return OpeningRange(
         session_name=session.name,
         day=day,
         high=high,
         low=low,
-        mid=(high + low) / 2.0,
+        mid=mid,
         bar_count=len(or_bars),
         skipped=skipped,
         skip_reason=reason,

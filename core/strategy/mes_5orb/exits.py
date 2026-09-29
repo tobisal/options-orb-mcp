@@ -27,12 +27,24 @@ def or_stop_price(
     *,
     tick_size: float,
     buffer_ticks: int = 1,
+    entry_price: float | None = None,
+    max_stop_points: float | None = None,
 ) -> float:
-    """Stop is a break of the 5m opening range (classic ORB SL)."""
+    """Stop is a break of the opening range; optionally capped from entry."""
     buf = max(int(buffer_ticks), 0) * tick_size
     if direction is Direction.LONG:
-        return orb.low - buf
-    return orb.high + buf
+        stop = orb.low - buf
+    else:
+        stop = orb.high + buf
+    if entry_price is not None and max_stop_points is not None and max_stop_points > 0:
+        cap = float(max_stop_points)
+        if direction is Direction.LONG:
+            capped = entry_price - cap
+            stop = max(stop, capped)
+        else:
+            capped = entry_price + cap
+            stop = min(stop, capped)
+    return stop
 
 
 def day_extremes(
@@ -64,16 +76,36 @@ def build_exit_levels(
     buffer_ticks: int = 1,
     target_r: float = 2.0,
     entry_index: int | None = None,
+    max_stop_points: float | None = None,
+    target_mode: str = "r_multiple",
+    target_or_fraction: float = 0.5,
 ) -> ExitLevels | None:
-    stop = or_stop_price(direction, orb, tick_size=tick_size, buffer_ticks=buffer_ticks)
+    stop = or_stop_price(
+        direction,
+        orb,
+        tick_size=tick_size,
+        buffer_ticks=buffer_ticks,
+        entry_price=entry_price,
+        max_stop_points=max_stop_points,
+    )
     risk = abs(entry_price - stop)
     if risk <= 0:
         return None
-    r = max(float(target_r), 0.1)
-    if direction is Direction.LONG:
-        target = entry_price + r * risk
+    mode = (target_mode or "r_multiple").lower().strip()
+    if mode == "or_fraction":
+        width = max(orb.width, tick_size)
+        frac = max(float(target_or_fraction), 0.05)
+        move = frac * width
+        if direction is Direction.LONG:
+            target = entry_price + move
+        else:
+            target = entry_price - move
     else:
-        target = entry_price - r * risk
+        r = max(float(target_r), 0.1)
+        if direction is Direction.LONG:
+            target = entry_price + r * risk
+        else:
+            target = entry_price - r * risk
     hod, lod = day_extremes(bars, orb.day, through_index=entry_index)
     return ExitLevels(
         stop=stop,
@@ -102,11 +134,13 @@ def primary_target(
     *,
     use_hod_lod: bool = True,
     min_r_for_hod_lod: float = 1.0,
+    target_label: str = "2R",
 ) -> tuple[float, str]:
-    """Usually 2R; use prior HOD/LOD only when it is at least ``min_r_for_hod_lod`` R."""
+    """Usually 2R / OR-fraction; use prior HOD/LOD only when far enough."""
     t2 = levels.target_2r
+    label = target_label or "2R"
     if not use_hod_lod or levels.risk_points <= 0:
-        return t2, "2R"
+        return t2, label
     min_move = max(float(min_r_for_hod_lod), 0.0) * levels.risk_points
     if direction is Direction.LONG:
         entry = levels.stop + levels.risk_points
@@ -118,4 +152,4 @@ def primary_target(
         lod = levels.lod_at_entry
         if lod is not None and t2 <= lod < entry and (entry - lod) >= min_move:
             return lod, "LOD"
-    return t2, "2R"
+    return t2, label

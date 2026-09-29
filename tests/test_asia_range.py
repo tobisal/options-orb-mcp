@@ -46,11 +46,121 @@ def test_load_asia_range_config():
     clear_mes_5orb_config_cache()
     cfg = load_mes_5orb_config("MES")
     assert cfg.asia_range.enabled is True
+    assert cfg.asia_range.allowed_weekdays == (2, 3, 4)
     assert cfg.asia_range.range_start == time(20, 0)
     assert cfg.asia_range.search_start == time(2, 0)
     assert cfg.asia_range.target_mode == "opposite_extreme"
     assert cfg.asia_range.use_ny_liquidity is True
     assert cfg.asia_range.ny_session_start == time(9, 30)
+    assert cfg.asia_range.use_pd_liquidity is True
+    assert cfg.asia_range.use_prev_session_liquidity is True
+    assert cfg.asia_range.prev_session_start == time(2, 0)
+
+
+def _london_prev_session_bars() -> list[Bar]:
+    """Prior London on Jan 14: PSH=104.0 PSL=95.0."""
+    return [
+        _bar(_et_to_naive_utc(2025, 1, 14, 2, 0), 100.0, 101.0, 99.0, 100.5),
+        _bar(_et_to_naive_utc(2025, 1, 14, 4, 0), 100.5, 104.0, 100.0, 103.0),  # high
+        _bar(_et_to_naive_utc(2025, 1, 14, 6, 0), 103.0, 103.2, 95.0, 96.0),  # low
+        _bar(_et_to_naive_utc(2025, 1, 14, 7, 30), 96.0, 97.0, 95.5, 96.5),
+    ]
+
+
+def test_compute_asia_range_attaches_pd_and_prev_session():
+    bars = (
+        _london_prev_session_bars()
+        + _ny_rth_bars()
+        + _asia_evening_bars()
+    )
+    bars.append(_bar(_et_to_naive_utc(2025, 1, 15, 0, 0), 99.0, 99.1, 98.9, 99.0))
+    cfg = AsiaRangeConfig(
+        enabled=True,
+        min_width_points=1.0,
+        max_width_points=50.0,
+        use_ny_liquidity=True,
+        use_pd_liquidity=True,
+        use_prev_session_liquidity=True,
+    )
+    ar = compute_asia_range(bars, date(2025, 1, 15), cfg)
+    assert ar is not None and not ar.skipped
+    assert ar.high == 100.5
+    assert ar.low == 98.0
+    assert ar.ny_high == 102.0
+    assert ar.ny_low == 97.0
+    # PD covers London+NY+Asia on Jan 14
+    assert ar.pd_high == 104.0
+    assert ar.pd_low == 95.0
+    assert ar.prev_session_high == 104.0
+    assert ar.prev_session_low == 95.0
+
+
+def test_asia_judas_long_pd_low_sweep():
+    """Sweep prior-session / PD low above Asia low without taking ARL."""
+    bars = [
+        _bar(_et_to_naive_utc(2025, 1, 14, 3, 0), 99.0, 100.0, 97.5, 98.5),  # PSL=97.5
+        _bar(_et_to_naive_utc(2025, 1, 14, 20, 0), 98.5, 100.5, 96.0, 97.0),  # ARL=96
+        _bar(_et_to_naive_utc(2025, 1, 14, 22, 0), 97.0, 97.5, 96.5, 97.2),
+        _bar(_et_to_naive_utc(2025, 1, 15, 0, 0), 97.5, 97.6, 97.4, 97.5),
+        _bar(_et_to_naive_utc(2025, 1, 15, 2, 0), 97.5, 97.6, 97.3, 97.4),
+        _bar(_et_to_naive_utc(2025, 1, 15, 2, 30), 97.4, 97.8, 97.2, 97.6),  # sweep PSL
+    ]
+    cfg = AsiaRangeConfig(
+        enabled=True,
+        min_width_points=1.0,
+        max_width_points=50.0,
+        use_ny_liquidity=False,
+        use_pd_liquidity=True,
+        use_prev_session_liquidity=True,
+        require_eq_bias=True,
+        stop_buffer_ticks=2,
+        target_mode="opposite_extreme",
+    )
+    ar = compute_asia_range(bars, date(2025, 1, 15), cfg)
+    assert ar is not None and not ar.skipped
+    assert ar.prev_session_low == 97.5
+    assert ar.low == 96.0
+    setup = detect_asia_judas(bars, ar, cfg, tick_size=0.25)
+    assert setup is not None
+    assert setup.direction is Direction.LONG
+    assert "prev_session_low" in setup.sweep_levels or "pd_low" in setup.sweep_levels
+    assert "asia_low" not in setup.sweep_levels
+    assert setup.entry_price == 97.6
+
+
+def test_asia_judas_short_prev_session_high_sweep():
+    """Sweep prior London high without needing Asia high alone."""
+    bars = [
+        _bar(_et_to_naive_utc(2025, 1, 14, 3, 0), 100.0, 103.5, 99.5, 102.0),  # PSH=103.5
+        _bar(_et_to_naive_utc(2025, 1, 14, 20, 0), 101.0, 101.5, 99.0, 100.0),  # ARH=101.5
+        _bar(_et_to_naive_utc(2025, 1, 14, 22, 0), 100.0, 100.5, 99.0, 99.5),
+        _bar(_et_to_naive_utc(2025, 1, 15, 0, 0), 100.5, 100.6, 100.4, 100.5),
+        _bar(_et_to_naive_utc(2025, 1, 15, 2, 0), 100.5, 100.8, 100.4, 100.6),  # above EQ
+        _bar(_et_to_naive_utc(2025, 1, 15, 2, 30), 100.6, 104.0, 100.5, 103.8),
+        _bar(_et_to_naive_utc(2025, 1, 15, 2, 35), 103.5, 103.6, 100.0, 101.0),
+    ]
+    cfg = AsiaRangeConfig(
+        enabled=True,
+        min_width_points=1.0,
+        max_width_points=50.0,
+        use_ny_liquidity=False,
+        use_pd_liquidity=True,
+        use_prev_session_liquidity=True,
+        require_eq_bias=True,
+        stop_buffer_ticks=2,
+        target_mode="opposite_extreme",
+    )
+    ar = compute_asia_range(bars, date(2025, 1, 15), cfg)
+    assert ar is not None
+    assert ar.prev_session_high == 103.5
+    setup = detect_asia_judas(bars, ar, cfg, tick_size=0.25)
+    assert setup is not None
+    assert setup.direction is Direction.SHORT
+    assert (
+        "prev_session_high" in setup.sweep_levels
+        or "pd_high" in setup.sweep_levels
+    )
+
 
 
 def _ny_rth_bars() -> list[Bar]:

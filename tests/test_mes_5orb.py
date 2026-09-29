@@ -57,19 +57,32 @@ def test_load_mes_config():
     assert len(cfg.sessions) >= 5
     assert cfg.session("london") is not None
     assert cfg.session("london_mid") is not None
-    assert cfg.session("new_york") is not None
-    assert cfg.session("ny_mid") is not None
-    assert cfg.session("ny_pm") is not None
+    ny = cfg.session("new_york")
+    assert ny is not None
+    assert ny.or_end == time(9, 35)
+    assert ny.enabled is True
+    assert cfg.session("london").enabled is True
+    assert cfg.session("london").entry.allowed_directions == "short"
+    assert cfg.session("london_mid").enabled is False
+    assert cfg.session("ny_mid").enabled is False
+    assert cfg.session("ny_pm").enabled is False
+    assert cfg.asia_range.enabled is True
     assert cfg.risk.allow_reentry is True
     assert cfg.risk.max_entries_per_session >= 2
     assert cfg.risk.max_concurrent >= 1
     assert cfg.exits.stop_mode == "or_extreme"
-    assert cfg.exits.target_r == 2.0
+    assert cfg.exits.target_r == 2.5
+    assert cfg.exits.scale_fraction == 1.0
+    assert cfg.exits.max_stop_points is None
+    assert cfg.exits.target_mode == "r_multiple"
+    assert cfg.risk.max_entries_per_session == 2
+    assert cfg.asia_range.target_r == 1.5
     assert 0 < cfg.exits.scale_fraction <= 1.0
-    # Midday OR should be preferred over earlier London when both would be active
-    # only one is active at 12:30 ET.
+    # Midday OR disabled — opens-only trading.
     active = cfg.active_sessions_at(time(12, 30))
-    assert any(s.name == "ny_mid" for s in active)
+    assert not any(s.name == "ny_mid" for s in active)
+    assert cfg.active_sessions_at(time(9, 40))
+    assert any(s.name == "new_york" for s in cfg.active_sessions_at(time(9, 40)))
 
 
 def test_load_other_futures_configs():
@@ -315,6 +328,60 @@ def test_apply_mes_opt_params():
     assert out.sessions[0].retest.tolerance_ticks == 4
 
 
+def test_session_exits_fallback_and_scoped_opt():
+    from dataclasses import replace
+
+    from core.strategy.mes_5orb.sessions import (
+        ExitPolicyConfig,
+        apply_mes_opt_params,
+        resolve_session_exits,
+        resolve_session_max_entries,
+    )
+
+    clear_mes_5orb_config_cache()
+    cfg = load_mes_5orb_config()
+    ldn = cfg.session("london")
+    ny = cfg.session("new_york")
+    assert ldn is not None and ny is not None
+    # No per-session exits → global
+    assert ldn.exits is None
+    assert resolve_session_exits(cfg, ldn) is cfg.exits
+    assert resolve_session_max_entries(cfg, ldn) == cfg.risk.max_entries_per_session
+
+    # Scoped knobs only touch London
+    out = apply_mes_opt_params(
+        cfg,
+        {
+            "london_target_r": 1.5,
+            "london_scale_fraction": 0.5,
+            "london_tolerance_ticks": 2,
+            "london_max_entries": 1,
+            "ny_target_r": 2.0,
+            "ny_scale_fraction": 1.0,
+            "ny_tolerance_ticks": 3,
+            "ny_max_entries": 2,
+        },
+    )
+    out_ldn = out.session("london")
+    out_ny = out.session("new_york")
+    assert out_ldn is not None and out_ny is not None
+    assert out_ldn.exits is not None
+    assert out_ldn.exits.target_r == 1.5
+    assert out_ldn.exits.scale_fraction == 0.5
+    assert out_ldn.retest.tolerance_ticks == 2
+    assert out_ldn.max_entries == 1
+    assert out_ny.exits is not None
+    assert out_ny.exits.target_r == 2.0
+    assert out_ny.retest.tolerance_ticks == 3
+    assert out_ny.max_entries == 2
+    # Global exits unchanged by scoped-only keys
+    assert out.exits.target_r == cfg.exits.target_r
+
+    # Explicit session exits on MesSession win over global
+    custom = replace(ldn, exits=ExitPolicyConfig(target_r=1.75, scale_fraction=0.5))
+    assert resolve_session_exits(cfg, custom).target_r == 1.75
+
+
 def test_walk_forward_70_30_split():
     from core.backtest_mes import walk_forward_mes_7030
 
@@ -338,3 +405,92 @@ def test_walk_forward_70_30_split():
     assert wf["in_sample"]["days"] >= wf["out_of_sample"]["days"]
     # Chronological: IS ends before OOS starts
     assert wf["in_sample"]["day_end"] < wf["out_of_sample"]["day_start"]
+
+
+def test_close_break_entry_and_max_stop():
+    from dataclasses import replace
+
+    from core.strategy.mes_5orb.exits import build_exit_levels, or_stop_price
+    from core.strategy.mes_5orb.opening_range import OpeningRange, to_et
+    from core.strategy.mes_5orb.sessions import EntryConfig
+    from core.strategy.mes_5orb.signals import detect_close_break, detect_orb_setup
+
+    sess = replace(
+        _ny_session(require_rejection_candle=False),
+        or_end=time(9, 45),
+        entry=EntryConfig(mode="close_break", allowed_directions="both"),
+    )
+    base = _et_to_naive_utc(2026, 1, 6, 9, 30)
+    bars = [
+        _bar(base, 100.0, 101.0, 99.0, 100.5),  # OR start
+        _bar(base + timedelta(minutes=5), 100.5, 101.5, 99.5, 100.8),
+        _bar(base + timedelta(minutes=10), 100.8, 101.2, 99.8, 100.2),
+        # First close outside OR high after 09:45
+        _bar(base + timedelta(minutes=15), 101.2, 102.5, 101.0, 102.0),
+    ]
+    d = to_et(bars[0].ts).date()
+    orb = compute_opening_range(bars, sess, d)
+    assert orb is not None
+    assert orb.high == 101.5
+    assert orb.low == 99.0
+    setup = detect_orb_setup(bars, sess, orb, tick_size=0.25, max_stop_points=1.5)
+    assert setup is not None
+    assert setup.state is SetupState.RETESTED
+    assert setup.direction is Direction.LONG
+    assert setup.entry_price == 102.0
+    # Full OR stop would be ~99-0.25; capped to entry - 1.5
+    assert setup.initial_stop == pytest_approx(102.0 - 1.5)
+
+    # Opposite-first long-only skip
+    sess_long = replace(
+        sess,
+        entry=EntryConfig(
+            mode="close_break",
+            allowed_directions="long",
+            skip_if_opposite_first=True,
+        ),
+    )
+    bars_short = [
+        _bar(base, 100.0, 101.0, 99.0, 100.5),
+        _bar(base + timedelta(minutes=5), 100.5, 101.0, 99.5, 100.0),
+        _bar(base + timedelta(minutes=10), 100.0, 100.5, 99.2, 99.8),
+        _bar(base + timedelta(minutes=15), 99.5, 99.8, 98.0, 98.5),  # close below OR
+    ]
+    orb2 = compute_opening_range(bars_short, sess_long, d)
+    assert orb2 is not None
+    blocked = detect_close_break(bars_short, sess_long, orb2, tick_size=0.25)
+    assert blocked is not None
+    assert blocked.state is SetupState.INVALID
+
+    # or_fraction target
+    day = d
+    levels = build_exit_levels(
+        Direction.LONG,
+        102.0,
+        OpeningRange("new_york", day, 101.5, 99.0, 100.25, 3),
+        bars,
+        tick_size=0.25,
+        target_mode="or_fraction",
+        target_or_fraction=0.5,
+        max_stop_points=1.5,
+    )
+    assert levels is not None
+    assert levels.target_2r == pytest_approx(102.0 + 0.5 * 2.5)
+
+    stop = or_stop_price(
+        Direction.LONG,
+        OpeningRange("new_york", day, 101.5, 99.0, 100.25, 3),
+        tick_size=0.25,
+        entry_price=102.0,
+        max_stop_points=1.5,
+    )
+    assert stop == pytest_approx(100.5)
+
+
+def pytest_approx(val, rel=1e-9):
+    """Tiny local approx to avoid importing pytest helpers in asserts."""
+    class _A:
+        def __eq__(self, other):
+            return abs(float(other) - float(val)) <= rel * max(1.0, abs(float(val)))
+
+    return _A()

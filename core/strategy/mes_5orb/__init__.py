@@ -5,7 +5,9 @@ from core.strategy.mes_5orb.asia_range import (
     AsiaRange,
     AsiaRangeConfig,
     compute_asia_range,
+    compute_day_hl,
     compute_ny_session_hl,
+    compute_session_hl,
     detect_asia_judas,
 )
 from core.strategy.mes_5orb.markets import (
@@ -18,8 +20,18 @@ from core.strategy.mes_5orb.markets import (
 )
 from core.strategy.mes_5orb.opening_range import OpeningRange, compute_opening_range
 from core.strategy.mes_5orb.plan import MesTradePlan
-from core.strategy.mes_5orb.sessions import Mes5OrbConfig, MesSession, load_mes_5orb_config
-from core.strategy.mes_5orb.signals import BreakRetestSetup, SetupState, detect_break_retest
+from core.strategy.mes_5orb.sessions import (
+    EntryConfig,
+    Mes5OrbConfig,
+    MesSession,
+    load_mes_5orb_config,
+)
+from core.strategy.mes_5orb.signals import (
+    BreakRetestSetup,
+    SetupState,
+    detect_break_retest,
+    detect_orb_setup,
+)
 from core.strategy.mes_5orb.trailing_stop import SwingTrailingStop
 
 __all__ = [
@@ -28,6 +40,7 @@ __all__ = [
     "AsiaRangeConfig",
     "BreakRetestSetup",
     "DEFAULT_FUTURES_SYMBOL",
+    "EntryConfig",
     "FUTURES_MARKETS",
     "Mes5OrbConfig",
     "MesSession",
@@ -37,10 +50,13 @@ __all__ = [
     "SwingTrailingStop",
     "coerce_futures_symbol",
     "compute_asia_range",
+    "compute_day_hl",
     "compute_ny_session_hl",
     "compute_opening_range",
+    "compute_session_hl",
     "detect_asia_judas",
     "detect_break_retest",
+    "detect_orb_setup",
     "get_futures_market",
     "is_supported_futures",
     "load_mes_5orb_config",
