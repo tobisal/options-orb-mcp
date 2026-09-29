@@ -5,6 +5,7 @@ from core.strategy.mes_5orb.asia_range import (
     AsiaRange,
     AsiaRangeConfig,
     compute_asia_range,
+    compute_ny_session_hl,
     detect_asia_judas,
 )
 from core.strategy.mes_5orb.markets import (
@@ -36,6 +37,7 @@ __all__ = [
     "SwingTrailingStop",
     "coerce_futures_symbol",
     "compute_asia_range",
+    "compute_ny_session_hl",
     "compute_opening_range",
     "detect_asia_judas",
     "detect_break_retest",

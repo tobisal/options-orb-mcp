@@ -105,10 +105,13 @@
     "_comment": "contracts = max size from risk%; up to 3 entries per OR window after stops"
   },
   "asia_range": {
-    "_comment": "ICT Asian Range 20:00–00:00 ET. Judas sweep + reclaim in London/NY. Primer: https://forum.ictsharks.com/t/ict-forex-market-maker-primer-course-implementing-the-asian-range/234",
+    "_comment": "ICT Asian Range 20:00–00:00 ET + prior NY RTH H/L as SSL/BSL. Judas sweep+reclaim. Primer: https://forum.ictsharks.com/t/ict-forex-market-maker-primer-course-implementing-the-asian-range/234",
     "enabled": true,
     "range_start": "20:00",
     "range_end": "00:00",
+    "use_ny_liquidity": true,
+    "ny_session_start": "09:30",
+    "ny_session_end": "16:00",
     "search_start": "02:00",
     "search_end": "11:00",
     "force_flat": "11:55",

@@ -683,41 +683,48 @@ def _evaluate_asia_live(
             "reason": "asia_range: no Asia bars yet (need prior 20:00–00:00 ET)",
             "session": "asia",
         }
+
+    def _levels() -> dict[str, Any]:
+        out: dict[str, Any] = {
+            "or_high": ar.high,
+            "or_low": ar.low,
+            "asia_eq": ar.eq,
+            "ny_high": ar.ny_high,
+            "ny_low": ar.ny_low,
+            "midnight_open": ar.midnight_open,
+        }
+        return out
+
     if ar.skipped:
         return {
             "ok": False,
             "reason": f"asia_range: skipped — {ar.skip_reason}",
             "session": "asia",
-            "or_high": ar.high,
-            "or_low": ar.low,
-            "asia_eq": ar.eq,
+            **_levels(),
         }
 
     if et.time() < asia_cfg.search_start:
+        ny_bit = ""
+        if ar.ny_high is not None and ar.ny_low is not None:
+            ny_bit = f" NYH={ar.ny_high:.2f} NYL={ar.ny_low:.2f}"
         return {
             "ok": False,
             "reason": (
                 f"asia_range: waiting for search "
                 f"{asia_cfg.search_start.strftime('%H:%M')} ET "
-                f"(ARH={ar.high:.2f} ARL={ar.low:.2f} EQ={ar.eq:.2f})"
+                f"(ARH={ar.high:.2f} ARL={ar.low:.2f} EQ={ar.eq:.2f}{ny_bit})"
             ),
             "session": "asia",
-            "or_high": ar.high,
-            "or_low": ar.low,
-            "asia_eq": ar.eq,
-            "midnight_open": ar.midnight_open,
+            **_levels(),
         }
 
     setup = detect_asia_judas(bars, ar, asia_cfg, tick_size=cfg.tick_size)
     if setup is None or setup.state is not AsiaSetupState.RECLAIMED:
         return {
             "ok": False,
-            "reason": "asia_range: waiting for Judas sweep + reclaim",
+            "reason": "asia_range: waiting for Judas sweep + reclaim (Asia/NY liquidity)",
             "session": "asia",
-            "or_high": ar.high,
-            "or_low": ar.low,
-            "asia_eq": ar.eq,
-            "midnight_open": ar.midnight_open,
+            **_levels(),
         }
 
     entry_px = float(setup.entry_price)  # type: ignore[arg-type]
@@ -749,10 +756,8 @@ def _evaluate_asia_live(
     return {
         "ok": True,
         "session": "asia",
-        "or_high": ar.high,
-        "or_low": ar.low,
-        "asia_eq": ar.eq,
-        "midnight_open": ar.midnight_open,
+        **_levels(),
+        "sweep_levels": list(setup.sweep_levels),
         "state": setup.state.value,
         "plan": plan.as_dict(),
         "mes_plan": plan,

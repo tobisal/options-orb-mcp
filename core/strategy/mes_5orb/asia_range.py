@@ -3,9 +3,10 @@
 Source model (ICT Forex Market Maker Primer — Implementing The Asian Range):
 - Mark Asia high/low from 20:00–00:00 America/New_York (modern ICT; primer once
   said 19:00, later mentorship uses 20:00).
+- Also mark prior New York RTH high/low (default 09:30–16:00 ET) as liquidity.
 - Bias proxy from price vs Asia EQ at London search open.
-- Bullish: sweep Asia low (SSL), reclaim close back above → long.
-- Bearish: sweep Asia high (BSL), reclaim close back below → short.
+- Bullish: sweep Asia low and/or NY low (SSL), reclaim close back above → long.
+- Bearish: sweep Asia high and/or NY high (BSL), reclaim close back below → short.
 - Target: opposite Asia extreme (or 2R). Prefer partials over aggressive trails.
 
 Refs:
@@ -45,6 +46,10 @@ class AsiaRangeConfig:
     # Range build window (America/New_York wall clock).
     range_start: time = time(20, 0)
     range_end: time = time(0, 0)  # midnight — ends at 00:00 of the trade day
+    # Prior NY RTH used as additional BSL/SSL for Judas sweeps.
+    use_ny_liquidity: bool = True
+    ny_session_start: time = time(9, 30)
+    ny_session_end: time = time(16, 0)
     # Judas search / manage (London → early NY).
     search_start: time = time(2, 0)
     search_end: time = time(11, 0)
@@ -70,6 +75,9 @@ class AsiaRange:
     eq: float
     midnight_open: float | None
     bar_count: int
+    # Prior NY RTH extremes (session day = trade_day - 1).
+    ny_high: float | None = None
+    ny_low: float | None = None
     skipped: bool = False
     skip_reason: str = ""
 
@@ -91,8 +99,31 @@ class AsiaJudasSetup:
     initial_stop: float | None = None
     target_price: float | None = None
     target_label: str = "asia_opposite"
+    sweep_levels: tuple[str, ...] = ()
+    ny_high: float | None = None
+    ny_low: float | None = None
     state: AsiaSetupState = AsiaSetupState.IDLE
     notes: str = ""
+
+
+def compute_ny_session_hl(
+    bars: list[Bar],
+    session_day: date,
+    *,
+    start: time = time(9, 30),
+    end: time = time(16, 0),
+) -> tuple[float, float] | None:
+    """High/low of New York RTH on ``session_day`` (America/New_York)."""
+    ny_bars: list[Bar] = []
+    for b in bars:
+        et = _to_et(b.ts)
+        if et.date() != session_day:
+            continue
+        if start <= et.time() < end:
+            ny_bars.append(b)
+    if not ny_bars:
+        return None
+    return max(b.high for b in ny_bars), min(b.low for b in ny_bars)
 
 
 def compute_asia_range(
@@ -104,6 +135,7 @@ def compute_asia_range(
 
     Default window: previous calendar day 20:00 ET through 00:00 ET on ``trade_day``
     (midnight open bar is recorded but post-midnight prices are not in the range).
+    When ``use_ny_liquidity``, also attaches prior-day NY RTH high/low.
     """
     prev = trade_day - timedelta(days=1)
     range_bars: list[Bar] = []
@@ -129,6 +161,19 @@ def compute_asia_range(
     lo = min(b.low for b in range_bars)
     width = hi - lo
     eq = (hi + lo) / 2.0
+
+    ny_high: float | None = None
+    ny_low: float | None = None
+    if cfg.use_ny_liquidity:
+        ny = compute_ny_session_hl(
+            bars,
+            prev,
+            start=cfg.ny_session_start,
+            end=cfg.ny_session_end,
+        )
+        if ny is not None:
+            ny_high, ny_low = ny
+
     if width < cfg.min_width_points:
         return AsiaRange(
             trade_day=trade_day,
@@ -137,6 +182,8 @@ def compute_asia_range(
             eq=eq,
             midnight_open=midnight_open,
             bar_count=len(range_bars),
+            ny_high=ny_high,
+            ny_low=ny_low,
             skipped=True,
             skip_reason=f"asia range too narrow ({width:.2f} < {cfg.min_width_points})",
         )
@@ -148,6 +195,8 @@ def compute_asia_range(
             eq=eq,
             midnight_open=midnight_open,
             bar_count=len(range_bars),
+            ny_high=ny_high,
+            ny_low=ny_low,
             skipped=True,
             skip_reason=f"asia range too wide ({width:.2f} > {cfg.max_width_points})",
         )
@@ -158,6 +207,8 @@ def compute_asia_range(
         eq=eq,
         midnight_open=midnight_open,
         bar_count=len(range_bars),
+        ny_high=ny_high,
+        ny_low=ny_low,
     )
 
 
@@ -179,6 +230,22 @@ def _bias_at_search_open(
     return Direction.NEUTRAL
 
 
+def _ssl_levels(ar: AsiaRange) -> list[tuple[str, float]]:
+    """Sell-side liquidity (lows) — Asia low plus optional prior NY low."""
+    levels = [("asia_low", ar.low)]
+    if ar.ny_low is not None:
+        levels.append(("ny_low", ar.ny_low))
+    return levels
+
+
+def _bsl_levels(ar: AsiaRange) -> list[tuple[str, float]]:
+    """Buy-side liquidity (highs) — Asia high plus optional prior NY high."""
+    levels = [("asia_high", ar.high)]
+    if ar.ny_high is not None:
+        levels.append(("ny_high", ar.ny_high))
+    return levels
+
+
 def detect_asia_judas(
     bars: list[Bar],
     ar: AsiaRange,
@@ -187,7 +254,7 @@ def detect_asia_judas(
     tick_size: float = 0.25,
     after_bar_index: int | None = None,
 ) -> AsiaJudasSetup | None:
-    """Scan London/NY search window for Asia liquidity sweep + reclaim close."""
+    """Scan London/NY search window for Asia/NY liquidity sweep + reclaim close."""
     if ar.skipped or ar.high <= ar.low:
         return None
 
@@ -211,74 +278,100 @@ def detect_asia_judas(
     allow_long = (not cfg.require_eq_bias) or bias is Direction.LONG
     allow_short = (not cfg.require_eq_bias) or bias is Direction.SHORT
 
-    swept_long = False
-    swept_short = False
-    sweep_low = ar.low
-    sweep_high = ar.high
+    ssl = _ssl_levels(ar)
+    bsl = _bsl_levels(ar)
+
+    swept_ssl: set[str] = set()
+    swept_bsl: set[str] = set()
+    sweep_low = min(lvl for _, lvl in ssl)
+    sweep_high = max(lvl for _, lvl in bsl)
 
     for i, b in post:
-        if allow_long and b.low < ar.low:
-            swept_long = True
-            sweep_low = min(sweep_low, b.low)
-        if allow_short and b.high > ar.high:
-            swept_short = True
-            sweep_high = max(sweep_high, b.high)
+        if allow_long:
+            for name, lvl in ssl:
+                if b.low < lvl:
+                    swept_ssl.add(name)
+                    sweep_low = min(sweep_low, b.low)
+        if allow_short:
+            for name, lvl in bsl:
+                if b.high > lvl:
+                    swept_bsl.add(name)
+                    sweep_high = max(sweep_high, b.high)
 
-        # Reclaim / CHoCH proxy: close back through the swept Asia extreme
-        if swept_long and b.close > ar.low:
-            entry = float(b.close)
-            stop = sweep_low - buf
-            risk = abs(entry - stop)
-            if risk <= 0:
-                continue
-            if cfg.target_mode == "2R":
-                target = entry + cfg.target_r * risk
-                label = "2R"
-            else:
-                target = ar.high
-                label = "asia_high"
-            return AsiaJudasSetup(
-                trade_day=ar.trade_day,
-                direction=Direction.LONG,
-                asia_high=ar.high,
-                asia_low=ar.low,
-                asia_eq=ar.eq,
-                sweep_extreme=sweep_low,
-                entry_bar_index=i,
-                entry_price=entry,
-                initial_stop=stop,
-                target_price=target,
-                target_label=label,
-                state=AsiaSetupState.RECLAIMED,
-                notes="asia Judas long: SSL sweep + reclaim",
-            )
-        if swept_short and b.close < ar.high:
-            entry = float(b.close)
-            stop = sweep_high + buf
-            risk = abs(entry - stop)
-            if risk <= 0:
-                continue
-            if cfg.target_mode == "2R":
-                target = entry - cfg.target_r * risk
-                label = "2R"
-            else:
-                target = ar.low
-                label = "asia_low"
-            return AsiaJudasSetup(
-                trade_day=ar.trade_day,
-                direction=Direction.SHORT,
-                asia_high=ar.high,
-                asia_low=ar.low,
-                asia_eq=ar.eq,
-                sweep_extreme=sweep_high,
-                entry_bar_index=i,
-                entry_price=entry,
-                initial_stop=stop,
-                target_price=target,
-                target_label=label,
-                state=AsiaSetupState.RECLAIMED,
-                notes="asia Judas short: BSL sweep + reclaim",
-            )
+        # Reclaim: close back through the highest SSL / lowest BSL that was taken.
+        if swept_ssl:
+            reclaim = max(lvl for name, lvl in ssl if name in swept_ssl)
+            if b.close > reclaim:
+                entry = float(b.close)
+                stop = sweep_low - buf
+                risk = abs(entry - stop)
+                if risk <= 0:
+                    continue
+                if cfg.target_mode == "2R":
+                    target = entry + cfg.target_r * risk
+                    label = "2R"
+                else:
+                    # Draw on opposite buy-side liquidity (Asia high, else NY high).
+                    target = ar.high
+                    label = "asia_high"
+                    if ar.ny_high is not None and ar.ny_high > ar.high:
+                        target = ar.ny_high
+                        label = "ny_high"
+                names = tuple(sorted(swept_ssl))
+                return AsiaJudasSetup(
+                    trade_day=ar.trade_day,
+                    direction=Direction.LONG,
+                    asia_high=ar.high,
+                    asia_low=ar.low,
+                    asia_eq=ar.eq,
+                    sweep_extreme=sweep_low,
+                    entry_bar_index=i,
+                    entry_price=entry,
+                    initial_stop=stop,
+                    target_price=target,
+                    target_label=label,
+                    sweep_levels=names,
+                    ny_high=ar.ny_high,
+                    ny_low=ar.ny_low,
+                    state=AsiaSetupState.RECLAIMED,
+                    notes=f"asia Judas long: SSL sweep ({', '.join(names)}) + reclaim",
+                )
+        if swept_bsl:
+            reclaim = min(lvl for name, lvl in bsl if name in swept_bsl)
+            if b.close < reclaim:
+                entry = float(b.close)
+                stop = sweep_high + buf
+                risk = abs(entry - stop)
+                if risk <= 0:
+                    continue
+                if cfg.target_mode == "2R":
+                    target = entry - cfg.target_r * risk
+                    label = "2R"
+                else:
+                    target = ar.low
+                    label = "asia_low"
+                    if ar.ny_low is not None and ar.ny_low < ar.low:
+                        target = ar.ny_low
+                        label = "ny_low"
+                names = tuple(sorted(swept_bsl))
+                return AsiaJudasSetup(
+                    trade_day=ar.trade_day,
+                    direction=Direction.SHORT,
+                    asia_high=ar.high,
+                    asia_low=ar.low,
+                    asia_eq=ar.eq,
+                    sweep_extreme=sweep_high,
+                    entry_bar_index=i,
+                    entry_price=entry,
+                    initial_stop=stop,
+                    target_price=target,
+                    target_label=label,
+                    sweep_levels=names,
+                    ny_high=ar.ny_high,
+                    ny_low=ar.ny_low,
+                    state=AsiaSetupState.RECLAIMED,
+                    notes=f"asia Judas short: BSL sweep ({', '.join(names)}) + reclaim",
+                )
 
     return None
 
@@ -294,6 +387,9 @@ def asia_config_from_raw(raw: dict | None) -> AsiaRangeConfig:
         enabled=bool(raw.get("enabled", False)),
         range_start=_t("range_start", "20:00"),
         range_end=_t("range_end", "00:00"),
+        use_ny_liquidity=bool(raw.get("use_ny_liquidity", True)),
+        ny_session_start=_t("ny_session_start", "09:30"),
+        ny_session_end=_t("ny_session_end", "16:00"),
         search_start=_t("search_start", "02:00"),
         search_end=_t("search_end", "11:00"),
         force_flat=_t("force_flat", "11:55"),

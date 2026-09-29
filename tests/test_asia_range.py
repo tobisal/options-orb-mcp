@@ -49,6 +49,107 @@ def test_load_asia_range_config():
     assert cfg.asia_range.range_start == time(20, 0)
     assert cfg.asia_range.search_start == time(2, 0)
     assert cfg.asia_range.target_mode == "opposite_extreme"
+    assert cfg.asia_range.use_ny_liquidity is True
+    assert cfg.asia_range.ny_session_start == time(9, 30)
+
+
+def _ny_rth_bars() -> list[Bar]:
+    """Prior NY RTH on Jan 14: NYH=102.0 NYL=97.0 (outside Asia range)."""
+    return [
+        _bar(_et_to_naive_utc(2025, 1, 14, 9, 30), 100.0, 101.0, 99.5, 100.5),
+        _bar(_et_to_naive_utc(2025, 1, 14, 11, 0), 100.5, 102.0, 100.0, 101.5),  # high
+        _bar(_et_to_naive_utc(2025, 1, 14, 14, 0), 101.0, 101.2, 97.0, 97.5),  # low
+        _bar(_et_to_naive_utc(2025, 1, 14, 15, 55), 97.5, 98.0, 97.2, 97.8),
+    ]
+
+
+def test_compute_asia_range_attaches_ny_hl():
+    bars = _ny_rth_bars() + _asia_evening_bars()
+    bars.append(_bar(_et_to_naive_utc(2025, 1, 15, 0, 0), 99.0, 99.1, 98.9, 99.0))
+    cfg = AsiaRangeConfig(
+        enabled=True,
+        min_width_points=1.0,
+        max_width_points=50.0,
+        use_ny_liquidity=True,
+    )
+    ar = compute_asia_range(bars, date(2025, 1, 15), cfg)
+    assert ar is not None and not ar.skipped
+    assert ar.high == 100.5
+    assert ar.low == 98.0
+    assert ar.ny_high == 102.0
+    assert ar.ny_low == 97.0
+
+
+def test_asia_judas_long_ny_low_sweep_without_asia_low():
+    """Sweep prior NY low (above Asia low) counts as SSL even if ARL untouched."""
+    # Asia: high 100.5 low 96.0 — NYL=97.5 sits inside Asia so we can sweep NYL
+    # without taking ARL.
+    bars = [
+        _bar(_et_to_naive_utc(2025, 1, 14, 9, 30), 99.0, 100.0, 98.5, 99.5),
+        _bar(_et_to_naive_utc(2025, 1, 14, 12, 0), 99.5, 100.0, 97.5, 98.0),  # NYL=97.5
+        _bar(_et_to_naive_utc(2025, 1, 14, 15, 0), 98.0, 98.5, 97.8, 98.2),
+        _bar(_et_to_naive_utc(2025, 1, 14, 20, 0), 98.5, 100.5, 96.0, 97.0),  # Asia H/L
+        _bar(_et_to_naive_utc(2025, 1, 14, 22, 0), 97.0, 97.5, 96.5, 97.2),
+        _bar(_et_to_naive_utc(2025, 1, 15, 0, 0), 97.5, 97.6, 97.4, 97.5),
+        # Below EQ → bullish; EQ = (100.5+96)/2 = 98.25
+        _bar(_et_to_naive_utc(2025, 1, 15, 2, 0), 97.5, 97.6, 97.3, 97.4),
+        # Sweep NYL 97.5 but stay above ARL 96.0, reclaim above NYL
+        _bar(_et_to_naive_utc(2025, 1, 15, 2, 30), 97.4, 97.8, 97.2, 97.6),
+    ]
+    cfg = AsiaRangeConfig(
+        enabled=True,
+        min_width_points=1.0,
+        max_width_points=50.0,
+        use_ny_liquidity=True,
+        require_eq_bias=True,
+        stop_buffer_ticks=2,
+        target_mode="opposite_extreme",
+    )
+    ar = compute_asia_range(bars, date(2025, 1, 15), cfg)
+    assert ar is not None and not ar.skipped
+    assert ar.ny_low == 97.5
+    assert ar.low == 96.0
+    setup = detect_asia_judas(bars, ar, cfg, tick_size=0.25)
+    assert setup is not None
+    assert setup.direction is Direction.LONG
+    assert "ny_low" in setup.sweep_levels
+    assert "asia_low" not in setup.sweep_levels
+    assert setup.entry_price == 97.6
+
+
+def test_asia_judas_short_ny_high_sweep():
+    """Sweep prior NY high (above Asia high) counts as BSL."""
+    bars = [
+        _bar(_et_to_naive_utc(2025, 1, 14, 9, 30), 100.0, 103.0, 99.5, 102.0),  # NYH=103
+        _bar(_et_to_naive_utc(2025, 1, 14, 15, 0), 102.0, 102.5, 101.0, 101.5),
+        _bar(_et_to_naive_utc(2025, 1, 14, 20, 0), 101.0, 101.5, 99.0, 100.0),  # ARH=101.5
+        _bar(_et_to_naive_utc(2025, 1, 14, 22, 0), 100.0, 100.5, 99.0, 99.5),
+        _bar(_et_to_naive_utc(2025, 1, 15, 0, 0), 100.5, 100.6, 100.4, 100.5),
+        # Above EQ → bearish; EQ=(101.5+99)/2=100.25
+        _bar(_et_to_naive_utc(2025, 1, 15, 2, 0), 100.5, 100.8, 100.4, 100.6),
+        # Sweep NYH 103 without reclaim yet
+        _bar(_et_to_naive_utc(2025, 1, 15, 2, 30), 100.6, 103.5, 100.5, 103.2),
+        # Reclaim below NYH (and below ARH)
+        _bar(_et_to_naive_utc(2025, 1, 15, 2, 35), 103.0, 103.1, 100.0, 100.8),
+    ]
+    cfg = AsiaRangeConfig(
+        enabled=True,
+        min_width_points=1.0,
+        max_width_points=50.0,
+        use_ny_liquidity=True,
+        require_eq_bias=True,
+        stop_buffer_ticks=2,
+        target_mode="opposite_extreme",
+    )
+    ar = compute_asia_range(bars, date(2025, 1, 15), cfg)
+    assert ar is not None
+    assert ar.ny_high == 103.0
+    setup = detect_asia_judas(bars, ar, cfg, tick_size=0.25)
+    assert setup is not None
+    assert setup.direction is Direction.SHORT
+    assert "ny_high" in setup.sweep_levels
+    assert setup.sweep_extreme == 103.5
+
 
 
 def test_compute_asia_range_20_to_midnight():
