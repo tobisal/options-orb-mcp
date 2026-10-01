@@ -85,6 +85,19 @@ class ExitPolicyConfig:
     # After scale: move stop to breakeven, trail runner with swings.
     move_stop_to_be: bool = True
     runner_trail: bool = True
+    # Soft trail tiers: once price reaches ``arm`` of entry→target, ratchet
+    # stop to lock ``lock`` of that same span (BE + that %). Empty disables.
+    # Legacy ``profit_lock_arm`` / ``profit_lock_fraction`` seed the first tier
+    # when ``profit_lock_tiers`` is omitted.
+    profit_lock_arm: float = 0.75
+    profit_lock_fraction: float = 0.35
+    profit_lock_tiers: tuple[tuple[float, float], ...] = (
+        (0.75, 0.35),
+        (0.80, 0.50),
+        (0.90, 0.75),
+        (0.95, 0.85),
+        (0.975, 0.90),
+    )
 
 
 @dataclass(frozen=True)
@@ -163,6 +176,38 @@ def _exit_policy_from_raw(
     if target_mode not in ("r_multiple", "or_fraction"):
         target_mode = base.target_mode
     max_stop = raw.get("max_stop_points", base.max_stop_points)
+    arm = float(raw.get("profit_lock_arm", base.profit_lock_arm))
+    lock = float(raw.get("profit_lock_fraction", base.profit_lock_fraction))
+    arm = min(max(arm, 0.0), 1.0)
+    lock = min(max(lock, 0.0), 1.0)
+    tiers_raw = raw.get("profit_lock_tiers")
+    tiers: list[tuple[float, float]] = []
+    if isinstance(tiers_raw, list) and tiers_raw:
+        for item in tiers_raw:
+            if isinstance(item, dict):
+                ta = item.get("arm", item.get("profit_lock_arm"))
+                tl = item.get("lock", item.get("fraction", item.get("profit_lock_fraction")))
+            elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                ta, tl = item[0], item[1]
+            else:
+                continue
+            if ta is None or tl is None:
+                continue
+            ta_f = min(max(float(ta), 0.0), 1.0)
+            tl_f = min(max(float(tl), 0.0), 1.0)
+            if ta_f > 0 and tl_f > 0:
+                tiers.append((ta_f, tl_f))
+    if not tiers:
+        # Seed from legacy single arm/lock, else keep dataclass defaults.
+        if "profit_lock_arm" in raw or "profit_lock_fraction" in raw:
+            if arm > 0 and lock > 0:
+                tiers = [(arm, lock)]
+        else:
+            tiers = list(base.profit_lock_tiers)
+    tiers.sort(key=lambda t: t[0])
+    # Keep first tier as the legacy single-pair fields for callers/UI.
+    if tiers:
+        arm, lock = tiers[0]
     return ExitPolicyConfig(
         stop_mode=str(raw.get("stop_mode", base.stop_mode)),
         stop_buffer_ticks=int(raw.get("stop_buffer_ticks", base.stop_buffer_ticks)),
@@ -176,6 +221,9 @@ def _exit_policy_from_raw(
         use_hod_lod_target=bool(raw.get("use_hod_lod_target", base.use_hod_lod_target)),
         move_stop_to_be=bool(raw.get("move_stop_to_be", base.move_stop_to_be)),
         runner_trail=bool(raw.get("runner_trail", base.runner_trail)),
+        profit_lock_arm=arm,
+        profit_lock_fraction=lock,
+        profit_lock_tiers=tuple(tiers),
     )
 
 

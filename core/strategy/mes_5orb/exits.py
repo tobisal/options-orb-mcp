@@ -153,3 +153,138 @@ def primary_target(
         if lod is not None and t2 <= lod < entry and (entry - lod) >= min_move:
             return lod, "LOD"
     return t2, label
+
+
+def target_progress(
+    direction: Direction,
+    entry: float,
+    target: float,
+    mark: float,
+) -> float | None:
+    """Fraction of entry→target path realized at ``mark`` (None if no span)."""
+    span = abs(float(target) - float(entry))
+    if span <= 1e-12:
+        return None
+    if direction is Direction.LONG:
+        return (float(mark) - float(entry)) / span
+    if direction is Direction.SHORT:
+        return (float(entry) - float(mark)) / span
+    return None
+
+
+def profit_lock_stop_price(
+    direction: Direction,
+    entry: float,
+    target: float,
+    *,
+    lock_fraction: float = 0.35,
+) -> float | None:
+    """Stop that locks ``lock_fraction`` of the entry→target span (BE + that %)."""
+    span = abs(float(target) - float(entry))
+    if span <= 1e-12 or lock_fraction <= 0:
+        return None
+    frac = min(max(float(lock_fraction), 0.0), 1.0)
+    if direction is Direction.LONG:
+        return float(entry) + frac * span
+    if direction is Direction.SHORT:
+        return float(entry) - frac * span
+    return None
+
+
+def normalize_profit_lock_tiers(
+    tiers: list[tuple[float, float]] | tuple[tuple[float, float], ...] | None,
+    *,
+    arm_fraction: float | None = None,
+    lock_fraction: float | None = None,
+) -> list[tuple[float, float]]:
+    """Dedupe/clamp/sort (arm, lock) tiers ascending by arm.
+
+    If ``tiers`` is empty/None, falls back to a single ``(arm, lock)`` pair.
+    """
+    out: list[tuple[float, float]] = []
+    if tiers:
+        for arm, lock in tiers:
+            a = min(max(float(arm), 0.0), 1.0)
+            f = min(max(float(lock), 0.0), 1.0)
+            if a > 0 and f > 0:
+                out.append((a, f))
+    elif arm_fraction is not None and lock_fraction is not None:
+        a = min(max(float(arm_fraction), 0.0), 1.0)
+        f = min(max(float(lock_fraction), 0.0), 1.0)
+        if a > 0 and f > 0:
+            out.append((a, f))
+    # Keep highest lock for a given arm (last write wins after sort by arm).
+    out.sort(key=lambda t: (t[0], t[1]))
+    merged: list[tuple[float, float]] = []
+    for arm, lock in out:
+        if merged and abs(merged[-1][0] - arm) < 1e-12:
+            merged[-1] = (arm, max(merged[-1][1], lock))
+        else:
+            merged.append((arm, lock))
+    return merged
+
+
+def active_profit_lock_fraction(
+    progress: float | None,
+    tiers: list[tuple[float, float]] | tuple[tuple[float, float], ...],
+) -> float | None:
+    """Highest lock fraction among tiers whose arm ≤ progress."""
+    if progress is None:
+        return None
+    best: float | None = None
+    for arm, lock in tiers:
+        if progress + 1e-12 >= float(arm):
+            best = float(lock) if best is None else max(best, float(lock))
+    return best
+
+
+def apply_profit_lock_stop(
+    direction: Direction,
+    entry: float,
+    target: float,
+    mark: float,
+    current_stop: float,
+    *,
+    arm_fraction: float = 0.75,
+    lock_fraction: float = 0.35,
+    tiers: list[tuple[float, float]] | tuple[tuple[float, float], ...] | None = None,
+) -> float:
+    """If mark has reached a tier arm, tighten stop to that tier's lock.
+
+    Never loosens the stop. Returns ``current_stop`` unchanged when not armed.
+    ``tiers`` is a list of ``(arm_fraction, lock_fraction)``; when omitted,
+    uses the single ``(arm_fraction, lock_fraction)`` pair.
+    """
+    resolved = normalize_profit_lock_tiers(
+        tiers, arm_fraction=arm_fraction, lock_fraction=lock_fraction
+    )
+    if not resolved:
+        return float(current_stop)
+    progress = target_progress(direction, entry, target, mark)
+    lock = active_profit_lock_fraction(progress, resolved)
+    if lock is None:
+        return float(current_stop)
+    locked = profit_lock_stop_price(
+        direction, entry, target, lock_fraction=lock
+    )
+    if locked is None:
+        return float(current_stop)
+    cur = float(current_stop)
+    if direction is Direction.LONG:
+        return max(cur, locked)
+    if direction is Direction.SHORT:
+        return min(cur, locked)
+    return cur
+
+
+def tighten_stop_to_be(
+    direction: Direction, entry: float, current_stop: float
+) -> float:
+    """Move stop to breakeven only when that improves protection."""
+    entry_f = float(entry)
+    cur = float(current_stop)
+    if direction is Direction.LONG:
+        return max(cur, entry_f)
+    if direction is Direction.SHORT:
+        return min(cur, entry_f)
+    return cur

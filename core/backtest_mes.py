@@ -15,10 +15,12 @@ from core.strategy.mes_5orb.asia_range import (
     detect_asia_judas,
 )
 from core.strategy.mes_5orb.exits import (
+    apply_profit_lock_stop,
     build_exit_levels,
     hit_stop,
     hit_target,
     primary_target,
+    tighten_stop_to_be,
 )
 from core.strategy.mes_5orb.opening_range import compute_opening_range, to_et
 from core.strategy.mes_5orb.regime import (
@@ -365,6 +367,20 @@ def _manage_scaled_exit(
     stop_final = init_stop
 
     for bi, b in enumerate(manage):
+        # Soft profit lock tiers before stop/target checks.
+        stop = apply_profit_lock_stop(
+            direction,
+            entry_px,
+            target_px,
+            float(b.close),
+            stop,
+            arm_fraction=float(exits.profit_lock_arm),
+            lock_fraction=float(exits.profit_lock_fraction),
+            tiers=exits.profit_lock_tiers,
+        )
+        if trail is not None:
+            trail.stop = stop
+
         if hit_stop(direction, b, stop):
             exit_px = stop
             exit_reason = "or_stop" if not scale_hit else (
@@ -389,7 +405,7 @@ def _manage_scaled_exit(
                 stop_final = stop
                 break
             if exits.move_stop_to_be:
-                stop = entry_px
+                stop = tighten_stop_to_be(direction, entry_px, stop)
             if exits.runner_trail:
                 trail = SwingTrailingStop(
                     direction=direction,

@@ -183,6 +183,10 @@ def close_open_paper_trades(
 
     IBKR-backed rows (live or paper fills with an ``ORB-`` order ref) are left
     alone here; ``settle_session_exits`` flattens those at the broker first.
+
+    Futures / MES 5ORB / Asia Judas rows are also skipped — options-style
+    ``evaluate_exit`` (value <= stop) falsely stops out shorts. Session exits
+    own those trades.
     """
     live = now_window if now_window is not None else active_window()
     closed: list[dict[str, Any]] = []
@@ -192,6 +196,15 @@ def close_open_paper_trades(
         if t.symbol.upper() == symbol.upper() and not is_ibkr_backed(t)
     ]
     for trade in opens:
+        plan = _parse_plan(trade.plan_json)
+        instrument = str(plan.get("instrument") or "").lower()
+        entry_model = str(plan.get("entry_model") or "").lower()
+        if instrument == "future" or entry_model in {
+            "mes_5orb",
+            "asia_judas",
+            "asia_range",
+        }:
+            continue
         window_live = live is trade.window
         cfg = get_window_config(trade.window)
         in_win = bars_in_window(bars, cfg)

@@ -55,12 +55,19 @@ from core.ibkr_client import IBKRClient, IBKRUnavailable
 from core.journal import close_open_paper_trades, mark_open_trade
 from core.marketdata import fetch_bars_with_fallback
 from core.mes_active import resolve_mes_5orb_config
-from core.models import Regime, SessionWindow, TradeStatus
+from core.models import Direction, Regime, SessionWindow, TradeStatus
 from core.risk import RiskManager
 from core.strategy.mes_5orb.asia_range import compute_asia_range, detect_asia_judas
+from core.strategy.mes_5orb.exits import (
+    active_profit_lock_fraction,
+    normalize_profit_lock_tiers,
+    profit_lock_stop_price,
+    target_progress,
+)
 from core.strategy.mes_5orb.markets import coerce_futures_symbol, is_supported_futures
 from core.strategy.mes_5orb.opening_range import compute_opening_range, to_et
 from core.strategy.mes_5orb.sessions import (
+    ExitPolicyConfig,
     apply_mes_opt_params,
     clear_mes_5orb_config_cache,
     load_mes_5orb_config,
@@ -423,6 +430,9 @@ def _open_trade_levels(symbol: str) -> list[dict[str, Any]]:
                 "target_label": str(plan.get("target_label") or "TP"),
                 "contracts": trade.contracts,
                 "created_at": trade.created_at.isoformat() if trade.created_at else None,
+                "profit_lock_arm": plan.get("profit_lock_arm"),
+                "profit_lock_fraction": plan.get("profit_lock_fraction"),
+                "profit_lock_tiers": plan.get("profit_lock_tiers"),
             }
         )
     # Newest first so the chart can emphasise the latest fill.
@@ -471,6 +481,166 @@ def _level(
     }
 
 
+def _pct_label(frac: float) -> str:
+    """Format 0.75 → '75%', 0.975 → '97.5%'."""
+    pct = float(frac) * 100.0
+    if abs(pct - round(pct)) < 1e-6:
+        return f"{int(round(pct))}%"
+    return f"{pct:g}%"
+
+
+def _profit_lock_desc(exits: ExitPolicyConfig) -> str:
+    tiers = exits.profit_lock_tiers or (
+        (exits.profit_lock_arm, exits.profit_lock_fraction),
+    )
+    if not tiers:
+        return "Profit lock off."
+    parts = [f"{_pct_label(a)}→{_pct_label(f)}" for a, f in tiers]
+    return "Profit lock " + ", ".join(parts) + "."
+
+
+def _profit_lock_overlay_levels(
+    *,
+    prefix: str,
+    strategy: str,
+    direction: Direction | str,
+    entry: float | None,
+    target: float | None,
+    exits: ExitPolicyConfig | None = None,
+    arm_fraction: float | None = None,
+    lock_fraction: float | None = None,
+    tiers: list | tuple | None = None,
+    mark: float | None = None,
+    current_stop: float | None = None,
+) -> list[dict[str, Any]]:
+    """Chart line for the currently armed profit-lock SL only (none if not armed).
+
+    Uses mark progress and, when provided, the trade's current stop (so a lock
+    still shows after a pullback that does not loosen the ratcheted SL).
+    """
+    if entry is None or target is None:
+        return []
+    try:
+        entry_f = float(entry)
+        target_f = float(target)
+    except (TypeError, ValueError):
+        return []
+    span = abs(target_f - entry_f)
+    if span <= 1e-9:
+        return []
+
+    parsed_tiers: list[tuple[float, float]] | None = None
+    if isinstance(tiers, (list, tuple)) and tiers:
+        tmp: list[tuple[float, float]] = []
+        for item in tiers:
+            try:
+                if isinstance(item, dict):
+                    tmp.append(
+                        (
+                            float(item.get("arm")),
+                            float(item.get("lock", item.get("fraction"))),
+                        )
+                    )
+                elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                    tmp.append((float(item[0]), float(item[1])))
+            except (TypeError, ValueError):
+                continue
+        if tmp:
+            parsed_tiers = tmp
+    elif exits is not None and exits.profit_lock_tiers:
+        parsed_tiers = list(exits.profit_lock_tiers)
+
+    resolved = normalize_profit_lock_tiers(
+        parsed_tiers,
+        arm_fraction=(
+            arm_fraction
+            if arm_fraction is not None
+            else (exits.profit_lock_arm if exits is not None else 0.75)
+        ),
+        lock_fraction=(
+            lock_fraction
+            if lock_fraction is not None
+            else (exits.profit_lock_fraction if exits is not None else 0.35)
+        ),
+    )
+    if not resolved:
+        return []
+
+    direction_s = (
+        direction.value if isinstance(direction, Direction) else str(direction)
+    ).lower()
+    is_short = direction_s == "short"
+    dir_enum = Direction.SHORT if is_short else Direction.LONG
+
+    lock: float | None = None
+    arm: float | None = None
+    if mark is not None:
+        try:
+            mark_f = float(mark)
+        except (TypeError, ValueError):
+            mark_f = None
+        if mark_f is not None:
+            progress = target_progress(dir_enum, entry_f, target_f, mark_f)
+            lock = active_profit_lock_fraction(progress, resolved)
+            if lock is not None and progress is not None:
+                arm = next(
+                    (
+                        a
+                        for a, f in reversed(resolved)
+                        if progress + 1e-12 >= a and abs(f - lock) < 1e-12
+                    ),
+                    None,
+                )
+
+    # Pullback case: stop already ratcheted to a lock level.
+    if current_stop is not None:
+        try:
+            stop_f = float(current_stop)
+        except (TypeError, ValueError):
+            stop_f = None
+        if stop_f is not None:
+            for a, f in resolved:
+                lock_px = profit_lock_stop_price(
+                    dir_enum, entry_f, target_f, lock_fraction=f
+                )
+                if lock_px is None:
+                    continue
+                armed_here = (
+                    stop_f <= lock_px + 1e-6
+                    if is_short
+                    else stop_f >= lock_px - 1e-6
+                )
+                if armed_here and (lock is None or f >= lock):
+                    lock = f
+                    arm = a
+
+    if lock is None:
+        return []
+
+    lock_px = profit_lock_stop_price(
+        dir_enum, entry_f, target_f, lock_fraction=lock
+    )
+    if lock_px is None:
+        return []
+    arm_lbl = _pct_label(arm if arm is not None else resolved[0][0])
+    lock_lbl = _pct_label(lock)
+    spec = _level(
+        id=f"{prefix}_profit_lock",
+        label=f"Lock SL {lock_lbl}",
+        price=lock_px,
+        strategy=strategy,
+        kind="lock",
+        color="#db61a2",
+        desc=(
+            f"Active profit-lock (armed at {arm_lbl} of target path; "
+            f"locks {lock_lbl} of entry→target)"
+        ),
+        dash=[8, 3],
+        width=2,
+    )
+    return [spec] if spec else []
+
+
 def _live_stack_overlay(symbol: str, bars: list) -> dict[str, Any]:
     """Active MES strategies + chart levels (Asia Judas / London / NY ORB)."""
     clear_mes_5orb_config_cache()
@@ -481,6 +651,7 @@ def _live_stack_overlay(symbol: str, bars: list) -> dict[str, Any]:
     t = et.time()
     levels: list[dict[str, Any]] = []
     strategies: list[dict[str, Any]] = []
+    mark = float(bars[-1].close) if bars else None
 
     # --- Asia Judas ---
     asia = cfg.asia_range
@@ -651,6 +822,17 @@ def _live_stack_overlay(symbol: str, bars: list) -> dict[str, Any]:
             ):
                 if spec:
                     levels.append(spec)
+            levels.extend(
+                _profit_lock_overlay_levels(
+                    prefix="asia",
+                    strategy="asia",
+                    direction=setup.direction,
+                    entry=setup.entry_price,
+                    target=setup.target_price,
+                    exits=cfg.exits,
+                    mark=mark,
+                )
+            )
         elif ar.skipped:
             asia_reason = ar.skip_reason or "Asia range skipped"
             asia_status = "skipped_range"
@@ -674,7 +856,8 @@ def _live_stack_overlay(symbol: str, bars: list) -> dict[str, Any]:
             "desc": (
                 "Not naked ORB: sweep SSL/BSL (Asia/NY/PD) then reclaim. "
                 f"Target {asia.target_mode}, scale {int(asia.scale_fraction * 100)}%, "
-                f"EQ bias {'on' if asia.require_eq_bias else 'off'}."
+                f"EQ bias {'on' if asia.require_eq_bias else 'off'}. "
+                f"{_profit_lock_desc(cfg.exits)}"
             ),
         }
     )
@@ -761,6 +944,17 @@ def _live_stack_overlay(symbol: str, bars: list) -> dict[str, Any]:
                 ):
                     if spec:
                         levels.append(spec)
+                levels.extend(
+                    _profit_lock_overlay_levels(
+                        prefix=sess.name,
+                        strategy=sess.name,
+                        direction=str(plan.get("direction") or ""),
+                        entry=plan.get("entry_price"),
+                        target=plan.get("target_price"),
+                        exits=exits,
+                        mark=mark,
+                    )
+                )
             else:
                 reason = str(live.get("reason") or reason)
                 if "waiting" in reason.lower() or "no break" in reason.lower():
@@ -794,6 +988,7 @@ def _live_stack_overlay(symbol: str, bars: list) -> dict[str, Any]:
                 "desc": (
                     f"Break/retest OR · dirs {dir_txt} · "
                     f"{exits.target_r}R · scale {int(exits.scale_fraction * 100)}% · "
+                    f"{_profit_lock_desc(exits)} "
                     f"max entries {max_e}."
                 ),
             }
@@ -839,6 +1034,22 @@ def _live_stack_overlay(symbol: str, bars: list) -> dict[str, Any]:
         ):
             if spec:
                 levels.append(spec)
+        # Prefer plan knobs; fall back to global MES exits.
+        levels.extend(
+            _profit_lock_overlay_levels(
+                prefix=f"open_{ot['trade_id']}",
+                strategy=str(ot.get("window") or "open"),
+                direction=str(ot.get("direction") or ""),
+                entry=ot.get("entry"),
+                target=ot.get("target"),
+                exits=cfg.exits,
+                arm_fraction=ot.get("profit_lock_arm"),
+                lock_fraction=ot.get("profit_lock_fraction"),
+                tiers=ot.get("profit_lock_tiers"),
+                mark=mark,
+                current_stop=ot.get("stop"),
+            )
+        )
 
     active = [s for s in strategies if s.get("active")]
     schedule_parts = [f"{s['name']}: {s['gmt']}" for s in strategies if s.get("armed")]

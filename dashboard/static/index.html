@@ -579,11 +579,11 @@ async function loadTicker() {
       { label: "Low", data: lows, borderColor: "rgba(139,152,169,.25)", backgroundColor: "rgba(79,140,255,.10)", fill: "-1", pointRadius: 0, borderWidth: 1, tension: 0 },
       { label: "Close", data: closes, borderColor: lineColor, backgroundColor: "transparent", fill: false, pointRadius: 0, borderWidth: 2, tension: 0.1 },
     ];
-    // Cap overlays so the chart stays readable; prefer range/OR/entry/stop/target.
-    const priority = { entry: 0, stop: 1, target: 2, or: 3, range: 4, sweep: 5, eq: 6, liquidity: 7 };
+    // Cap overlays so the chart stays readable; prefer entry/stop/lock/arm/target.
+    const priority = { entry: 0, stop: 1, lock: 1, arm: 2, target: 2, or: 3, range: 4, sweep: 5, eq: 6, liquidity: 7 };
     const sorted = [...levels].sort((a, b) => (priority[a.kind] ?? 9) - (priority[b.kind] ?? 9));
     const seenPx = new Set();
-    sorted.slice(0, 14).forEach((lv) => {
+    sorted.slice(0, 18).forEach((lv) => {
       const key = `${lv.kind}:${Number(lv.price).toFixed(2)}`;
       if (seenPx.has(key)) return;
       seenPx.add(key);

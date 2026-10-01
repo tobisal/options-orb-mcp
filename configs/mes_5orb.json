@@ -33,7 +33,16 @@
         "scale_fraction": 0.5,
         "use_hod_lod_target": true,
         "move_stop_to_be": true,
-        "runner_trail": true
+        "runner_trail": true,
+        "profit_lock_arm": 0.75,
+        "profit_lock_fraction": 0.35,
+        "profit_lock_tiers": [
+          {"arm": 0.75, "lock": 0.35},
+          {"arm": 0.80, "lock": 0.50},
+          {"arm": 0.90, "lock": 0.75},
+          {"arm": 0.95, "lock": 0.85},
+          {"arm": 0.975, "lock": 0.90}
+        ]
       }
     },
     "london_mid": {
@@ -76,7 +85,16 @@
         "scale_fraction": 1.0,
         "use_hod_lod_target": false,
         "move_stop_to_be": true,
-        "runner_trail": true
+        "runner_trail": true,
+        "profit_lock_arm": 0.75,
+        "profit_lock_fraction": 0.35,
+        "profit_lock_tiers": [
+          {"arm": 0.75, "lock": 0.35},
+          {"arm": 0.80, "lock": 0.50},
+          {"arm": 0.90, "lock": 0.75},
+          {"arm": 0.95, "lock": 0.85},
+          {"arm": 0.975, "lock": 0.90}
+        ]
       }
     },
     "ny_mid": {
@@ -127,7 +145,16 @@
     "use_hod_lod_target": true,
     "move_stop_to_be": true,
     "runner_trail": true,
-    "_comment": "Global fallback; London/NY session exits override (NT HISTORY 90d opt)."
+    "profit_lock_arm": 0.75,
+    "profit_lock_fraction": 0.35,
+    "profit_lock_tiers": [
+      {"arm": 0.75, "lock": 0.35},
+      {"arm": 0.80, "lock": 0.50},
+      {"arm": 0.90, "lock": 0.75},
+      {"arm": 0.95, "lock": 0.85},
+      {"arm": 0.975, "lock": 0.90}
+    ],
+    "_comment": "Ratchet SL tiers on entry→target progress: 75%→35%, 80%→50%, 90%→75%, 95%→85%, 97.5%→90%. Session exits may override."
   },
   "risk": {
     "contracts": 20,

@@ -24,7 +24,12 @@ from core.models import Direction, Regime, SessionWindow, SpreadType, TradeRecor
 from core.risk import RiskManager
 from core.sessions import active_window
 from core.mes_active import resolve_mes_5orb_config
-from core.strategy.mes_5orb.exits import hit_stop, hit_target
+from core.strategy.mes_5orb.exits import (
+    apply_profit_lock_stop,
+    hit_stop,
+    hit_target,
+    tighten_stop_to_be,
+)
 from core.strategy.mes_5orb.markets import (
     DEFAULT_FUTURES_SYMBOL,
     coerce_futures_symbol,
@@ -543,6 +548,57 @@ async def settle_session_exits(
                 scaled and full_exit_at_target
             )
 
+            # Soft profit lock tiers (e.g. 75%→35%, 80%→50%, …).
+            exits_cfg = trade_cfg.exits
+            if target_px_f is not None and last is not None:
+                lock_mark = float(last.close)
+                tiers = None
+                plan_tiers = plan.get("profit_lock_tiers")
+                if isinstance(plan_tiers, list) and plan_tiers:
+                    parsed: list[tuple[float, float]] = []
+                    for item in plan_tiers:
+                        try:
+                            if isinstance(item, dict):
+                                parsed.append(
+                                    (
+                                        float(item.get("arm")),
+                                        float(
+                                            item.get(
+                                                "lock",
+                                                item.get("fraction"),
+                                            )
+                                        ),
+                                    )
+                                )
+                            elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                                parsed.append((float(item[0]), float(item[1])))
+                        except (TypeError, ValueError):
+                            continue
+                    if parsed:
+                        tiers = parsed
+                new_stop = apply_profit_lock_stop(
+                    direction,
+                    entry_px,
+                    target_px_f,
+                    lock_mark,
+                    stop,
+                    arm_fraction=float(
+                        plan.get("profit_lock_arm", exits_cfg.profit_lock_arm)
+                    ),
+                    lock_fraction=float(
+                        plan.get(
+                            "profit_lock_fraction", exits_cfg.profit_lock_fraction
+                        )
+                    ),
+                    tiers=tiers if tiers else exits_cfg.profit_lock_tiers,
+                )
+                if abs(new_stop - stop) > 1e-9:
+                    stop = new_stop
+                    plan["stop_loss_price"] = stop
+                    plan["profit_lock_armed"] = True
+                    if trade.id:
+                        db.update_plan_json(trade.id, plan)
+
             async def _close_full_target(exit_px: float, reason: str) -> bool:
                 """Close at target price. Returns True if journaled closed."""
                 if is_ibkr_backed(trade) and client is not None and trade.order_ref:
@@ -614,12 +670,12 @@ async def settle_session_exits(
                     _mark_pending_target(target_px_f)
                     continue
 
-                # Partial scale: take marker, move stop to BE, trail runner.
+                # Partial scale: take marker, move stop to BE (never loosen), trail runner.
                 plan["scaled_out"] = True
                 plan["scale_fill_price"] = target_px_f
                 if trade_cfg.exits.move_stop_to_be:
-                    plan["stop_loss_price"] = entry_px
-                    stop = entry_px
+                    stop = tighten_stop_to_be(direction, entry_px, stop)
+                    plan["stop_loss_price"] = stop
                 plan["trail_active"] = use_trail
                 if trade.id:
                     db.update_plan_json(trade.id, plan)
