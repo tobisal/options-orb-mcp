@@ -10,8 +10,7 @@ from typing import Any
 
 from core.brokers.base import BrokerUnavailable, FuturesBroker
 from core.brokers.ibkr_adapter import IbkrBroker
-from core.brokers.multi_account import MultiAccountBroker, PropAccount
-from core.brokers.tradovate_client import TradovateClient
+from core.brokers.multi_account import PropAccount
 from core.config import get_settings
 
 _log = logging.getLogger("orb.broker.factory")
@@ -90,6 +89,11 @@ def get_broker(*, readonly: bool = False) -> FuturesBroker:
         )
 
     if backend in {"tradovate", "tradovate_prop", "prop"}:
+        # Lazy import so the default IBKR dashboard path does not require httpx
+        # at process start (Docker images without optional deps still boot).
+        from core.brokers.multi_account import MultiAccountBroker
+        from core.brokers.tradovate_client import TradovateClient
+
         settings = get_settings()
         accounts = _parse_prop_accounts(
             getattr(settings, "prop_accounts_json", None)
