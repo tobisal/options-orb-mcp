@@ -1383,12 +1383,37 @@ class AutoTrader:
         target = plan.get("target_price")
         tlabel = plan.get("target_label") or "TP"
         direction = str(plan.get("direction") or "").upper()
-        # Always Discord the setup levels once per session/day — even if risk blocks placement.
+        # Discord once per calendar day per market (asia/london/ny) — no second ping on risk block.
         if key not in self._signaled_keys:
             self._signaled_keys.add(key)
+            from core.discord_format import format_nt_ticket
+
+            qty = plan.get("contracts")
+            try:
+                qty_i = int(qty) if qty is not None else int(
+                    getattr(get_settings(), "prop_default_contracts", 1) or 1
+                )
+            except (TypeError, ValueError):
+                qty_i = 1
+            note = None
+            if not preview.get("tradeable"):
+                reasons = (
+                    "; ".join(preview.get("risk", {}).get("reasons", []))
+                    or "risk checks failed"
+                )
+                note = f"Paper auto-place blocked ({reasons})."
             self._add_log(
-                f"SIGNAL [{tag}] {self.symbol} {direction} "
-                f"entry {entry} SL {stop} {tlabel} {target}",
+                format_nt_ticket(
+                    label=tag,
+                    symbol=self.symbol,
+                    direction=direction,
+                    entry=entry,
+                    stop=stop,
+                    target=target,
+                    target_label=tlabel,
+                    qty=max(qty_i, 1),
+                    note=note,
+                ),
                 "signal",
             )
 
@@ -1401,13 +1426,10 @@ class AutoTrader:
             return
 
         if not preview.get("tradeable"):
-            reasons = "; ".join(preview.get("risk", {}).get("reasons", [])) or "risk checks failed"
-            # Same one-liner style so Discord always shows entry/SL/TP even when blocked.
+            # Already pinged Discord once above — stay quiet here.
             self._add_log(
-                f"SIGNAL [{tag}] {self.symbol} {direction} "
-                f"entry {entry} SL {stop} {tlabel} {target} "
-                f"(blocked: {reasons})",
-                "signal",
+                f"Signal found ({win}) but blocked (levels already sent).",
+                "muted",
             )
             return
 

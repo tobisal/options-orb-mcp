@@ -129,12 +129,87 @@ def format_signals(payload: dict[str, Any]) -> str:
     return clip("\n".join(lines))
 
 
-def format_signal_alert(signal: dict[str, Any], *, symbol: str = "MES") -> str:
-    """Push alert when a live session setup fires (Asia / London / NY).
+def _mes_pip_size(symbol: str | None = None) -> float:
+    """MES/MNQ-style index micros: 1 'pip' = 1 tick = 0.25 points."""
+    sym = str(symbol or "MES").upper()
+    if sym in {"MES", "ES", "MYM", "YM"}:
+        return 0.25
+    if sym in {"MNQ", "NQ"}:
+        return 0.25
+    if sym in {"M2K", "RTY"}:
+        return 0.10
+    return 0.25
 
-    Canonical one-liner:
-    SIGNAL [ASIA] MES LONG entry 7740.25 SL 7711.75 pd_high 7767.75
-    """
+
+def format_nt_ticket(
+    *,
+    label: str,
+    symbol: str,
+    direction: str,
+    entry: Any,
+    stop: Any,
+    target: Any = None,
+    target_label: str = "TP",
+    qty: int | None = None,
+    note: str | None = None,
+) -> str:
+    """NinjaTrader-ready ticket: once-daily style alert with 2R/3R pip moves."""
+    side = str(direction or "").upper()
+    action = (
+        "BUY"
+        if side in {"LONG", "BUY"}
+        else "SELL"
+        if side in {"SHORT", "SELL"}
+        else side or "?"
+    )
+    qty_s = str(qty) if qty is not None else "1"
+    pip = _mes_pip_size(symbol)
+    try:
+        entry_f = float(entry)
+        stop_f = float(stop)
+    except (TypeError, ValueError):
+        entry_f = None
+        stop_f = None
+
+    lines = [
+        f"**SIGNAL [{label}]** {symbol} {side}",
+        f"NT → `{symbol}`  **{action}**  qty **{qty_s}**  ·  Entry `{entry}`",
+    ]
+
+    if entry_f is not None and stop_f is not None:
+        risk = abs(entry_f - stop_f)
+        risk_pips = risk / pip if pip else 0.0
+        long = action == "BUY"
+        tp2 = entry_f + (2.0 * risk if long else -2.0 * risk)
+        tp3 = entry_f + (3.0 * risk if long else -3.0 * risk)
+        # Round to tick
+        def _tick(px: float) -> float:
+            return round(round(px / pip) * pip, 2) if pip else round(px, 2)
+
+        stop_r = _tick(stop_f)
+        tp2_r = _tick(tp2)
+        tp3_r = _tick(tp3)
+        lines.extend(
+            [
+                f"SL `{stop_r}`  (−{risk_pips:.0f} pips / {risk:.2f} pts)",
+                f"2R `{tp2_r}`  (+{risk_pips * 2:.0f} pips / {risk * 2:.2f} pts)",
+                f"3R `{tp3_r}`  (+{risk_pips * 3:.0f} pips / {risk * 3:.2f} pts)",
+                f"1 pip = {pip:g} MES tick",
+            ]
+        )
+        if target is not None:
+            lines.append(f"Plan {target_label or 'TP'} `{target}` (strategy target; prefer 2R/3R above for NT)")
+    else:
+        lines.append(f"Stop `{stop}`  ·  {target_label or 'TP'} `{target}`")
+
+    lines.append("Manual NT only — one ping per market per day.")
+    if note:
+        lines.append(str(note)[:220])
+    return clip("\n".join(lines))
+
+
+def format_signal_alert(signal: dict[str, Any], *, symbol: str = "MES") -> str:
+    """Push alert when a live session setup fires (Asia / London / NY)."""
     label = session_label(
         signal.get("window") or signal.get("session_name") or signal.get("session")
     )
@@ -147,16 +222,26 @@ def format_signal_alert(signal: dict[str, Any], *, symbol: str = "MES") -> str:
     stop = signal.get("stop_price") or signal.get("stop_loss_price") or signal.get("sl")
     target = signal.get("target_price") or signal.get("tp")
     tlabel = signal.get("target_label") or "TP"
-    line = (
-        f"**SIGNAL [{label}]** {symbol} {direction} "
-        f"entry {entry} SL {stop} {tlabel} {target}"
-    )
-    lines = [line]
-    blocked = signal.get("blocked") or signal.get("risk_blocked")
-    if blocked:
+    qty = signal.get("contracts") or signal.get("qty")
+    try:
+        qty_i = int(qty) if qty is not None else None
+    except (TypeError, ValueError):
+        qty_i = None
+    note = None
+    if signal.get("blocked") or signal.get("risk_blocked"):
         reason = signal.get("block_reason") or signal.get("reason") or "risk blocked"
-        lines.append(f"⚠️ Not auto-placed: {str(reason)[:200]}")
-    return clip("\n".join(lines))
+        note = f"Paper auto-place blocked ({reason})."
+    return format_nt_ticket(
+        label=label,
+        symbol=symbol,
+        direction=direction,
+        entry=entry,
+        stop=stop,
+        target=target,
+        target_label=tlabel,
+        qty=qty_i,
+        note=note,
+    )
 
 
 def format_preview(plan: dict[str, Any]) -> str:

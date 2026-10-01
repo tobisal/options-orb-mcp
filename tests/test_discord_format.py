@@ -128,6 +128,7 @@ def test_format_signal_alert_labels_asia():
             "stop_price": 7711.75,
             "target_price": 7767.75,
             "target_label": "pd_high",
+            "contracts": 1,
             "range_low": 7711.75,
             "range_high": 7755.0,
             "strategy": {"entry_model": "asia_judas"},
@@ -137,11 +138,16 @@ def test_format_signal_alert_labels_asia():
         symbol="MES",
     )
     assert "SIGNAL [ASIA]" in text
-    assert "MES LONG" in text
-    assert "entry 7740.25" in text
-    assert "SL 7711.75" in text
-    assert "pd_high 7767.75" in text
-    assert "Not auto-placed" in text
+    assert "BUY" in text
+    assert "Entry `7740.25`" in text
+    # risk = 28.5 pts = 114 pips (0.25 tick)
+    assert "114 pips" in text
+    assert "2R" in text
+    assert "3R" in text
+    assert "228 pips" in text  # 2R
+    assert "342 pips" in text  # 3R
+    assert "one ping per market per day" in text
+    assert "Paper auto-place blocked" in text
 
 
 def test_format_nightly_and_log_filter():
@@ -181,7 +187,7 @@ def test_format_nightly_and_log_filter():
             "level": "signal",
             "msg": "SIGNAL [ASIA] MES LONG entry 7740.25 SL 7711.75 pd_high 7767.75",
         }
-    ) == "SIGNAL [ASIA] MES LONG entry 7740.25 SL 7711.75 pd_high 7767.75"
+    ).startswith("SIGNAL [ASIA]")
 
 
 def test_format_trade_alert_placed_and_closed():

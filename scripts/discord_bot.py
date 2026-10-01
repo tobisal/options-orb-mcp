@@ -131,6 +131,7 @@ class OrbDiscord(discord.Client):
         self._trades_primed = False
         self._signal_state: dict[str, bool] = {}
         self._signals_primed = False
+        self._signal_days_posted: set[str] = set()
         self._owner_id: int | None = None
         self._pump_task: asyncio.Task | None = None
         self._trade_pump_task: asyncio.Task | None = None
@@ -284,13 +285,21 @@ class OrbDiscord(discord.Client):
             await asyncio.sleep(10)
 
     async def _signal_pump(self) -> None:
-        """Push Asia / London / NY setups as soon as they arm (labeled by session)."""
+        """Push Asia / London / NY setups at most once per market per UTC day.
+
+        When AutoTrader is running it already emits the NT ticket via the log pump,
+        so this pump stays quiet to avoid a double ping.
+        """
         await self.wait_until_ready()
         if not (self.settings.discord_log_channel_id or "").strip().isdigit():
             return
         symbol = (self.settings.default_symbol or "MES").upper()
         while not self.is_closed():
             try:
+                status = await self.api.get("/api/autotrade/status")
+                if status.get("running"):
+                    await asyncio.sleep(20)
+                    continue
                 payload = await self.api.get("/api/signals", symbol=symbol)
                 if payload.get("error"):
                     await asyncio.sleep(20)
@@ -299,16 +308,16 @@ class OrbDiscord(discord.Client):
                 if channel is None:
                     await asyncio.sleep(15)
                     continue
+                from datetime import datetime, timezone
+
+                day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
                 signals = list(payload.get("signals") or [])
                 if not self._signals_primed:
-                    # Seed as "not armed" so currently live setups still alert once
-                    # after startup (don't swallow an already-true Asia/London signal).
                     for s in signals:
                         wid = str(s.get("window") or "")
                         if wid:
                             self._signal_state[wid] = False
                     self._signals_primed = True
-                    # Fall through and post any currently armed signals this cycle.
                 for s in signals:
                     wid = str(s.get("window") or "")
                     if not wid:
@@ -316,16 +325,24 @@ class OrbDiscord(discord.Client):
                     armed = bool(s.get("breakout"))
                     was = self._signal_state.get(wid, False)
                     self._signal_state[wid] = armed
-                    if armed and not was:
-                        await channel.send(
-                            format_signal_alert(s, symbol=str(payload.get("symbol") or symbol))
+                    day_key = f"{day}|{wid}"
+                    if not armed or was or day_key in self._signal_days_posted:
+                        continue
+                    self._signal_days_posted.add(day_key)
+                    if len(self._signal_days_posted) > 60:
+                        self._signal_days_posted = set(
+                            list(self._signal_days_posted)[-30:]
                         )
-                        log.info(
-                            "signal alert [%s] %s %s",
-                            session_label(wid),
-                            payload.get("symbol") or symbol,
-                            s.get("direction"),
-                        )
+                    await channel.send(
+                        format_signal_alert(s, symbol=str(payload.get("symbol") or symbol))
+                    )
+                    log.info(
+                        "signal alert [%s] %s %s (once/%s)",
+                        session_label(wid),
+                        payload.get("symbol") or symbol,
+                        s.get("direction"),
+                        day,
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
