@@ -46,14 +46,16 @@ def test_load_asia_range_config():
     clear_mes_5orb_config_cache()
     cfg = load_mes_5orb_config("MES")
     assert cfg.asia_range.enabled is True
-    assert cfg.asia_range.allowed_weekdays == (2, 3, 4)
+    # Live Asia opt: all weekdays (None), no EQ bias, NY+PD liq only.
+    assert cfg.asia_range.allowed_weekdays is None
+    assert cfg.asia_range.require_eq_bias is False
     assert cfg.asia_range.range_start == time(20, 0)
     assert cfg.asia_range.search_start == time(2, 0)
     assert cfg.asia_range.target_mode == "opposite_extreme"
     assert cfg.asia_range.use_ny_liquidity is True
     assert cfg.asia_range.ny_session_start == time(9, 30)
     assert cfg.asia_range.use_pd_liquidity is True
-    assert cfg.asia_range.use_prev_session_liquidity is True
+    assert cfg.asia_range.use_prev_session_liquidity is False
     assert cfg.asia_range.prev_session_start == time(2, 0)
 
 
@@ -308,6 +310,37 @@ def test_asia_judas_long_ssl_sweep_reclaim():
     assert setup.sweep_extreme == 97.5
     assert setup.initial_stop == 97.5 - 0.5  # 2 ticks
     assert setup.target_price == 100.5
+
+
+def test_asia_judas_reclaim_when_level_inside_bar_hl():
+    """No ticks: after SSL sweep, reclaim if ARL sits inside later bar H/L and close holds."""
+    bars = _asia_evening_bars()
+    bars.append(_bar(_et_to_naive_utc(2025, 1, 15, 0, 0), 99.0, 99.1, 98.9, 99.0))
+    bars.append(_bar(_et_to_naive_utc(2025, 1, 15, 2, 0), 99.0, 99.1, 98.5, 98.8))
+    # Sweep SSL, close still below ARL=98 (no reclaim yet)
+    bars.append(_bar(_et_to_naive_utc(2025, 1, 15, 2, 30), 98.5, 98.6, 97.2, 97.8))
+    # Level 98 inside H/L; close back at reclaim (OHLC proxy, no tick path)
+    bars.append(_bar(_et_to_naive_utc(2025, 1, 15, 2, 35), 97.9, 98.4, 97.7, 98.0))
+
+    cfg = AsiaRangeConfig(
+        enabled=True,
+        min_width_points=1.0,
+        max_width_points=50.0,
+        require_eq_bias=True,
+        stop_buffer_ticks=2,
+        target_mode="opposite_extreme",
+        scale_fraction=1.0,
+        use_ny_liquidity=False,
+        use_pd_liquidity=False,
+        use_prev_session_liquidity=False,
+    )
+    ar = compute_asia_range(bars, date(2025, 1, 15), cfg)
+    assert ar is not None and not ar.skipped
+    setup = detect_asia_judas(bars, ar, cfg, tick_size=0.25)
+    assert setup is not None
+    assert setup.direction is Direction.LONG
+    assert setup.entry_price == 98.0
+    assert "OHLC range" in setup.notes
 
 
 def test_asia_judas_short_bsl_sweep_reclaim():

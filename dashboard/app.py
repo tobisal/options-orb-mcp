@@ -9,15 +9,17 @@ Run with:  python -m dashboard.app
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
-from datetime import timedelta
+from datetime import datetime, time as dt_time, timedelta
 from pathlib import Path
 from typing import Any
 
 import anyio
+import pytz
 import uvicorn
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -33,29 +35,101 @@ from core.active_params import (
 from core.analytics import daily_revenue, monte_carlo, performance_metrics, summarize
 from core.autotrade_state import load_state, save_state, should_autostart, start_kwargs
 from core.backtest_mes import (
+    evaluate_mes_signal_live,
+    mes_live_config_snapshot,
     optimise_mes_5orb,
     run_mes_5orb_backtest,
     walk_forward_mes_7030,
 )
 from core.config import get_settings
 from core.db import Database, is_tradable_orb_params
-from core.engine import build_trade_plan, place_trade_plan, resolve_window, settle_session_exits
+from core.engine import (
+    build_trade_plan,
+    place_trade_plan,
+    reconcile_open_futures_vs_ibkr,
+    resolve_window,
+    settle_session_exits,
+)
 from core.ibkr_client import IBKRClient, IBKRUnavailable
-from core.journal import close_open_paper_trades, mark_open_trade, paper_account_snapshot
+from core.journal import close_open_paper_trades, mark_open_trade
 from core.marketdata import fetch_bars_with_fallback
 from core.mes_active import resolve_mes_5orb_config
 from core.models import Regime, SessionWindow, TradeStatus
 from core.risk import RiskManager
+from core.strategy.mes_5orb.asia_range import compute_asia_range, detect_asia_judas
 from core.strategy.mes_5orb.markets import coerce_futures_symbol, is_supported_futures
-from core.strategy.mes_5orb.sessions import clear_mes_5orb_config_cache, load_mes_5orb_config
+from core.strategy.mes_5orb.opening_range import compute_opening_range, to_et
+from core.strategy.mes_5orb.sessions import (
+    apply_mes_opt_params,
+    clear_mes_5orb_config_cache,
+    load_mes_5orb_config,
+    resolve_session_exits,
+    resolve_session_max_entries,
+)
 from core.sessions import active_window, describe_windows_gmt
 from core.strategy.orb import compute_orb_signal
-from core.timeutils import as_naive_utc, utcnow
+from core.timeutils import as_naive_utc, market_now, utcnow
+
+_EASTERN = pytz.timezone("America/New_York")
 
 _STATIC = Path(__file__).resolve().parent / "static"
 _db = Database()
 _log = logging.getLogger("orb.dashboard")
 _SESSION_EXIT_INTERVAL = 30.0
+# Dashboard is MES-only — hide legacy SPY / other symbols from every journal view.
+_DASHBOARD_SYMBOL = "MES"
+
+
+def _is_dashboard_symbol(symbol: str | None) -> bool:
+    if not symbol:
+        return False
+    return str(symbol).strip().upper() == _DASHBOARD_SYMBOL
+
+
+def _mes_trades(trades: list) -> list:
+    return [t for t in trades if _is_dashboard_symbol(getattr(t, "symbol", None))]
+
+
+def _mes_paper_snapshot(
+    *,
+    spots: dict[str, float],
+    starting_capital: float,
+    environment: str = "PAPER",
+) -> dict[str, Any]:
+    """Paper equity / daily PnL using MES journal rows only."""
+    opens = _mes_trades(
+        _db.query_trades(status=TradeStatus.OPEN, environment=environment, limit=1000)
+    )
+    closed = _mes_trades(
+        _db.query_trades(status=TradeStatus.CLOSED, environment=environment, limit=100000)
+    )
+    unreal = 0.0
+    for trade in opens:
+        spot = spots.get(trade.symbol.upper())
+        if spot is None:
+            continue
+        unreal += mark_open_trade(trade, spot)["unrealized_pnl"]
+    lifetime = sum(float(t.pnl or 0.0) for t in closed if t.pnl is not None)
+    start_of_day = utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    daily_realised = 0.0
+    for t in closed:
+        if t.pnl is None:
+            continue
+        closed_at = t.closed_at or t.created_at
+        if closed_at is None:
+            continue
+        if as_naive_utc(closed_at) >= start_of_day:
+            daily_realised += float(t.pnl)
+    unreal = round(unreal, 2)
+    lifetime = round(lifetime, 2)
+    daily_realised = round(daily_realised, 2)
+    return {
+        "lifetime_realised_pnl": lifetime,
+        "open_unrealized_pnl": unreal,
+        "daily_realised_pnl": daily_realised,
+        "daily_pnl": round(daily_realised + unreal, 2),
+        "paper_equity": round(starting_capital + lifetime + unreal, 2),
+    }
 
 # Short-lived cache for IBKR calls so the ~8s UI poll doesn't reconnect every
 # time (and, when offline, doesn't retry the socket on every request).
@@ -239,22 +313,47 @@ def _filter_bars_for_window(bars: list, window: SessionWindow) -> list:
 async def _load_history(
     symbol: str, *, demo: bool, lookback_days: int, seed: int
 ) -> tuple[list, str, str | None]:
-    """Fetch historical bars (IBKR live history, or synthetic in demo mode)."""
+    """Fetch historical bars (IBKR live history, or synthetic in demo mode).
+
+    For ~1 calendar month lookbacks, prefer IBKR ``1 M`` duration (same as the
+    live month PnL reports) before falling back to ``N D``.
+    """
     symbol = coerce_futures_symbol(symbol) if is_supported_futures(symbol) else symbol.upper()
     key = (symbol.upper(), demo, lookback_days, seed)
     now = time.monotonic()
     cached = _bars_cache.get(key)
     if cached and now - cached[0] < _BARS_CACHE_TTL:
         return cached[1]
-    bars, source, warning = await fetch_bars_with_fallback(
-        symbol,
-        duration=f"{lookback_days} D",
-        bar_size="5 mins",
-        use_synthetic=demo,
-        allow_synthetic_fallback=demo,
-        synthetic_days=lookback_days,
-        synthetic_seed=seed,
-    )
+
+    durations: list[str] = []
+    if 28 <= lookback_days <= 35 and not demo:
+        durations.append("1 M")
+    durations.append(f"{lookback_days} D")
+
+    bars: list = []
+    source = "none"
+    warning: str | None = None
+    last_exc: Exception | None = None
+    for dur in durations:
+        try:
+            bars, source, warning = await fetch_bars_with_fallback(
+                symbol,
+                duration=dur,
+                bar_size="5 mins",
+                use_synthetic=demo,
+                allow_synthetic_fallback=demo,
+                synthetic_days=lookback_days,
+                synthetic_seed=seed,
+            )
+            if bars:
+                break
+        except IBKRUnavailable as exc:
+            last_exc = exc
+            if demo:
+                raise
+            continue
+    if not bars and last_exc is not None and not demo:
+        raise last_exc
     result = (bars, source, warning)
     _bars_cache[key] = (now, result)
     return result
@@ -284,6 +383,480 @@ def _with_mark(trade, spots: dict[str, float]) -> dict[str, Any]:
     return payload
 
 
+def _parse_plan(plan_json: str | None) -> dict[str, Any]:
+    try:
+        raw = json.loads(plan_json or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _open_trade_levels(symbol: str) -> list[dict[str, Any]]:
+    """Entry / stop / target for open journal trades on ``symbol`` (chart overlay)."""
+    want = coerce_futures_symbol(symbol).upper()
+    levels: list[dict[str, Any]] = []
+    for trade in _db.query_trades(status=TradeStatus.OPEN, limit=200):
+        if coerce_futures_symbol(trade.symbol).upper() != want:
+            continue
+        plan = _parse_plan(trade.plan_json)
+        stop = plan.get("stop_loss_price")
+        if stop is None:
+            stop = plan.get("stop_price")
+        target = plan.get("target_price")
+        try:
+            stop_f = float(stop) if stop is not None else None
+        except (TypeError, ValueError):
+            stop_f = None
+        try:
+            target_f = float(target) if target is not None else None
+        except (TypeError, ValueError):
+            target_f = None
+        levels.append(
+            {
+                "trade_id": trade.id,
+                "direction": trade.direction.value,
+                "window": trade.window.value,
+                "entry": float(trade.entry_price),
+                "stop": stop_f,
+                "target": target_f,
+                "target_label": str(plan.get("target_label") or "TP"),
+                "contracts": trade.contracts,
+                "created_at": trade.created_at.isoformat() if trade.created_at else None,
+            }
+        )
+    # Newest first so the chart can emphasise the latest fill.
+    levels.sort(key=lambda row: row.get("created_at") or "", reverse=True)
+    return levels
+
+
+def _et_hhmm_gmt(t: dt_time, now: datetime | None = None) -> str:
+    """Convert an America/New_York wall-clock time to GMT HH:MM (DST-aware)."""
+    now = now or market_now()
+    et_date = to_et(now).date()
+    dt = _EASTERN.localize(datetime.combine(et_date, t))
+    return dt.astimezone(pytz.UTC).strftime("%H:%M")
+
+
+def _level(
+    *,
+    id: str,
+    label: str,
+    price: float | None,
+    strategy: str,
+    kind: str,
+    color: str,
+    desc: str,
+    dash: list[int] | None = None,
+    width: int = 1,
+) -> dict[str, Any] | None:
+    if price is None:
+        return None
+    try:
+        px = float(price)
+    except (TypeError, ValueError):
+        return None
+    if px <= 0:
+        return None
+    return {
+        "id": id,
+        "label": label,
+        "price": round(px, 4),
+        "strategy": strategy,
+        "kind": kind,
+        "color": color,
+        "dash": dash or [5, 4],
+        "width": width,
+        "desc": desc,
+    }
+
+
+def _live_stack_overlay(symbol: str, bars: list) -> dict[str, Any]:
+    """Active MES strategies + chart levels (Asia Judas / London / NY ORB)."""
+    clear_mes_5orb_config_cache()
+    cfg = load_mes_5orb_config(symbol)
+    now = market_now()
+    et = to_et(now)
+    day = et.date()
+    t = et.time()
+    levels: list[dict[str, Any]] = []
+    strategies: list[dict[str, Any]] = []
+
+    # --- Asia Judas ---
+    asia = cfg.asia_range
+    asia_in_search = bool(
+        asia.enabled and asia.allows_day(day) and asia.search_start <= t < asia.search_end
+    )
+    asia_in_range_build = False
+    if asia.enabled:
+        # Range build wraps midnight: 20:00 → 00:00 ET.
+        if asia.range_start > asia.range_end:
+            asia_in_range_build = t >= asia.range_start or t < asia.range_end
+        else:
+            asia_in_range_build = asia.range_start <= t < asia.range_end
+    asia_status = "disabled"
+    asia_reason = ""
+    if asia.enabled:
+        if not asia.allows_day(day):
+            asia_status = "skipped_weekday"
+            asia_reason = f"weekday {day.weekday()} not allowed"
+        elif asia_in_range_build:
+            asia_status = "building_range"
+            asia_reason = "Asia range forming (20:00–00:00 ET)"
+        elif asia_in_search:
+            asia_status = "searching"
+            asia_reason = "Judas search — waiting for sweep + reclaim"
+        elif t < asia.search_start:
+            asia_status = "waiting_search"
+            asia_reason = f"search opens {asia.search_start.strftime('%H:%M')} ET"
+        else:
+            asia_status = "flat"
+            asia_reason = "past Asia force flat / search end"
+
+    ar = compute_asia_range(bars, day, asia) if asia.enabled and bars else None
+    setup = None
+    if ar is not None and not ar.skipped:
+        for spec in (
+            _level(
+                id="asia_high",
+                label="Asia high",
+                price=ar.high,
+                strategy="asia",
+                kind="range",
+                color="#a371f7",
+                desc="Asia range high (20:00–00:00 ET) — BSL pool",
+                width=2,
+            ),
+            _level(
+                id="asia_low",
+                label="Asia low",
+                price=ar.low,
+                strategy="asia",
+                kind="range",
+                color="#a371f7",
+                desc="Asia range low (20:00–00:00 ET) — SSL pool",
+                width=2,
+            ),
+            _level(
+                id="asia_eq",
+                label="Asia EQ",
+                price=ar.eq,
+                strategy="asia",
+                kind="eq",
+                color="#8b98a9",
+                desc="Asia equilibrium (mid) — bias proxy",
+                dash=[2, 4],
+            ),
+        ):
+            if spec:
+                levels.append(spec)
+        if asia.use_ny_liquidity:
+            for spec in (
+                _level(
+                    id="ny_high",
+                    label="Prior NY high",
+                    price=ar.ny_high,
+                    strategy="asia",
+                    kind="liquidity",
+                    color="#39c5cf",
+                    desc="Prior NY RTH high — extra BSL",
+                    dash=[8, 4],
+                ),
+                _level(
+                    id="ny_low",
+                    label="Prior NY low",
+                    price=ar.ny_low,
+                    strategy="asia",
+                    kind="liquidity",
+                    color="#39c5cf",
+                    desc="Prior NY RTH low — extra SSL",
+                    dash=[8, 4],
+                ),
+            ):
+                if spec:
+                    levels.append(spec)
+        if asia.use_pd_liquidity:
+            for spec in (
+                _level(
+                    id="pd_high",
+                    label="PD high",
+                    price=ar.pd_high,
+                    strategy="asia",
+                    kind="liquidity",
+                    color="#79c0ff",
+                    desc="Previous day high — liquidity / target",
+                    dash=[8, 4],
+                ),
+                _level(
+                    id="pd_low",
+                    label="PD low",
+                    price=ar.pd_low,
+                    strategy="asia",
+                    kind="liquidity",
+                    color="#79c0ff",
+                    desc="Previous day low — liquidity / target",
+                    dash=[8, 4],
+                ),
+            ):
+                if spec:
+                    levels.append(spec)
+        setup = detect_asia_judas(bars, ar, asia, tick_size=cfg.tick_size)
+        if setup is not None:
+            asia_status = "setup"
+            asia_reason = setup.notes or f"{setup.direction.value} Judas ready"
+            for spec in (
+                _level(
+                    id="asia_entry",
+                    label=f"Asia entry ({setup.direction.value})",
+                    price=setup.entry_price,
+                    strategy="asia",
+                    kind="entry",
+                    color="#4f8cff",
+                    desc="Judas reclaim entry",
+                    dash=[2, 3],
+                    width=2,
+                ),
+                _level(
+                    id="asia_stop",
+                    label="Asia stop",
+                    price=setup.initial_stop,
+                    strategy="asia",
+                    kind="stop",
+                    color="#f85149",
+                    desc="Beyond sweep extreme + buffer",
+                    dash=[6, 4],
+                    width=2,
+                ),
+                _level(
+                    id="asia_target",
+                    label=f"Asia TP ({setup.target_label})",
+                    price=setup.target_price,
+                    strategy="asia",
+                    kind="target",
+                    color="#3fb950",
+                    desc=f"Target {setup.target_label}",
+                    dash=[6, 4],
+                    width=2,
+                ),
+                _level(
+                    id="asia_sweep",
+                    label="Sweep extreme",
+                    price=setup.sweep_extreme,
+                    strategy="asia",
+                    kind="sweep",
+                    color="#f85149",
+                    desc="Judas sweep extreme",
+                    dash=[1, 3],
+                ),
+            ):
+                if spec:
+                    levels.append(spec)
+        elif ar.skipped:
+            asia_reason = ar.skip_reason or "Asia range skipped"
+            asia_status = "skipped_range"
+    elif asia.enabled and ar is not None and ar.skipped:
+        asia_status = "skipped_range"
+        asia_reason = ar.skip_reason or "Asia range skipped"
+
+    strategies.append(
+        {
+            "id": "asia",
+            "name": "Asia Judas",
+            "armed": bool(asia.enabled),
+            "active": asia_in_search or asia_status == "setup",
+            "status": asia_status,
+            "reason": asia_reason,
+            "gmt": (
+                f"range {_et_hhmm_gmt(asia.range_start)}–{_et_hhmm_gmt(asia.range_end)} · "
+                f"search {_et_hhmm_gmt(asia.search_start)}–{_et_hhmm_gmt(asia.search_end)} · "
+                f"flat {_et_hhmm_gmt(asia.force_flat)} GMT"
+            ),
+            "desc": (
+                "Not naked ORB: sweep SSL/BSL (Asia/NY/PD) then reclaim. "
+                f"Target {asia.target_mode}, scale {int(asia.scale_fraction * 100)}%, "
+                f"EQ bias {'on' if asia.require_eq_bias else 'off'}."
+            ),
+        }
+    )
+
+    # --- London / NY 5ORB ---
+    for sess in cfg.sessions:
+        if not sess.enabled:
+            continue
+        exits = resolve_session_exits(cfg, sess)
+        max_e = resolve_session_max_entries(cfg, sess)
+        in_window = sess.or_start <= t < sess.force_flat
+        dirs = sess.entry.allowed_directions
+        dir_txt = str(dirs or "both")
+        status = "idle"
+        reason = f"OR {sess.or_start.strftime('%H:%M')}–{sess.or_end.strftime('%H:%M')} ET"
+        orb = compute_opening_range(bars, sess, day) if bars else None
+        if in_window and orb is not None and not orb.skipped:
+            status = "or_ready"
+            reason = f"OR {orb.low:.2f}–{orb.high:.2f}"
+            color = "#d29922" if sess.name == "london" else "#e3b341"
+            for spec in (
+                _level(
+                    id=f"{sess.name}_or_high",
+                    label=f"{sess.name.replace('_', ' ').title()} OR high",
+                    price=orb.high,
+                    strategy=sess.name,
+                    kind="or",
+                    color=color,
+                    desc=f"{sess.name} 5m opening range high",
+                    width=2,
+                ),
+                _level(
+                    id=f"{sess.name}_or_low",
+                    label=f"{sess.name.replace('_', ' ').title()} OR low",
+                    price=orb.low,
+                    strategy=sess.name,
+                    kind="or",
+                    color=color,
+                    desc=f"{sess.name} 5m opening range low",
+                    width=2,
+                ),
+            ):
+                if spec:
+                    levels.append(spec)
+            live = evaluate_mes_signal_live(bars, cfg=cfg, session_name=sess.name, as_of=now)
+            if live.get("ok"):
+                status = "setup"
+                plan = live.get("plan") or {}
+                reason = str(plan.get("notes") or live.get("reason") or "break/retest ready")
+                for spec in (
+                    _level(
+                        id=f"{sess.name}_entry",
+                        label=f"{sess.name} entry",
+                        price=plan.get("entry_price"),
+                        strategy=sess.name,
+                        kind="entry",
+                        color="#4f8cff",
+                        desc="5ORB retest entry",
+                        dash=[2, 3],
+                        width=2,
+                    ),
+                    _level(
+                        id=f"{sess.name}_stop",
+                        label=f"{sess.name} stop",
+                        price=plan.get("stop_price"),
+                        strategy=sess.name,
+                        kind="stop",
+                        color="#f85149",
+                        desc="OR extreme stop",
+                        dash=[6, 4],
+                        width=2,
+                    ),
+                    _level(
+                        id=f"{sess.name}_target",
+                        label=f"{sess.name} TP",
+                        price=plan.get("target_price"),
+                        strategy=sess.name,
+                        kind="target",
+                        color="#3fb950",
+                        desc=str(plan.get("target_label") or "target"),
+                        dash=[6, 4],
+                        width=2,
+                    ),
+                ):
+                    if spec:
+                        levels.append(spec)
+            else:
+                reason = str(live.get("reason") or reason)
+                if "waiting" in reason.lower() or "no break" in reason.lower():
+                    status = "searching"
+        elif in_window and orb is not None and orb.skipped:
+            status = "or_skipped"
+            reason = orb.skip_reason or "OR skipped"
+        elif in_window:
+            status = "waiting_or"
+            reason = "waiting for OR bars"
+        elif t < sess.or_start:
+            status = "waiting"
+            reason = f"opens {sess.or_start.strftime('%H:%M')} ET"
+        else:
+            status = "flat"
+            reason = "past force flat"
+
+        strategies.append(
+            {
+                "id": sess.name,
+                "name": f"{sess.name.replace('_', ' ').title()} 5ORB",
+                "armed": True,
+                "active": in_window,
+                "status": status,
+                "reason": reason,
+                "gmt": (
+                    f"OR {_et_hhmm_gmt(sess.or_start)}–{_et_hhmm_gmt(sess.or_end)} · "
+                    f"search→{_et_hhmm_gmt(sess.search_end)} · "
+                    f"flat {_et_hhmm_gmt(sess.force_flat)} GMT"
+                ),
+                "desc": (
+                    f"Break/retest OR · dirs {dir_txt} · "
+                    f"{exits.target_r}R · scale {int(exits.scale_fraction * 100)}% · "
+                    f"max entries {max_e}."
+                ),
+            }
+        )
+
+    # Open trade levels (already journaled)
+    for i, ot in enumerate(_open_trade_levels(symbol)[:3]):
+        tag = f"#{ot['trade_id']}"
+        for spec in (
+            _level(
+                id=f"open_entry_{ot['trade_id']}",
+                label=f"Entry {tag}",
+                price=ot.get("entry"),
+                strategy=str(ot.get("window") or "open"),
+                kind="entry",
+                color="#4f8cff",
+                desc=f"Open {ot.get('direction')} trade {tag}",
+                dash=[2, 3],
+                width=2 if i == 0 else 1,
+            ),
+            _level(
+                id=f"open_stop_{ot['trade_id']}",
+                label=f"SL {tag}",
+                price=ot.get("stop"),
+                strategy=str(ot.get("window") or "open"),
+                kind="stop",
+                color="#f85149",
+                desc=f"Stop {tag}",
+                dash=[6, 4],
+                width=2 if i == 0 else 1,
+            ),
+            _level(
+                id=f"open_tp_{ot['trade_id']}",
+                label=f"{ot.get('target_label') or 'TP'} {tag}",
+                price=ot.get("target"),
+                strategy=str(ot.get("window") or "open"),
+                kind="target",
+                color="#3fb950",
+                desc=f"Target {tag}",
+                dash=[6, 4],
+                width=2 if i == 0 else 1,
+            ),
+        ):
+            if spec:
+                levels.append(spec)
+
+    active = [s for s in strategies if s.get("active")]
+    schedule_parts = [f"{s['name']}: {s['gmt']}" for s in strategies if s.get("armed")]
+    return {
+        "now_et": et.strftime("%Y-%m-%d %H:%M %Z"),
+        "now_gmt": et.astimezone(pytz.UTC).strftime("%H:%M GMT"),
+        "strategies": strategies,
+        "active_count": len(active),
+        "levels": levels,
+        "schedule_gmt": " · ".join(schedule_parts),
+        "summary": (
+            f"{len(active)} active now · "
+            + "; ".join(f"{s['name']} ({s['status']})" for s in active)
+            if active
+            else "no strategy window open"
+        ),
+    }
+
+
 def _equity_curve(pnls: list[float], starting: float = 0.0) -> list[dict]:
     equity = starting
     curve = [{"i": 0, "equity": round(equity, 2)}]
@@ -303,7 +876,7 @@ class AutoTrader:
     window and, if a break/retest passes risk gates, places it (paper) via
     the shared engine.
 
-    Safety: refuses to *start* against a LIVE account.
+    Safety: refuses LIVE autotrade unless LIVE_AUTOTRADE_CONFIRM is set.
     """
 
     MIN_INTERVAL = 10.0
@@ -376,11 +949,14 @@ class AutoTrader:
         if self.running:
             return {"ok": False, "error": "Auto-trading is already running.", **self.status()}
         settings = get_settings()
-        if settings.trading_environment() == "LIVE":
+        if settings.trading_environment() == "LIVE" and not settings.live_autotrade_enabled:
             return {
                 "ok": False,
-                "error": "Auto-trading is disabled for LIVE accounts as a safety "
-                         "measure. Set ACCOUNT_MODE=paper to use it.",
+                "error": (
+                    "LIVE auto-trading is locked. Set ACCOUNT_MODE=live, "
+                    "LIVE_TRADING_CONFIRM=I_UNDERSTAND_THE_RISK, and "
+                    "LIVE_AUTOTRADE_CONFIRM=I_ENABLE_LIVE_AUTOTRADE — or use paper."
+                ),
             }
         self.symbol = (symbol or get_settings().default_symbol or "MES").upper()
         from core.strategy.mes_5orb.markets import coerce_futures_symbol
@@ -399,14 +975,28 @@ class AutoTrader:
         self.started_at = utcnow().isoformat()
         self.cycles = 0
         self.trades_placed = 0
-        self.per_window_limit = settings.max_open_positions_per_window
+        # Match live mes_5orb.json max entries per OR window (not the old 3/window SPY cap).
+        clear_mes_5orb_config_cache()
+        mes_cfg = load_mes_5orb_config(self.symbol)
+        self.per_window_limit = max(int(mes_cfg.risk.max_entries_per_session), 1)
         self._placed_counts.clear()
+        env_label = settings.trading_environment()
+        data_label = (
+            "demo data"
+            if demo
+            else ("live IBKR data" if env_label == "LIVE" else "live paper data")
+        )
         self._add_log(
             f"Auto-trading started - {self.symbol} / {self.window}, "
-            f"risk {self.risk_pct:.0f}%, "
-            f"{'demo data' if demo else 'live paper data'}, every {self.interval:.0f}s "
-            f"(up to {self.per_window_limit} per window, "
-            f"{settings.max_open_positions}/day).",
+            f"risk {self.risk_pct:.0f}%, {data_label}, every {self.interval:.0f}s "
+            f"(up to {self.per_window_limit} per window from mes_5orb.json, "
+            f"{settings.max_open_positions}/day"
+            + (
+                f", LIVE_MAX_CONTRACTS={settings.live_max_contracts}"
+                if env_label == "LIVE"
+                else ""
+            )
+            + ").",
             "start",
         )
         for w in SessionWindow:
@@ -494,10 +1084,10 @@ class AutoTrader:
         # Falling back to New York outside its cash session would keep scoring
         # yesterday's bars (and never fill).
         if not self.demo and self.window.lower() in ("auto", "active", "current"):
-            live = active_window()
+            live = active_window(market_now())
             if live is None:
                 self._add_log(
-                    f"No session window is open ({describe_windows_gmt()}). Waiting.",
+                    f"No session window is open ({describe_windows_gmt(market_now())}). Waiting.",
                     "muted",
                 )
                 return
@@ -546,11 +1136,16 @@ class AutoTrader:
             self._placed_counts[key] = placed_here + 1
             self.trades_placed += 1
             plan = result.get("plan", {})
+            entry = plan.get("entry_price")
+            stop = plan.get("stop_loss_price") or plan.get("stop_price")
+            target = plan.get("target_price")
+            tlabel = plan.get("target_label") or "TP"
+            session = plan.get("session_name") or win
             self._add_log(
-                f"PLACED trade #{result['trade_id']} - {plan.get('spread_type','')} "
-                f"{plan.get('direction','')} x{plan.get('contracts','')} "
-                f"({result.get('environment','')}; "
-                f"{format_strategy(preview.get('strategy') or {})}).",
+                f"PLACED trade #{result['trade_id']} {plan.get('symbol') or self.symbol} "
+                f"{plan.get('direction','').upper()} x{plan.get('contracts','')} "
+                f"{session} entry {entry} stop {stop} {tlabel} {target} "
+                f"({result.get('environment','')}).",
                 "trade",
             )
         else:
@@ -592,10 +1187,35 @@ async def _run_session_exits() -> None:
         for row in closed:
             pnl = row.get("pnl") or 0.0
             _autotrader._add_log(
-                f"CLOSED journal #{row.get('trade_id')} {row.get('reason')} "
-                f"pnl {pnl:+.2f} ({row.get('window')})"
+                f"CLOSED journal #{row.get('trade_id')} {row.get('symbol') or ''} "
+                f"{row.get('window')} {row.get('reason')} "
+                f"exit {row.get('exit_price')} pnl {pnl:+.2f}"
                 f"{' IBKR flattened' if row.get('ibkr') else ''}.",
                 "trade" if pnl >= 0 else "warn",
+            )
+
+    # Live: flag journal vs broker qty mismatches (no auto-flatten).
+    settings = get_settings()
+    if settings.is_live and opens:
+        try:
+            report = await reconcile_open_futures_vs_ibkr(_db)
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("futures reconcile: %s", exc)
+            return
+        for mismatch in report.get("mismatches") or []:
+            if mismatch.get("error"):
+                _autotrader._add_log(
+                    f"RECONCILE {mismatch.get('symbol')}: {mismatch['error']}",
+                    "warn",
+                )
+                continue
+            _autotrader._add_log(
+                f"RECONCILE MISMATCH {mismatch.get('symbol')}: "
+                f"journal_net={mismatch.get('journal_net')} "
+                f"broker={mismatch.get('broker_qty')} "
+                f"delta={mismatch.get('delta')} "
+                f"ids={mismatch.get('open_trade_ids')}",
+                "error",
             )
 
 
@@ -644,23 +1264,56 @@ async def api_summary(_request: Request) -> JSONResponse:
         "session_hours_gmt": describe_windows_gmt(),
         "strategy_by_window": strategy_by_window(settings.default_symbol, _db),
         "mes_params": _mes_params_payload(settings.default_symbol, _db),
+        "live_stack": None,
     }
+    # Lightweight live-stack schedule (no bars) for autotrade caption.
+    try:
+        clear_mes_5orb_config_cache()
+        mes_cfg = load_mes_5orb_config(settings.default_symbol)
+        asia = mes_cfg.asia_range
+        parts: list[str] = []
+        if asia.enabled:
+            parts.append(
+                f"Asia Judas range {_et_hhmm_gmt(asia.range_start)}–{_et_hhmm_gmt(asia.range_end)} "
+                f"search {_et_hhmm_gmt(asia.search_start)}–{_et_hhmm_gmt(asia.search_end)} "
+                f"flat {_et_hhmm_gmt(asia.force_flat)} GMT "
+                f"(sweep+reclaim, not naked ORB; scale {int(asia.scale_fraction * 100)}%)"
+            )
+        for sess in mes_cfg.sessions:
+            if not sess.enabled:
+                continue
+            exits = resolve_session_exits(mes_cfg, sess)
+            dir_txt = str(sess.entry.allowed_directions or "both")
+            parts.append(
+                f"{sess.name.replace('_', ' ').title()} OR "
+                f"{_et_hhmm_gmt(sess.or_start)}–{_et_hhmm_gmt(sess.or_end)} "
+                f"flat {_et_hhmm_gmt(sess.force_flat)} GMT · {dir_txt} · "
+                f"{exits.target_r}R/{int(exits.scale_fraction * 100)}%"
+            )
+        payload["live_stack"] = {
+            "schedule_gmt": " · ".join(parts),
+            "enabled_sessions": [s.name for s in mes_cfg.sessions if s.enabled],
+            "asia_enabled": bool(asia.enabled),
+        }
+        if parts:
+            payload["session_hours_gmt"] = " · ".join(parts)
+    except Exception as exc:  # noqa: BLE001 — UI caption only
+        _log.debug("live_stack caption failed: %s", exc)
     connected, acct, note = await _ibkr_fetch("account", lambda ib: ib.account_summary())
     payload["ibkr_connected"] = connected
     if connected:
         payload["ibkr"] = acct
     else:
         payload["ibkr_note"] = note
-    opens = _db.query_trades(status=TradeStatus.OPEN, limit=1000)
+    opens = _mes_trades(_db.query_trades(status=TradeStatus.OPEN, limit=1000))
     try:
         spots = await asyncio.wait_for(
             _spot_by_symbol({t.symbol for t in opens}), timeout=4.0
         )
     except TimeoutError:
         spots = {}
-    paper = paper_account_snapshot(
-        _db,
-        spots,
+    paper = _mes_paper_snapshot(
+        spots=spots,
         starting_capital=settings.starting_capital,
         environment=rm.environment(),
     )
@@ -670,13 +1323,17 @@ async def api_summary(_request: Request) -> JSONResponse:
         rm.risk_budget_per_trade(preferred, equity=equity), 2
     )
     payload["equity_for_sizing"] = round(equity, 2)
+    payload["dashboard_symbol"] = _DASHBOARD_SYMBOL
+    payload["open_positions"] = len(opens)
     return JSONResponse(payload)
 
 
 async def api_trades(request: Request) -> JSONResponse:
     limit = int(request.query_params.get("limit", "500"))
     status = request.query_params.get("status")
-    open_paper = _db.query_trades(status=TradeStatus.OPEN, environment="PAPER", limit=100)
+    open_paper = _mes_trades(
+        _db.query_trades(status=TradeStatus.OPEN, environment="PAPER", limit=100)
+    )
     seen: set[str] = set()
     for t in open_paper:
         if t.symbol in seen:
@@ -687,15 +1344,19 @@ async def api_trades(request: Request) -> JSONResponse:
             close_open_paper_trades(_db, t.symbol, bars)
         except IBKRUnavailable:
             continue
-    trades = _db.query_trades(
-        status=TradeStatus(status.lower()) if status else None, limit=limit
-    )
+    trades = _mes_trades(
+        _db.query_trades(
+            status=TradeStatus(status.lower()) if status else None,
+            limit=max(limit * 5, 500),
+        )
+    )[:limit]
     spots = await _spot_by_symbol(
         {t.symbol for t in trades if t.status is TradeStatus.OPEN}
     )
     return JSONResponse(
         {
             "count": len(trades),
+            "symbol": _DASHBOARD_SYMBOL,
             "trades": [
                 _with_mark(t, spots) if t.status is TradeStatus.OPEN else t.model_dump(mode="json")
                 for t in trades
@@ -706,7 +1367,7 @@ async def api_trades(request: Request) -> JSONResponse:
 
 async def api_performance(_request: Request) -> JSONResponse:
     settings = get_settings()
-    closed = _db.query_trades(status=TradeStatus.CLOSED, limit=100000)
+    closed = _mes_trades(_db.query_trades(status=TradeStatus.CLOSED, limit=100000))
     closed_sorted = sorted(
         [t for t in closed if t.pnl is not None],
         key=lambda t: (t.closed_at or t.created_at),
@@ -728,11 +1389,12 @@ async def api_performance(_request: Request) -> JSONResponse:
             }
         )
 
-    opens = _db.query_trades(status=TradeStatus.OPEN, environment="PAPER", limit=1000)
+    opens = _mes_trades(
+        _db.query_trades(status=TradeStatus.OPEN, environment="PAPER", limit=1000)
+    )
     spots = await _spot_by_symbol({t.symbol for t in opens})
-    paper = paper_account_snapshot(
-        _db,
-        spots,
+    paper = _mes_paper_snapshot(
+        spots=spots,
         starting_capital=settings.starting_capital,
         environment=settings.trading_environment(),
     )
@@ -783,16 +1445,17 @@ async def api_performance(_request: Request) -> JSONResponse:
 async def api_revenue_daily(_request: Request) -> JSONResponse:
     """Realised P&L grouped by UTC calendar day (revenue tracker)."""
     settings = get_settings()
-    closed = _db.query_trades(status=TradeStatus.CLOSED, limit=100000)
+    closed = _mes_trades(_db.query_trades(status=TradeStatus.CLOSED, limit=100000))
     closed_sorted = sorted(
         [t for t in closed if t.pnl is not None],
         key=lambda t: (t.closed_at or t.created_at),
     )
-    opens = _db.query_trades(status=TradeStatus.OPEN, environment="PAPER", limit=1000)
+    opens = _mes_trades(
+        _db.query_trades(status=TradeStatus.OPEN, environment="PAPER", limit=1000)
+    )
     spots = await _spot_by_symbol({t.symbol for t in opens})
-    paper = paper_account_snapshot(
-        _db,
-        spots,
+    paper = _mes_paper_snapshot(
+        spots=spots,
         starting_capital=settings.starting_capital,
         environment=settings.trading_environment(),
     )
@@ -802,38 +1465,52 @@ async def api_revenue_daily(_request: Request) -> JSONResponse:
     )
     payload["currency"] = settings.account_currency
     payload["starting_capital"] = settings.starting_capital
+    payload["symbol"] = _DASHBOARD_SYMBOL
     return JSONResponse(payload)
 
 
 async def api_positions(_request: Request) -> JSONResponse:
-    open_trades = _db.query_trades(status=TradeStatus.OPEN, limit=1000)
+    open_trades = _mes_trades(_db.query_trades(status=TradeStatus.OPEN, limit=1000))
     spots = await _spot_by_symbol({t.symbol for t in open_trades})
     marked = [_with_mark(t, spots) for t in open_trades]
+    paper = _mes_paper_snapshot(
+        spots=spots,
+        starting_capital=get_settings().starting_capital,
+        environment=get_settings().trading_environment(),
+    )
     payload: dict = {
         "open_trades": marked,
         "count": len(marked),
+        "symbol": _DASHBOARD_SYMBOL,
         "open_unrealized_pnl": round(
             sum(t.get("unrealized_pnl") or 0.0 for t in marked), 2
         ),
-        "paper_equity": paper_account_snapshot(
-            _db,
-            spots,
-            starting_capital=get_settings().starting_capital,
-            environment=get_settings().trading_environment(),
-        )["paper_equity"],
+        "paper_equity": paper["paper_equity"],
         "spots": spots,
     }
     connected, positions, note = await _ibkr_fetch("positions", lambda ib: ib.positions())
     payload["ibkr_connected"] = connected
-    payload["ibkr_positions"] = positions if connected else []
+    # Only show MES futures positions from IBKR when connected.
+    if connected and isinstance(positions, list):
+        payload["ibkr_positions"] = [
+            p
+            for p in positions
+            if _is_dashboard_symbol(str((p or {}).get("symbol") or ""))
+            or str((p or {}).get("symbol") or "").upper().startswith("MES")
+        ]
+    else:
+        payload["ibkr_positions"] = []
     if not connected:
         payload["ibkr_note"] = note
     return JSONResponse(payload)
 
 
 async def api_signals(request: Request) -> JSONResponse:
+    """Live MES stack signals: Asia Judas + enabled London/NY 5ORB sessions."""
     settings = get_settings()
-    symbol = request.query_params.get("symbol", settings.default_symbol)
+    symbol = coerce_futures_symbol(
+        request.query_params.get("symbol", settings.default_symbol)
+    )
     use_synthetic = request.query_params.get("use_synthetic", "false").lower() == "true"
     seed = int(request.query_params.get("seed", "1"))
 
@@ -851,22 +1528,54 @@ async def api_signals(request: Request) -> JSONResponse:
             {"error": str(exc), "hint": "Toggle 'Demo data' on, or start IB Gateway."}
         )
 
-    signals = []
-    for w in SessionWindow:
-        cfg, found = resolve_trading_config(symbol, w, _db)
-        sig = compute_orb_signal(symbol, w, bars, cfg)
-        payload = sig.model_dump(mode="json")
-        payload["strategy"] = strategy_payload(cfg, found)
-        signals.append(payload)
+    overlay = _live_stack_overlay(symbol, bars)
+    signals: list[dict[str, Any]] = []
+    for strat in overlay.get("strategies") or []:
+        if not strat.get("armed"):
+            continue
+        sid = str(strat["id"])
+        live = evaluate_mes_signal_live(bars, cfg=load_mes_5orb_config(symbol), session_name=sid)
+        plan = live.get("plan") or {}
+        signals.append(
+            {
+                "window": sid,
+                "name": strat.get("name"),
+                "direction": plan.get("direction") or live.get("direction") or "neutral",
+                "breakout": bool(live.get("ok")),
+                "strength": 1.0 if live.get("ok") else 0.0,
+                "regime": "trend",
+                "range_low": plan.get("or_low") or plan.get("asia_low"),
+                "range_high": plan.get("or_high") or plan.get("asia_high"),
+                "last_price": plan.get("entry_price"),
+                "as_of": plan.get("as_of") or overlay.get("now_et"),
+                "status": strat.get("status"),
+                "reason": live.get("reason") or strat.get("reason"),
+                "gmt": strat.get("gmt"),
+                "desc": strat.get("desc"),
+                "active": strat.get("active"),
+                "strategy": {
+                    "label": strat.get("name"),
+                    "entry_model": "asia_judas" if sid == "asia" else "mes_5orb",
+                },
+            }
+        )
     return JSONResponse(
-        {"symbol": symbol, "data_source": source, "warning": warning, "signals": signals}
+        {
+            "symbol": symbol,
+            "data_source": source,
+            "warning": warning,
+            "signals": signals,
+            "live_stack": overlay,
+        }
     )
 
 
 async def api_ticker(request: Request) -> JSONResponse:
-    """Recent 5-minute OHLCV for a live ticker chart, plus the current OR overlay."""
+    """Recent 5-minute OHLCV for a live ticker chart, plus strategy level overlays."""
     settings = get_settings()
-    symbol = request.query_params.get("symbol", settings.default_symbol)
+    symbol = coerce_futures_symbol(
+        request.query_params.get("symbol", settings.default_symbol)
+    )
     demo = request.query_params.get("use_synthetic", "false").lower() == "true"
     try:
         hours = int(request.query_params.get("hours", "24") or 24)
@@ -889,27 +1598,52 @@ async def api_ticker(request: Request) -> JSONResponse:
     recent = [b for b in bars if as_naive_utc(b.ts) >= cutoff] or bars[-400:]
     recent = recent[-500:]
 
-    win = active_window()
+    overlay = _live_stack_overlay(symbol, bars)
+    # Backward-compat single OR payload: prefer active ORB session range.
     range_payload = None
-    if win is not None and bars:
-        cfg, _found = resolve_trading_config(symbol, win, _db)
-        sig = compute_orb_signal(symbol, win, bars, cfg)
-        if sig.range_high > 0:
+    for lvl_high, lvl_low, win in (
+        ("london_or_high", "london_or_low", "london"),
+        ("new_york_or_high", "new_york_or_low", "new_york"),
+        ("asia_high", "asia_low", "asia"),
+    ):
+        by_id = {lv["id"]: lv for lv in overlay.get("levels") or []}
+        hi = by_id.get(lvl_high)
+        lo = by_id.get(lvl_low)
+        if hi and lo:
             range_payload = {
-                "window": win.value,
-                "low": sig.range_low,
-                "high": sig.range_high,
-                "last": sig.last_price,
+                "window": win,
+                "low": lo["price"],
+                "high": hi["price"],
+                "last": recent[-1].close if recent else None,
             }
+            # Prefer currently active strategy for the legacy OR field.
+            active_ids = {
+                s["id"] for s in (overlay.get("strategies") or []) if s.get("active")
+            }
+            if win in active_ids or range_payload is not None:
+                if win in active_ids:
+                    break
 
     last = recent[-1] if recent else None
     prev = recent[-2] if len(recent) > 1 else last
+    open_levels = _open_trade_levels(symbol)
+    from core.timeutils import market_data_lag
+
+    lag = market_data_lag()
+    lag_minutes = round(lag.total_seconds() / 60.0, 1) if lag.total_seconds() > 0 else 0.0
+    bar_lag_minutes = None
+    if last is not None:
+        bar_lag_minutes = round(
+            (utcnow() - as_naive_utc(last.ts)).total_seconds() / 60.0, 1
+        )
     return JSONResponse(
         {
             "symbol": symbol.upper(),
             "data_source": source,
             "warning": warning,
             "hours": hours,
+            "market_data_lag_minutes": lag_minutes,
+            "bar_lag_minutes": bar_lag_minutes,
             "last": None
             if last is None
             else {
@@ -918,6 +1652,10 @@ async def api_ticker(request: Request) -> JSONResponse:
                 "change": round(last.close - prev.close, 4) if prev else 0.0,
             },
             "range": range_payload,
+            "open_trades": open_levels,
+            "live_stack": overlay,
+            "levels": overlay.get("levels") or [],
+            "strategies": overlay.get("strategies") or [],
             "bars": [
                 {
                     "t": b.ts.isoformat(),
@@ -956,8 +1694,24 @@ async def api_backtest(request: Request) -> JSONResponse:
         )
 
     clear_mes_5orb_config_cache()
-    cfg, _chosen = resolve_mes_5orb_config(symbol, _db)
+    # Align with Live Month PnL: JSON defaults (opens-only / London shorts /
+    # Asia Wed–Fri / 2.5R), not DB optimiser overlays. Optional query knobs
+    # still apply for what-if runs.
+    cfg = load_mes_5orb_config(symbol)
+    custom = _parse_mes_custom_params(q, symbol=symbol)
+    if custom:
+        cfg = apply_mes_opt_params(cfg, custom)
     bars = _filter_bars_for_window(bars, window)
+
+    # Match report_daily_pnl_opt: keep last ~lookback calendar days in ET.
+    from core.strategy.mes_5orb.opening_range import to_et
+
+    if bars and lookback_days <= 35:
+        last_et = to_et(bars[-1].ts).date()
+        start = last_et - timedelta(days=lookback_days - 1)
+        clipped = [b for b in bars if to_et(b.ts).date() >= start]
+        if clipped:
+            bars = clipped
 
     def _run():
         bt = run_mes_5orb_backtest(bars, cfg=cfg)
@@ -968,6 +1722,18 @@ async def api_backtest(request: Request) -> JSONResponse:
         metrics = summarize(pnls) if pnls else combined
         if "monte_carlo" not in metrics and pnls:
             metrics = {**metrics, "monte_carlo": monte_carlo(pnls)}
+        # Prefer backtest combined PF / expectancy when summarize differs.
+        for k in (
+            "profit_factor",
+            "expectancy",
+            "win_rate",
+            "total_pnl",
+            "max_drawdown",
+            "wins",
+            "losses",
+        ):
+            if combined.get(k) is not None:
+                metrics[k] = combined[k]
         payload = {
             "window": window.value,
             "params": {
@@ -976,11 +1742,14 @@ async def api_backtest(request: Request) -> JSONResponse:
                 "point_value": cfg.point_value,
                 "tick_size": cfg.tick_size,
                 "risk_pct": cfg.risk.risk_pct,
+                "source": "custom" if custom else "defaults",
             },
+            "config": summary.get("config") or mes_live_config_snapshot(cfg),
             "num_trades": len(trades_ui),
             "metrics": metrics,
             "trades": trades_ui,
             "by_session": summary.get("by_session") or {},
+            "by_day": summary.get("by_day") or [],
             "score": round(_mes_score(metrics), 4),
             "equity_curve": _equity_curve(pnls),
             "data_source": source,
@@ -988,6 +1757,7 @@ async def api_backtest(request: Request) -> JSONResponse:
             "symbol": symbol,
             "lookback_days": lookback_days,
             "bars_analysed": len(bars),
+            "aligns_with": "live_month_pnl_1_lot",
         }
         if walk_forward:
             wf = walk_forward_mes_7030(bars, cfg=cfg, is_fraction=0.70)

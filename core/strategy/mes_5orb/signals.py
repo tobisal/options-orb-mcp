@@ -308,11 +308,11 @@ def detect_break_retest(
             return setup
 
         if break_dir is Direction.LONG:
-            touched = bar.low <= break_level + tol and bar.low >= break_level - tol
-            held = bar.low >= break_level - tol
+            # OHLC (no ticks): level inside bar H/L counts as the retest touch.
+            touched = (bar.low - tol) <= break_level <= (bar.high + tol)
             closed_ok = bar.close >= break_level
             rej_ok = (not require_rej) or _is_rejection_long(bar)
-            if touched and held and closed_ok and rej_ok:
+            if touched and closed_ok and rej_ok:
                 entry_px = bar.close
                 setup.state = SetupState.RETESTED
                 setup.retest_bar_index = global_i
@@ -326,14 +326,13 @@ def detect_break_retest(
                     entry_price=entry_px,
                     max_stop_points=max_stop_points,
                 )
-                setup.notes = "long retest confirmed"
+                setup.notes = "long retest confirmed (OHLC range)"
                 return setup
         else:
-            touched = bar.high >= break_level - tol and bar.high <= break_level + tol
-            held = bar.high <= break_level + tol
+            touched = (bar.low - tol) <= break_level <= (bar.high + tol)
             closed_ok = bar.close <= break_level
             rej_ok = (not require_rej) or _is_rejection_short(bar)
-            if touched and held and closed_ok and rej_ok:
+            if touched and closed_ok and rej_ok:
                 entry_px = bar.close
                 setup.state = SetupState.RETESTED
                 setup.retest_bar_index = global_i
@@ -347,7 +346,7 @@ def detect_break_retest(
                     entry_price=entry_px,
                     max_stop_points=max_stop_points,
                 )
-                setup.notes = "short retest confirmed"
+                setup.notes = "short retest confirmed (OHLC range)"
                 return setup
 
     setup.state = SetupState.INVALID

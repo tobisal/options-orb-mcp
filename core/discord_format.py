@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 
@@ -194,10 +195,80 @@ def format_log_line(entry: dict[str, Any]) -> str:
     level = str(entry.get("level") or "info")
     msg = str(entry.get("msg") or "")
     t = str(entry.get("t") or "")[-8:]
+    if level == "trade":
+        upper = msg.upper()
+        if upper.startswith("PLACED") or " PLACED " in f" {upper}":
+            return clip(f"🟢 **TRADE PLACED** `{t}`\n{msg}")
+        if upper.startswith("CLOSED") or "CLOSED JOURNAL" in upper:
+            return clip(f"🔴 **TRADE CLOSED** `{t}`\n{msg}")
+        return clip(f"⚡ **TRADE** `{t}`\n{msg}")
     return f"`{t}` **{level}** {msg}"
+
+
+def format_trade_alert(trade: dict[str, Any], *, event: str) -> str:
+    """Discord alert for a journal row (open = entry fill, closed = exit fill)."""
+    tid = trade.get("id") or trade.get("trade_id") or "?"
+    symbol = trade.get("symbol") or "?"
+    window = str(trade.get("window") or "").replace("_", " ")
+    direction = str(trade.get("direction") or "").upper()
+    contracts = trade.get("contracts") or 1
+    entry = trade.get("entry_price")
+    exit_px = trade.get("exit_price")
+    pnl = trade.get("pnl")
+    status = str(trade.get("status") or "")
+    notes = str(trade.get("notes") or "")
+    plan: dict[str, Any] = {}
+    raw_plan = trade.get("plan_json")
+    if isinstance(raw_plan, dict):
+        plan = raw_plan
+    elif isinstance(raw_plan, str) and raw_plan.strip():
+        try:
+            loaded = json.loads(raw_plan)
+            if isinstance(loaded, dict):
+                plan = loaded
+        except (TypeError, ValueError, json.JSONDecodeError):
+            plan = {}
+    session = plan.get("session_name") or window
+    stop = plan.get("stop_loss_price")
+    if stop is None:
+        stop = plan.get("stop_price")
+    target = plan.get("target_price")
+    target_label = plan.get("target_label") or "TP"
+    env = trade.get("environment") or ""
+
+    if event == "placed" or status == "open":
+        lines = [
+            f"🟢 **FILLED / PLACED** #{tid}  {symbol}  {direction}  x{contracts}",
+            f"Session **{session}**  ·  {env}",
+            f"Entry `{entry}`  ·  Stop `{stop}`  ·  {target_label} `{target}`",
+        ]
+        if notes:
+            lines.append(notes.split("|")[0].strip()[:160])
+        return clip("\n".join(lines))
+
+    lines = [
+        f"🔴 **CLOSED** #{tid}  {symbol}  {direction}  x{contracts}",
+        f"Session **{session}**  ·  pnl {_sign(pnl if isinstance(pnl, (int, float)) else None)}",
+        f"Entry `{entry}` → exit `{exit_px}`",
+    ]
+    if notes:
+        # Prefer exit= reason fragment when present.
+        exit_bit = ""
+        for part in notes.split("|"):
+            part = part.strip()
+            if part.startswith("exit="):
+                exit_bit = part
+                break
+        lines.append(exit_bit or notes.split("|")[0].strip()[:160])
+    return clip("\n".join(lines))
 
 
 def should_relay_log(entry: dict[str, Any], *, verbose: bool) -> bool:
     if verbose:
         return True
-    return str(entry.get("level") or "") in {"trade", "error", "warn", "start", "stop"}
+    level = str(entry.get("level") or "")
+    msg = str(entry.get("msg") or "").upper()
+    # Place / fill alerts are owned by the journal trade pump (richer format).
+    if level == "trade" and (msg.startswith("PLACED") or msg.startswith("CLOSED")):
+        return False
+    return level in {"trade", "error", "warn", "start", "stop"}

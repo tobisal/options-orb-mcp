@@ -161,8 +161,11 @@ def _journal_close(
         _append_exit_note(db, trade.id, db_update_notes)
     return {
         "trade_id": trade.id,
+        "symbol": trade.symbol,
+        "direction": trade.direction.value,
         "reason": reason,
         "exit_price": round(exit_price, 4),
+        "entry_price": trade.entry_price,
         "pnl": pnl,
         "window": trade.window.value,
         "ibkr": False,

@@ -10,6 +10,7 @@ from typing import Any
 
 from core.config import REPO_ROOT
 from core.strategy.mes_5orb.asia_range import AsiaRangeConfig, asia_config_from_raw
+from core.strategy.mes_5orb.regime import RegimeFilterConfig, regime_config_from_raw
 from core.strategy.mes_5orb.markets import (
     DEFAULT_FUTURES_SYMBOL,
     coerce_futures_symbol,
@@ -126,6 +127,7 @@ class Mes5OrbConfig:
     exits: ExitPolicyConfig = field(default_factory=ExitPolicyConfig)
     risk: MesRiskConfig = field(default_factory=MesRiskConfig)
     asia_range: AsiaRangeConfig = field(default_factory=AsiaRangeConfig)
+    regime: RegimeFilterConfig = field(default_factory=RegimeFilterConfig)
 
     def session(self, name: str) -> MesSession | None:
         key = name.lower().replace(" ", "_")
@@ -306,6 +308,7 @@ def load_mes_5orb_config(symbol: str | None = None) -> Mes5OrbConfig:
     exits_raw = raw.get("exits") or {}
     risk = raw.get("risk") or {}
     asia = asia_config_from_raw(raw.get("asia_range") or {})
+    regime = regime_config_from_raw(raw.get("regime") or {})
     global_exits = _exit_policy_from_raw(
         {
             **exits_raw,
@@ -339,6 +342,7 @@ def load_mes_5orb_config(symbol: str | None = None) -> Mes5OrbConfig:
             max_entries_per_session=max(int(risk.get("max_entries_per_session", 2)), 1),
         ),
         asia_range=asia,
+        regime=regime,
     )
 
 
@@ -415,6 +419,29 @@ def apply_mes_opt_params(cfg: Mes5OrbConfig, params: dict[str, Any] | None) -> M
     if asia_kw:
         asia = replace(asia, **asia_kw)
 
+    regime = cfg.regime
+    regime_kw: dict[str, Any] = {}
+    if params.get("regime_enabled") is not None:
+        regime_kw["enabled"] = bool(params["regime_enabled"])
+    if params.get("regime_allowed_structures") is not None:
+        regime_kw["allowed_structures"] = tuple(
+            str(s).lower() for s in params["regime_allowed_structures"]
+        )
+    if params.get("regime_allowed_vol") is not None:
+        regime_kw["allowed_vol"] = tuple(
+            str(v).lower() for v in params["regime_allowed_vol"]
+        )
+    if params.get("regime_allowed_biases") is not None:
+        regime_kw["allowed_biases"] = tuple(
+            str(b).lower() for b in params["regime_allowed_biases"]
+        )
+    if params.get("regime_require_trend_align") is not None:
+        regime_kw["require_trend_align"] = bool(params["regime_require_trend_align"])
+    if params.get("regime_skip_flat") is not None:
+        regime_kw["skip_flat"] = bool(params["regime_skip_flat"])
+    if regime_kw:
+        regime = replace(regime, **regime_kw)
+
     tol = params.get("tolerance_ticks")
     rej = params.get("require_rejection_candle")
     timeout = params.get("timeout_bars")
@@ -466,6 +493,19 @@ def apply_mes_opt_params(cfg: Mes5OrbConfig, params: dict[str, Any] | None) -> M
         ):
             base_ex = sess.exits if sess.exits is not None else exits
             sess = replace(sess, exits=_apply_exit_knobs(base_ex, params, prefix=prefix))
+
+        dirs = params.get(f"{prefix}allowed_directions")
+        if dirs is not None:
+            d = str(dirs).lower().strip()
+            if d in ("both", "long", "short"):
+                sess = replace(sess, entry=replace(sess.entry, allowed_directions=d))
         updated.append(sess)
 
-    return replace(cfg, exits=exits, risk=risk, asia_range=asia, sessions=tuple(updated))
+    return replace(
+        cfg,
+        exits=exits,
+        risk=risk,
+        asia_range=asia,
+        regime=regime,
+        sessions=tuple(updated),
+    )

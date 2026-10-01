@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
-from typing import Any
+from typing import Any, Optional
 
 from core.backtest_mes import evaluate_mes_signal_live
 from core.config import get_settings
@@ -32,7 +32,7 @@ from core.strategy.mes_5orb.markets import (
 from core.strategy.mes_5orb.opening_range import to_et
 from core.strategy.mes_5orb.sessions import load_mes_5orb_config
 from core.strategy.mes_5orb.trailing_stop import SwingTrailingStop
-from core.timeutils import utcnow
+from core.timeutils import market_now, utcnow
 
 
 def resolve_window(window: str) -> SessionWindow:
@@ -148,26 +148,69 @@ async def build_mes_trade_plan(
     stop_points = float(plan_dict.get("stop_points") or 0)
     rm = RiskManager(db=db)
     win = _mes_session_to_window(str(plan_dict.get("session_name") or "new_york"))
-    # Size off current paper equity so risk% stays dynamic as the account grows.
-    paper = paper_account_snapshot(
-        db,
-        {},
-        starting_capital=get_settings().starting_capital,
-        environment=rm.environment(),
-    )
-    equity = float(paper.get("paper_equity") or get_settings().starting_capital)
+    settings = get_settings()
+    # Live: size off IBKR NetLiquidation. Paper: journal equity curve.
+    equity: float
+    equity_source = "paper_journal"
+    if settings.is_live and not use_synthetic:
+        try:
+            async with IBKRClient(readonly=True) as ib:
+                acct = await ib.account_summary()
+            net = acct.get("NetLiquidation")
+            if net is not None and float(net) > 0:
+                equity = float(net)
+                equity_source = "ibkr_net_liquidation"
+            else:
+                paper = paper_account_snapshot(
+                    db,
+                    {},
+                    starting_capital=settings.starting_capital,
+                    environment=rm.environment(),
+                )
+                equity = float(paper.get("paper_equity") or settings.starting_capital)
+                equity_source = "paper_journal_fallback"
+        except IBKRUnavailable:
+            return {
+                "ok": False,
+                "reason": "LIVE sizing requires IBKR NetLiquidation; Gateway offline.",
+                "signal": {k: v for k, v in signal.items() if k != "mes_plan"},
+                "data_source": source,
+                "warning": warning,
+                "strategy": strategy,
+            }
+    else:
+        paper = paper_account_snapshot(
+            db,
+            {},
+            starting_capital=settings.starting_capital,
+            environment=rm.environment(),
+        )
+        equity = float(paper.get("paper_equity") or settings.starting_capital)
+
+    requested = int(cfg.risk.contracts)
+    if settings.is_live:
+        requested = min(requested, max(int(settings.live_max_contracts), 1))
+
     decision = rm.pre_trade_checks_futures(
         stop_points,
         point_value=cfg.point_value,
-        requested_contracts=cfg.risk.contracts,
+        requested_contracts=requested,
         max_concurrent=cfg.risk.max_concurrent,
         window=win,
         risk_pct=effective_risk,
         equity=equity,
     )
+    if settings.is_live and decision.contracts > settings.live_max_contracts:
+        decision.contracts = max(int(settings.live_max_contracts), 0)
+        if decision.contracts <= 0:
+            decision.approved = False
+            decision.reasons.append(
+                f"LIVE_MAX_CONTRACTS={settings.live_max_contracts} blocks sizing."
+            )
     plan_dict["contracts"] = decision.contracts
     plan_dict["risk_pct"] = effective_risk
     plan_dict["equity_for_sizing"] = round(equity, 2)
+    plan_dict["equity_source"] = equity_source
     plan_dict["max_loss_usd"] = round(
         stop_points * cfg.point_value * max(decision.contracts, 0), 2
     )
@@ -196,6 +239,7 @@ async def build_mes_trade_plan(
         "strategy": strategy,
         "instrument": "future",
         "entry_model": "mes_5orb",
+        "equity_source": equity_source,
     }
 
 
@@ -254,11 +298,27 @@ async def place_trade_plan(
 
     simulate = preview.get("data_source") == "synthetic" or use_synthetic
     side = "BUY" if direction is Direction.LONG else "SELL"
+    target_price = (
+        float(plan_dict["target_price"])
+        if plan_dict.get("target_price") is not None
+        else None
+    )
+    # Full-scale targets can sit on the broker as OCA TP; half-scale keeps TP
+    # in software so the runner can be managed after the scale.
+    scale_frac = float(plan_dict.get("scale_fraction") or 0.5)
+    broker_tp = target_price if (target_price is not None and scale_frac >= 0.999) else None
 
     if simulate:
+        if settings.is_live:
+            return {"ok": False, "error": "Refusing simulated fills while ACCOUNT_MODE=live."}
         order_ref = f"SIM-{symbol}-{utcnow():%Y%m%d%H%M%S}"
         environment = f"{settings.trading_environment()}(sim)"
-        placement: dict[str, Any] = {"simulated": True, "order_ref": order_ref}
+        placement: dict[str, Any] = {
+            "simulated": True,
+            "order_ref": order_ref,
+            "avg_fill_price": entry_price,
+            "filled_qty": float(contracts),
+        }
     else:
         try:
             async with IBKRClient(readonly=False) as ib:
@@ -268,6 +328,8 @@ async def place_trade_plan(
                     contracts=contracts,
                     stop_price=stop_price,
                     entry_limit=None,
+                    take_profit_price=broker_tp,
+                    fill_timeout=float(settings.live_fill_timeout_seconds or 15.0),
                 )
             if not placement.get("ok"):
                 return {
@@ -277,8 +339,17 @@ async def place_trade_plan(
                 }
             order_ref = placement["order_ref"]
             environment = settings.trading_environment()
+            fill_px = placement.get("avg_fill_price")
+            if fill_px is not None and float(fill_px) > 0:
+                entry_price = float(fill_px)
+            fill_qty = placement.get("filled_qty")
+            if fill_qty is not None and float(fill_qty) > 0:
+                contracts = max(int(round(float(fill_qty))), 1)
+                plan_dict["contracts"] = contracts
+                stop_points = abs(entry_price - stop_price)
+                max_loss = stop_points * point_value * contracts
         except IBKRUnavailable as exc:
-            if settings.trading_environment() != "PAPER":
+            if settings.is_live or settings.trading_environment() != "PAPER":
                 return {"ok": False, "error": f"Order placement failed: {exc}"}
             order_ref = f"SIM-{symbol}-{utcnow():%Y%m%d%H%M%S}"
             environment = "PAPER(sim)"
@@ -286,6 +357,8 @@ async def place_trade_plan(
                 "simulated": True,
                 "order_ref": order_ref,
                 "ibkr_error": str(exc),
+                "avg_fill_price": entry_price,
+                "filled_qty": float(contracts),
             }
 
     plan_payload = dict(plan_dict)
@@ -300,6 +373,9 @@ async def place_trade_plan(
     plan_payload["scaled_out"] = False
     plan_payload["original_stop_loss_price"] = stop_price
     plan_payload["stop_loss_price"] = stop_price
+    plan_payload["broker_take_profit"] = broker_tp is not None
+    plan_payload["avg_fill_price"] = placement.get("avg_fill_price")
+    plan_payload["filled_qty"] = placement.get("filled_qty")
     if plan_dict.get("target_price") is not None:
         plan_payload["target_price"] = float(plan_dict["target_price"])
         plan_payload["target_label"] = str(plan_dict.get("target_label") or "2R")
@@ -369,7 +445,7 @@ def _mes_force_flat_due(trade: TradeRecord, cfg, now: datetime | None = None) ->
             sess = cfg.session("new_york")
     if sess is None:
         return False
-    et = to_et(now or utcnow())
+    et = to_et(now or market_now())
     return et.time() >= sess.force_flat
 
 
@@ -599,3 +675,81 @@ async def settle_session_exits(
         if owned_client and client is not None:
             await client.disconnect()
     return closed
+
+
+async def reconcile_open_futures_vs_ibkr(
+    db: Database,
+    *,
+    client: Optional[IBKRClient] = None,
+) -> dict[str, Any]:
+    """Compare open futures trades in the journal vs IBKR positions.
+
+    Does not auto-close or flatten. Returns a report for ops / Discord.
+    """
+    owned_client = client is None
+    if client is None:
+        client = IBKRClient()
+    try:
+        await client.connect()
+    except IBKRUnavailable as exc:
+        return {"ok": False, "error": str(exc), "mismatches": []}
+
+    mismatches: list[dict[str, Any]] = []
+    try:
+        open_trades = [
+            t
+            for t in db.query_trades(status=TradeStatus.OPEN, limit=200)
+            if is_ibkr_backed(t)
+        ]
+        by_symbol: dict[str, list[TradeRecord]] = {}
+        for trade in open_trades:
+            if not trade.contracts:
+                continue
+            plan = trade.plan_json or {}
+            if str(plan.get("instrument") or "").lower() != "future":
+                continue
+            sym = coerce_futures_symbol(str(plan.get("symbol") or trade.symbol or ""))
+            by_symbol.setdefault(sym, []).append(trade)
+
+        for symbol, trades in by_symbol.items():
+            try:
+                broker_qty = await client.futures_position_qty(symbol)
+            except Exception as exc:  # noqa: BLE001
+                mismatches.append(
+                    {
+                        "symbol": symbol,
+                        "error": str(exc),
+                        "journal_net": None,
+                        "broker_qty": None,
+                    }
+                )
+                continue
+
+            journal_net = 0
+            for trade in trades:
+                side = str((trade.plan_json or {}).get("side") or "").upper()
+                qty = int(trade.contracts or 0)
+                if side == "SELL":
+                    journal_net -= qty
+                else:
+                    journal_net += qty
+
+            if int(broker_qty) != int(journal_net):
+                mismatches.append(
+                    {
+                        "symbol": symbol,
+                        "journal_net": journal_net,
+                        "broker_qty": int(broker_qty),
+                        "open_trade_ids": [t.id for t in trades if t.id],
+                        "delta": int(broker_qty) - int(journal_net),
+                    }
+                )
+    finally:
+        if owned_client:
+            await client.disconnect()
+
+    return {
+        "ok": True,
+        "mismatches": mismatches,
+        "mismatch_count": len(mismatches),
+    }

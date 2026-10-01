@@ -79,11 +79,19 @@ CREATE TABLE IF NOT EXISTS active_strategy (
 
 
 def _iso(dt: datetime | None) -> str | None:
-    return dt.isoformat() if dt is not None else None
+    if dt is None:
+        return None
+    from core.timeutils import as_naive_utc
+
+    return as_naive_utc(dt).isoformat()
 
 
 def _parse_dt(s: str | None) -> datetime | None:
-    return datetime.fromisoformat(s) if s else None
+    if not s:
+        return None
+    from core.timeutils import as_naive_utc
+
+    return as_naive_utc(datetime.fromisoformat(s))
 
 
 def _path_looks_cloud_synced(path: Path) -> bool:

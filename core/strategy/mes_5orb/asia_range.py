@@ -9,6 +9,8 @@ Liquidity pools used for SSL/BSL sweeps:
 Bias proxy from price vs Asia EQ at London search open.
 Bullish: sweep any SSL pool, reclaim close back above → long.
 Bearish: sweep any BSL pool, reclaim close back below → short.
+On OHLC bars (paper or live without ticks), reclaim also fires when the
+liquidity level sits inside the candle H/L and close holds the reclaim side.
 Target: furthest opposite liquidity (or 2R). Prefer partials over aggressive trails.
 
 Refs:
@@ -411,7 +413,10 @@ def detect_asia_judas(
 
         if swept_ssl:
             reclaim = max(lvl for name, lvl in ssl if name in swept_ssl)
-            if b.close > reclaim:
+            # OHLC proxy: reclaim if close clears the level, or the bar traded
+            # back through it (level inside H/L) and closed back on the long side.
+            in_bar = b.low <= reclaim <= b.high
+            if b.close > reclaim or (in_bar and b.close >= reclaim):
                 entry = float(b.close)
                 stop = sweep_low - buf
                 risk = abs(entry - stop)
@@ -423,6 +428,7 @@ def detect_asia_judas(
                 else:
                     target, label = _opposite_target(Direction.LONG, ar)
                 names = tuple(sorted(swept_ssl))
+                how = "close" if b.close > reclaim else "OHLC range"
                 return _setup(
                     direction=Direction.LONG,
                     entry_i=i,
@@ -432,11 +438,15 @@ def detect_asia_judas(
                     label=label,
                     extreme=sweep_low,
                     names=names,
-                    notes=f"asia Judas long: SSL sweep ({', '.join(names)}) + reclaim",
+                    notes=(
+                        f"asia Judas long: SSL sweep ({', '.join(names)}) "
+                        f"+ reclaim ({how})"
+                    ),
                 )
         if swept_bsl:
             reclaim = min(lvl for name, lvl in bsl if name in swept_bsl)
-            if b.close < reclaim:
+            in_bar = b.low <= reclaim <= b.high
+            if b.close < reclaim or (in_bar and b.close <= reclaim):
                 entry = float(b.close)
                 stop = sweep_high + buf
                 risk = abs(entry - stop)
@@ -448,6 +458,7 @@ def detect_asia_judas(
                 else:
                     target, label = _opposite_target(Direction.SHORT, ar)
                 names = tuple(sorted(swept_bsl))
+                how = "close" if b.close < reclaim else "OHLC range"
                 return _setup(
                     direction=Direction.SHORT,
                     entry_i=i,
@@ -457,7 +468,10 @@ def detect_asia_judas(
                     label=label,
                     extreme=sweep_high,
                     names=names,
-                    notes=f"asia Judas short: BSL sweep ({', '.join(names)}) + reclaim",
+                    notes=(
+                        f"asia Judas short: BSL sweep ({', '.join(names)}) "
+                        f"+ reclaim ({how})"
+                    ),
                 )
 
     return None

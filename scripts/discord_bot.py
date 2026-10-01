@@ -33,6 +33,7 @@ from core.discord_format import (
     format_preview,
     format_signals,
     format_status,
+    format_trade_alert,
     format_trades,
     should_relay_log,
 )
@@ -124,8 +125,11 @@ class OrbDiscord(discord.Client):
         self.api = DashboardClient(self.settings.discord_dashboard_url)
         self._seen_logs: set[str] = set()
         self._log_primed = False
+        self._trade_state: dict[int, str] = {}
+        self._trades_primed = False
         self._owner_id: int | None = None
         self._pump_task: asyncio.Task | None = None
+        self._trade_pump_task: asyncio.Task | None = None
 
     async def login(self, token: str) -> None:
         # TCPConnector needs a running loop, so this cannot live in __init__.
@@ -151,10 +155,13 @@ class OrbDiscord(discord.Client):
             synced = await self.tree.sync()
             log.info("Synced %s global commands (can take up to an hour)", len(synced))
         self._pump_task = asyncio.create_task(self._log_pump())
+        self._trade_pump_task = asyncio.create_task(self._trade_pump())
 
     async def close(self) -> None:
         if self._pump_task is not None:
             self._pump_task.cancel()
+        if self._trade_pump_task is not None:
+            self._trade_pump_task.cancel()
         await self.api.close()
         await super().close()
 
@@ -206,6 +213,67 @@ class OrbDiscord(discord.Client):
             except Exception as exc:
                 log.warning("log pump: %s", exc)
             await asyncio.sleep(8)
+
+    async def _trade_channel(self):
+        raw = (self.settings.discord_log_channel_id or "").strip()
+        if not raw.isdigit():
+            return None
+        channel_id = int(raw)
+        channel = self.get_channel(channel_id)
+        if channel is None:
+            channel = await self.fetch_channel(channel_id)
+        return channel
+
+    async def _trade_pump(self) -> None:
+        """Alert on new journal opens (entry fill) and closes (exit fill)."""
+        await self.wait_until_ready()
+        if not (self.settings.discord_log_channel_id or "").strip().isdigit():
+            return
+        while not self.is_closed():
+            try:
+                payload = await self.api.get("/api/trades", limit=40)
+                if payload.get("error"):
+                    await asyncio.sleep(15)
+                    continue
+                channel = await self._trade_channel()
+                if channel is None:
+                    await asyncio.sleep(15)
+                    continue
+                trades = list(payload.get("trades") or [])
+                # Oldest first so alerts fire in chronological order.
+                trades.sort(key=lambda t: int(t.get("id") or 0))
+                if not self._trades_primed:
+                    for t in trades:
+                        tid = t.get("id")
+                        if tid is not None:
+                            self._trade_state[int(tid)] = str(t.get("status") or "")
+                    self._trades_primed = True
+                    await asyncio.sleep(8)
+                    continue
+                for t in trades:
+                    tid = t.get("id")
+                    if tid is None:
+                        continue
+                    tid_i = int(tid)
+                    status = str(t.get("status") or "")
+                    prev = self._trade_state.get(tid_i)
+                    if prev is None and status == "open":
+                        await channel.send(format_trade_alert(t, event="placed"))
+                    elif prev == "open" and status == "closed":
+                        await channel.send(format_trade_alert(t, event="closed"))
+                    elif prev is None and status == "closed":
+                        # Missed the open (restart / lag) — still announce the close.
+                        await channel.send(format_trade_alert(t, event="closed"))
+                    self._trade_state[tid_i] = status
+                    if len(self._trade_state) > 500:
+                        # Drop oldest ids.
+                        for old in sorted(self._trade_state)[:-300]:
+                            self._trade_state.pop(old, None)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("trade pump: %s", exc)
+            await asyncio.sleep(10)
 
 
 def register_commands(bot: OrbDiscord) -> None:
@@ -316,7 +384,7 @@ def register_commands(bot: OrbDiscord) -> None:
                 lines.append(format_log_line(entry))
         await interaction.followup.send(clip("\n".join(lines)))
 
-    @auto.command(name="start", description="Start paper auto-trade (dashboard process)")
+    @auto.command(name="start", description="Start auto-trade (dashboard process)")
     @app_commands.describe(
         symbol="MES, MNQ, MYM, M2K, ES, or NQ",
         window="auto / london / new_york",
@@ -330,9 +398,13 @@ def register_commands(bot: OrbDiscord) -> None:
     ) -> None:
         if not await guard(interaction):
             return
-        if bot.settings.trading_environment() == "LIVE":
+        if (
+            bot.settings.trading_environment() == "LIVE"
+            and not bot.settings.live_autotrade_enabled
+        ):
             await interaction.response.send_message(
-                "Refusing: ACCOUNT_MODE is LIVE. Discord only starts paper auto-trade.",
+                "Refusing: LIVE auto-trade is locked. Need "
+                "LIVE_TRADING_CONFIRM + LIVE_AUTOTRADE_CONFIRM, or use paper.",
                 ephemeral=True,
             )
             return
@@ -353,7 +425,7 @@ def register_commands(bot: OrbDiscord) -> None:
             clip("Auto-trade started.\n" + format_status({}, data))
         )
 
-    @auto.command(name="stop", description="Stop paper auto-trade")
+    @auto.command(name="stop", description="Stop auto-trade")
     async def auto_stop(interaction: discord.Interaction) -> None:
         if not await guard(interaction):
             return

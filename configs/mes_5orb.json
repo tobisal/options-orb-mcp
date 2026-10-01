@@ -1,5 +1,5 @@
 {
-  "_comment": "MES 5m ORB default (live): opens only — Asia Wed–Fri + London shorts + NY. Mid/pm off. Exits 2.5R full scale, Asia 1.5R, max 2 entries.",
+  "_comment": "MES 5m ORB: Asia daily (opt) + London shorts 2.5R/0.5 scale/HOD max1 + NY 2.5R/full/no-HOD max2.",
   "symbol": "MES",
   "exchange": "CME",
   "point_value": 5.0,
@@ -12,6 +12,7 @@
       "or_end": "03:05",
       "search_end": "05:55",
       "force_flat": "05:55",
+      "max_entries": 1,
       "opening_range": {
         "min_range_points": 0.5,
         "max_range_points": 8.0
@@ -23,6 +24,16 @@
       },
       "entry": {
         "allowed_directions": "short"
+      },
+      "exits": {
+        "stop_mode": "or_extreme",
+        "stop_buffer_ticks": 1,
+        "target_r": 2.5,
+        "target_mode": "r_multiple",
+        "scale_fraction": 0.5,
+        "use_hod_lod_target": true,
+        "move_stop_to_be": true,
+        "runner_trail": true
       }
     },
     "london_mid": {
@@ -47,6 +58,7 @@
       "or_end": "09:35",
       "search_end": "11:55",
       "force_flat": "11:55",
+      "max_entries": 2,
       "opening_range": {
         "min_range_points": 0.75,
         "max_range_points": 10.0
@@ -55,6 +67,16 @@
         "tolerance_ticks": 3,
         "timeout_bars": 24,
         "require_rejection_candle": false
+      },
+      "exits": {
+        "stop_mode": "or_extreme",
+        "stop_buffer_ticks": 1,
+        "target_r": 2.5,
+        "target_mode": "r_multiple",
+        "scale_fraction": 1.0,
+        "use_hod_lod_target": false,
+        "move_stop_to_be": true,
+        "runner_trail": true
       }
     },
     "ny_mid": {
@@ -105,7 +127,7 @@
     "use_hod_lod_target": true,
     "move_stop_to_be": true,
     "runner_trail": true,
-    "_comment": "WF opens-only opt (2026-08/09): 2.5R full scale, trail on; max 2 entries/session"
+    "_comment": "Global fallback; London/NY session exits override (NT HISTORY 90d opt)."
   },
   "risk": {
     "contracts": 20,
@@ -113,10 +135,10 @@
     "risk_pct": 5,
     "allow_reentry": true,
     "max_entries_per_session": 2,
-    "_comment": "contracts = max size from risk%; up to 2 entries per OR window after stops"
+    "_comment": "contracts = max size from risk%; per-session max_entries override when set"
   },
   "asia_range": {
-    "_comment": "ICT Asian Range Judas \u2014 session open. Enabled with London + NY opens only.",
+    "_comment": "On — NT 90d Asia opt: all weekdays, no EQ bias, NY+PD liq (no prev-session), opposite_extreme, 0.5 scale. Asia alone +$628 PF~2.56 vs baseline −$101.",
     "enabled": true,
     "range_start": "20:00",
     "range_end": "00:00",
@@ -124,7 +146,7 @@
     "ny_session_start": "09:30",
     "ny_session_end": "16:00",
     "use_pd_liquidity": true,
-    "use_prev_session_liquidity": true,
+    "use_prev_session_liquidity": false,
     "prev_session_start": "02:00",
     "prev_session_end": "08:00",
     "search_start": "02:00",
@@ -136,12 +158,16 @@
     "target_mode": "opposite_extreme",
     "target_r": 1.5,
     "scale_fraction": 0.5,
-    "require_eq_bias": true,
-    "allowed_weekdays": [
-      2,
-      3,
-      4
-    ],
-    "_weekday_comment": "Mon=0 \u2026 Sun=6. Skip Mon/Tue Asia \u2014 largest red-day drag in Aug/Sep WF."
+    "require_eq_bias": false,
+    "allowed_weekdays": null
+  },
+  "regime": {
+    "_comment": "Off — not part of the PF 1.53 NT HISTORY stack.",
+    "enabled": false,
+    "sma_period": 20,
+    "efficiency_lookback": 10,
+    "vol_lookback": 60,
+    "require_trend_align": false,
+    "skip_flat": false
   }
 }

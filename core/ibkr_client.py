@@ -751,11 +751,25 @@ class IBKRClient:
         contracts: int,
         stop_price: float,
         entry_limit: float | None = None,
+        take_profit_price: float | None = None,
+        fill_timeout: float | None = None,
     ) -> dict[str, Any]:
-        """Place futures market (or limit) entry with an attached stop."""
+        """Place futures market (or limit) entry with stop (+ optional TP) OCA.
+
+        Waits up to ``fill_timeout`` seconds for the entry to fill. On live,
+        an unfilled entry is cancelled and the call returns ok=False so the
+        journal never records a phantom position.
+        """
+        from core.config import get_settings
         from core.strategy.mes_5orb.markets import coerce_futures_symbol
 
         symbol = coerce_futures_symbol(symbol)
+        settings = get_settings()
+        timeout = float(
+            fill_timeout
+            if fill_timeout is not None
+            else getattr(settings, "live_fill_timeout_seconds", 15.0) or 15.0
+        )
         contract = await self.qualify_future(symbol)
         qty = max(int(contracts), 0)
         if qty <= 0:
@@ -771,18 +785,52 @@ class IBKRClient:
         entry.orderRef = order_ref
         entry_trade = self.ib.placeOrder(contract, entry)
 
+        # Wait for entry fill before attaching protective exits.
+        filled_qty, avg_price, status = await self._await_fill(entry_trade, timeout=timeout)
+        if filled_qty <= 0:
+            try:
+                self.ib.cancelOrder(entry_trade.order)
+            except Exception:
+                pass
+            return {
+                "ok": False,
+                "error": f"Entry not filled within {timeout:.0f}s (status={status}).",
+                "order_ref": order_ref,
+                "status": status,
+            }
+
         exit_action = "SELL" if action == "BUY" else "BUY"
-        sl = iba.StopOrder(exit_action, qty, round(float(stop_price), 2), tif="GTC")
+        exit_qty = max(int(round(filled_qty)), 1)
+        oca_group = f"{order_ref}-EXIT"
+        sl = iba.StopOrder(exit_action, exit_qty, round(float(stop_price), 2), tif="GTC")
         sl.orderRef = f"{order_ref}-STOP"
+        if take_profit_price is not None:
+            sl.ocaGroup = oca_group
+            sl.ocaType = 1
         sl_trade = self.ib.placeOrder(contract, sl)
 
-        await asyncio.sleep(0.35)
-        status = getattr(getattr(entry_trade, "orderStatus", None), "status", "Submitted")
+        tp_trade = None
+        tp_ref = None
+        if take_profit_price is not None:
+            tp = iba.LimitOrder(
+                exit_action, exit_qty, round(float(take_profit_price), 2), tif="GTC"
+            )
+            tp.orderRef = f"{order_ref}-TP"
+            tp.ocaGroup = oca_group
+            tp.ocaType = 1
+            tp_trade = self.ib.placeOrder(contract, tp)
+            tp_ref = tp.orderRef
+
+        await asyncio.sleep(0.25)
         return {
             "ok": True,
             "order_ref": order_ref,
             "status": status,
+            "filled_qty": float(filled_qty),
+            "avg_fill_price": float(avg_price) if avg_price is not None else None,
             "stop_order_ref": sl.orderRef,
+            "take_profit_order_ref": tp_ref,
+            "oca_group": oca_group if take_profit_price is not None else None,
             "contract": {
                 "symbol": contract.symbol,
                 "localSymbol": getattr(contract, "localSymbol", ""),
@@ -791,7 +839,59 @@ class IBKRClient:
             },
             "entry_trade_id": getattr(getattr(entry_trade, "order", None), "orderId", None),
             "stop_trade_id": getattr(getattr(sl_trade, "order", None), "orderId", None),
+            "tp_trade_id": (
+                getattr(getattr(tp_trade, "order", None), "orderId", None)
+                if tp_trade is not None
+                else None
+            ),
         }
+
+    async def _await_fill(
+        self, trade: Any, *, timeout: float = 15.0
+    ) -> tuple[float, float | None, str]:
+        """Poll order status until filled / cancelled / rejected or timeout."""
+        deadline = asyncio.get_event_loop().time() + max(float(timeout), 0.5)
+        status = "Submitted"
+        filled = 0.0
+        avg: float | None = None
+        while asyncio.get_event_loop().time() < deadline:
+            st = getattr(trade, "orderStatus", None)
+            status = str(getattr(st, "status", status) or status)
+            filled = float(getattr(st, "filled", 0) or 0)
+            avg_raw = getattr(st, "avgFillPrice", None)
+            try:
+                avg = float(avg_raw) if avg_raw not in (None, "", 0, 0.0) else avg
+            except (TypeError, ValueError):
+                pass
+            if filled > 0 and status.upper() in {"FILLED", "APICANCELLED", "CANCELLED"}:
+                break
+            if status.upper() in {"FILLED"}:
+                break
+            if status.upper() in {"CANCELLED", "APICANCELLED", "INACTIVE", "REJECTED"}:
+                break
+            await asyncio.sleep(0.25)
+        if filled > 0 and (avg is None or avg <= 0):
+            # Fallback: last known price on the trade fills list.
+            fills = list(getattr(trade, "fills", None) or [])
+            if fills:
+                try:
+                    avg = float(getattr(fills[-1].execution, "avgPrice", 0) or 0) or avg
+                except Exception:
+                    pass
+        return filled, avg, status
+
+    async def futures_position_qty(self, symbol: str) -> float:
+        """Net futures position size for ``symbol`` ( ContFuture / FUT )."""
+        from core.strategy.mes_5orb.markets import coerce_futures_symbol
+
+        symbol = coerce_futures_symbol(symbol)
+        pos = 0.0
+        for p in self.ib.positions():
+            if getattr(p.contract, "symbol", "") == symbol and getattr(
+                p.contract, "secType", ""
+            ) in {"FUT", "CONTFUT"}:
+                pos += float(p.position)
+        return pos
 
     async def place_mes_bracket(
         self,
@@ -800,6 +900,8 @@ class IBKRClient:
         contracts: int,
         stop_price: float,
         entry_limit: float | None = None,
+        take_profit_price: float | None = None,
+        fill_timeout: float | None = None,
     ) -> dict[str, Any]:
         return await self.place_future_bracket(
             "MES",
@@ -807,6 +909,8 @@ class IBKRClient:
             contracts=contracts,
             stop_price=stop_price,
             entry_limit=entry_limit,
+            take_profit_price=take_profit_price,
+            fill_timeout=fill_timeout,
         )
 
     async def modify_future_stop(

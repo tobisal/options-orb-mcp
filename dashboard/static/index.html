@@ -97,7 +97,14 @@
   .autolog .row { padding: 5px 10px; border-bottom: 1px solid var(--border); display: flex; gap: 12px; font-size: 12px; }
   .autolog .row:last-child { border-bottom: none; }
   .autolog .ts { color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
-  .log-trade { color: var(--green); } .log-warn { color: var(--amber); } .log-error { color: var(--red); }
+  .strat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; margin: 10px 0 4px; }
+  .strat-card { background: var(--panel-2); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; }
+  .strat-card.active { border-color: rgba(79,140,255,.55); }
+  .strat-card .name { font-weight: 600; font-size: 13px; display: flex; align-items: center; gap: 8px; }
+  .strat-card .gmt { color: var(--muted); font-size: 11px; margin-top: 4px; }
+  .strat-card .desc { color: var(--muted); font-size: 12px; margin-top: 6px; line-height: 1.4; }
+  .strat-card .reason { font-size: 12px; margin-top: 6px; }
+  .lvl-swatch { display: inline-block; width: 10px; height: 3px; border-radius: 1px; vertical-align: middle; margin-right: 6px; }
   .log-muted { color: var(--muted); } .log-start { color: var(--accent); } .log-stop { color: var(--muted); }
   .pulse { animation: pulse 1.6s ease-in-out infinite; }
   @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .45; } }
@@ -161,7 +168,7 @@
       <span class="sub" id="autoStats"></span>
     </div>
     <div class="autolog" id="autoLog"><div class="row"><span class="mut">No activity yet. Press start to run the loop.</span></div></div>
-    <div class="sub mut" style="margin-top:8px" id="autoHours">Enters up to 3 trades per session window (max 9 per day across Asia / London / New York). Entries use the parameter set you choose below. All times GMT.</div>
+    <div class="sub mut" style="margin-top:8px" id="autoHours">Live stack from mes_5orb.json (Asia Judas + London shorts + NY). Times GMT.</div>
     <div class="sub mut" id="autoParams"></div>
     <div class="toolbar" style="margin-top:8px">
       <button id="autoDefaults" type="button">Use defaults</button>
@@ -170,7 +177,7 @@
   </div>
 
   <div class="panel">
-    <h2>Live ticker <span class="hint">5-minute bars &middot; times GMT</span><span id="tickerLast" style="margin-left:auto"></span></h2>
+    <h2>Live ticker <span class="hint">5-minute bars · times GMT · all live strategy levels</span><span id="tickerLast" style="margin-left:auto"></span></h2>
     <div class="toolbar" style="margin-bottom:14px">
       <select id="tickerSymbol"></select>
       <select id="tickerHours" title="Lookback">
@@ -181,6 +188,7 @@
       <label class="check"><input type="checkbox" id="tickerDemo" /> Demo data (offline, no IBKR)</label>
       <span class="sub" id="tickerNote"></span>
     </div>
+    <div id="tickerStrategies" class="strat-grid"></div>
     <canvas id="tickerChart" height="110"></canvas>
     <div class="empty" id="tickerEmpty" style="display:none">No bars yet.</div>
   </div>
@@ -200,7 +208,7 @@
   </div>
 
   <div class="panel">
-    <h2>Live signals <span class="hint">5ORB London / New York &middot; times ET</span></h2>
+    <h2>Live signals <span class="hint">Asia Judas + London / NY 5ORB · times GMT</span></h2>
     <div class="toolbar" style="margin-bottom:14px">
       <select id="sigSymbol"></select>
       <label class="check"><input type="checkbox" id="sigDemo" /> Demo data (offline, no IBKR)</label>
@@ -232,18 +240,18 @@
       <button id="btOpt">Optimise (grid 70/30)</button>
       <span class="sub" id="btNote"></span>
     </div>
-    <div class="sub mut" style="margin-bottom:12px">Uses the futures 5ORB break/retest rules for the selected symbol (config in configs/*_5orb.json).</div>
+    <div class="sub mut" style="margin-bottom:12px">Uses the live opens stack from <code>configs/*_5orb.json</code> (MES: Asia daily opt + London shorts 2.5R/half-scale + NY 2.5R full, 1-lot historical PnL — same as Live Month PnL).</div>
 
     <details id="customParams" open style="margin-bottom:14px;border:1px solid var(--border);border-radius:10px;padding:12px 14px;background:var(--panel-2)">
       <summary style="cursor:pointer;font-weight:600;font-size:13px">Custom params <span class="hint">apply your own exit / retest knobs for trading</span></summary>
       <div class="param-grid">
         <label>Target R
-          <input type="number" id="cpTargetR" min="0.5" max="5" step="0.5" value="2" />
+          <input type="number" id="cpTargetR" min="0.5" max="5" step="0.5" value="2.5" />
         </label>
         <label>Scale at TP
           <select id="cpScale">
             <option value="0.5">50% + runner</option>
-            <option value="1">100% at target</option>
+            <option value="1" selected>100% at target</option>
           </select>
         </label>
         <label>OR stop buffer (ticks)
@@ -263,7 +271,9 @@
     </details>
 
     <div id="btMetrics" class="grid cards" style="margin-bottom:6px"></div>
+    <div id="btConfig" class="sub mut" style="margin-bottom:10px"></div>
     <canvas id="simChart" height="90" style="display:none"></canvas>
+    <div id="btDaily"></div>
     <div id="btResult"></div>
   </div>
   <div class="panel">
@@ -427,8 +437,11 @@ async function loadSummary() {
   CCY = s.account_currency || "GBP";
   document.getElementById("serverTime").textContent = "Updated " + fmtGmtClock(s.server_time || new Date().toISOString());
   const hours = document.getElementById("autoHours");
-  if (hours && s.session_hours_gmt) {
-    hours.textContent = "Session hours: " + s.session_hours_gmt + ". Up to 3 trades per window (max 9/day). Entries use the set you choose, or the nightly 23:30 GMT optimiser pick. Exits are managed separately.";
+  if (hours) {
+    const stack = (s.live_stack && s.live_stack.schedule_gmt) || s.session_hours_gmt;
+    hours.textContent = stack
+      ? ("Live stack (GMT): " + stack)
+      : "Live stack from mes_5orb.json. Times GMT.";
   }
   renderStrategyLine(s.strategy_by_window);
   if (s.mes_params) fillCustomParams(s.mes_params);
@@ -463,13 +476,15 @@ async function loadSummary() {
       <div class="label" style="text-transform:none;margin-top:6px">${c.sub || ""}</div>
     </div>`).join("");
 
-  // Populate symbol selectors once.
-  const symbols = ["MES", "MNQ", "MYM", "M2K", "ES", "NQ"];
+  // MES-only dashboard.
+  const symbols = ["MES"];
   for (const id of ["sigSymbol", "btSymbol", "autoSymbol", "tickerSymbol"]) {
     const sel = document.getElementById(id);
     if (sel && !sel.dataset.init) {
-      sel.innerHTML = symbols.map(x => `<option ${x === s.default_symbol ? "selected" : ""}>${x}</option>`).join("");
+      sel.innerHTML = symbols.map(x => `<option selected>${x}</option>`).join("");
       sel.dataset.init = "1";
+      sel.disabled = true;
+      sel.title = "MES only";
     }
   }
   // Keep Risk dropdown in sync with server preferred risk%.
@@ -491,6 +506,25 @@ function tickerLabel(iso, hours) {
   return hm;
 }
 
+function renderTickerStrategies(strategies) {
+  const el = document.getElementById("tickerStrategies");
+  if (!el) return;
+  const rows = (strategies || []).filter(s => s.armed);
+  if (!rows.length) { el.innerHTML = ""; return; }
+  el.innerHTML = rows.map(s => {
+    const active = s.active ? "active" : "";
+    const pill = s.active
+      ? `<span class="pill open">active</span>`
+      : `<span class="pill neutral">${(s.status || "idle").replace(/_/g, " ")}</span>`;
+    return `<div class="strat-card ${active}">
+      <div class="name">${s.name} ${pill}</div>
+      <div class="gmt">${s.gmt || ""}</div>
+      <div class="reason ${s.status === "setup" ? "pos" : "mut"}">${s.reason || s.status || ""}</div>
+      <div class="desc">${s.desc || ""}</div>
+    </div>`;
+  }).join("");
+}
+
 async function loadTicker() {
   const sym = document.getElementById("tickerSymbol").value || "MES";
   const hours = document.getElementById("tickerHours").value;
@@ -505,6 +539,7 @@ async function loadTicker() {
       empty.style.display = "block";
       canvas.style.display = "none";
       document.getElementById("tickerLast").textContent = "";
+      renderTickerStrategies([]);
       return;
     }
     const bars = d.bars || [];
@@ -512,6 +547,7 @@ async function loadTicker() {
       empty.style.display = "block";
       canvas.style.display = "none";
       note.textContent = "";
+      renderTickerStrategies([]);
       return;
     }
     empty.style.display = "none";
@@ -520,9 +556,16 @@ async function loadTicker() {
     const chg = last.change || 0;
     document.getElementById("tickerLast").innerHTML =
       `<span class="${cls(chg)}">${sym} ${fmt(last.close)}</span> <span class="sub ${cls(chg)}">${chg > 0 ? "+" : ""}${fmt(chg)}</span>`;
-    const or = d.range;
+
+    const strategies = d.strategies || (d.live_stack && d.live_stack.strategies) || [];
+    renderTickerStrategies(strategies);
+    const levels = d.levels || (d.live_stack && d.live_stack.levels) || [];
+    const activeNames = strategies.filter(s => s.active).map(s => s.name);
     note.textContent = `source: ${d.data_source} · ${bars.length} bars` +
-      (or ? ` · OR overlay ${(or.window||"").replace(/_/g," ")} ${fmt(or.low)}-${fmt(or.high)}` : "") +
+      (d.market_data_lag_minutes ? ` · paper lag ${d.market_data_lag_minutes}m` : "") +
+      (d.bar_lag_minutes != null ? ` · last bar ${d.bar_lag_minutes}m ago` : "") +
+      (activeNames.length ? ` · active: ${activeNames.join(", ")}` : " · no window active") +
+      (levels.length ? ` · ${levels.length} levels` : "") +
       (d.warning ? ` (${d.warning})` : "");
 
     const labels = bars.map(b => tickerLabel(b.t, hours));
@@ -530,17 +573,42 @@ async function loadTicker() {
     const highs = bars.map(b => b.h);
     const lows = bars.map(b => b.l);
     const lineColor = chg >= 0 ? "#3fb950" : "#f85149";
+    const flat = (v) => bars.map(() => v);
     const datasets = [
       { label: "High", data: highs, borderColor: "rgba(139,152,169,.25)", backgroundColor: "rgba(79,140,255,.08)", fill: false, pointRadius: 0, borderWidth: 1, tension: 0 },
       { label: "Low", data: lows, borderColor: "rgba(139,152,169,.25)", backgroundColor: "rgba(79,140,255,.10)", fill: "-1", pointRadius: 0, borderWidth: 1, tension: 0 },
       { label: "Close", data: closes, borderColor: lineColor, backgroundColor: "transparent", fill: false, pointRadius: 0, borderWidth: 2, tension: 0.1 },
     ];
-    if (or && or.high > 0) {
-      datasets.push({ label: "OR high", data: bars.map(() => or.high), borderColor: "#d29922", borderDash: [5, 4], pointRadius: 0, borderWidth: 1, fill: false });
-      datasets.push({ label: "OR low", data: bars.map(() => or.low), borderColor: "#d29922", borderDash: [5, 4], pointRadius: 0, borderWidth: 1, fill: false });
-    }
+    // Cap overlays so the chart stays readable; prefer range/OR/entry/stop/target.
+    const priority = { entry: 0, stop: 1, target: 2, or: 3, range: 4, sweep: 5, eq: 6, liquidity: 7 };
+    const sorted = [...levels].sort((a, b) => (priority[a.kind] ?? 9) - (priority[b.kind] ?? 9));
+    const seenPx = new Set();
+    sorted.slice(0, 14).forEach((lv) => {
+      const key = `${lv.kind}:${Number(lv.price).toFixed(2)}`;
+      if (seenPx.has(key)) return;
+      seenPx.add(key);
+      datasets.push({
+        label: lv.label,
+        data: flat(lv.price),
+        borderColor: lv.color || "#8b98a9",
+        borderDash: lv.dash || [5, 4],
+        pointRadius: 0,
+        borderWidth: lv.width || 1,
+        fill: false,
+      });
+    });
+    const showLegend = datasets.length > 3;
     const opts = {
-      plugins: { legend: { display: false } },
+      plugins: {
+        legend: {
+          display: showLegend,
+          labels: {
+            color: "#8b98a9",
+            boxWidth: 12,
+            filter: (item) => !["High", "Low", "Close"].includes(item.text),
+          },
+        },
+      },
       animation: false,
       scales: {
         x: { ticks: { color: "#8b98a9", maxTicksLimit: 10, maxRotation: 0 }, grid: { color: "#243044" } },
@@ -554,6 +622,7 @@ async function loadTicker() {
     if (tickerChart) {
       tickerChart.data.labels = labels;
       tickerChart.data.datasets = datasets;
+      tickerChart.options.plugins.legend = opts.plugins.legend;
       tickerChart.update();
     } else {
       tickerChart = new Chart(canvas, { type: "line", data: { labels, datasets }, options: opts });
@@ -760,18 +829,26 @@ async function loadSignals() {
   const d = await getJSON(`/api/signals?symbol=${sym}&use_synthetic=${demo}`);
   if (d.error) { document.getElementById("signals").innerHTML = `<div class="empty">${d.error}</div>`; document.getElementById("sigNote").textContent = ""; return; }
   document.getElementById("sigNote").textContent = `source: ${d.data_source}` + (d.warning ? " (" + d.warning + ")" : "");
-  document.getElementById("signals").innerHTML = d.signals.map(s => {
+  document.getElementById("signals").innerHTML = (d.signals || []).map(s => {
     const strength = Math.min(s.strength || 0, 1) * 100;
-    const dcls = s.direction === "long" ? "pos" : (s.direction === "short" ? "neg" : "mut");
-    return `<div class="sig">
-      <div class="w">${s.window.replace(/_/g, " ")}</div>
-      <div class="d ${dcls}">${s.breakout ? s.direction.toUpperCase() : "no breakout"}</div>
-      <div class="sub">regime: <span class="pill">${s.regime}</span> &nbsp; strength: ${fmt(s.strength)}</div>
-      <div class="sub mut">range ${fmt(s.range_low)}-${fmt(s.range_high)} &middot; last ${fmt(s.last_price)} &middot; ${fmtGmt(s.as_of)}</div>
-      <div class="sub mut">${s.strategy ? fmtStrategy(s.strategy) : ""}</div>
+    const dir = (s.direction || "neutral").toLowerCase();
+    const dcls = dir === "long" ? "pos" : (dir === "short" ? "neg" : "mut");
+    const headline = s.breakout
+      ? (dir.toUpperCase() + " setup")
+      : ((s.status || "waiting").replace(/_/g, " "));
+    const rangeTxt = (s.range_low != null && s.range_high != null)
+      ? `range ${fmt(s.range_low)}-${fmt(s.range_high)}`
+      : "";
+    return `<div class="sig ${s.active ? "active" : ""}">
+      <div class="w">${(s.name || s.window || "").replace(/_/g, " ")} ${s.active ? '<span class="pill open">active</span>' : ""}</div>
+      <div class="d ${dcls}">${headline}</div>
+      <div class="sub mut">${s.gmt || ""}</div>
+      <div class="sub">${s.reason || s.desc || ""}</div>
+      <div class="sub mut">${rangeTxt}${s.last_price != null ? ` · last/entry ${fmt(s.last_price)}` : ""}</div>
+      <div class="sub mut">${s.desc || ""}</div>
       <div class="bar"><span style="width:${strength}%"></span></div>
     </div>`;
-  }).join("");
+  }).join("") || `<div class="empty">No armed strategies</div>`;
 }
 
 // --- backtesting / simulation ---------------------------------------------
@@ -802,13 +879,49 @@ function renderBacktestMetrics(j) {
     metricCard("Win rate", pct(m.win_rate), cls(m.win_rate - 0.5), `${m.wins||0}W / ${m.losses||0}L`),
     metricCard("Expectancy", sign(m.expectancy), cls(m.expectancy), "per trade"),
     metricCard("Profit factor", PF(m.profit_factor), cls((m.profit_factor||0) - 1), "gross win / loss"),
-    metricCard("Total P&L", sign(m.total_pnl), cls(m.total_pnl), "simulated"),
+    metricCard("Total P&L", sign(m.total_pnl), cls(m.total_pnl), "1-lot historical"),
     metricCard("Max drawdown", money(m.max_drawdown), "neg", pct(m.max_drawdown_pct)),
     metricCard("Sharpe", fmt(m.sharpe), cls(m.sharpe), "per-trade"),
     metricCard("Score", fmt(j.score), cls(j.score), "balanced rank"),
     metricCard("MC prob. profit", pct(mc.prob_profit), cls((mc.prob_profit||0) - 0.5), `p05 ${sign(mc.final_pnl_p05||0)}`),
   ];
   document.getElementById("btMetrics").innerHTML = cards.join("");
+  const cfg = j.config || {};
+  const asia = cfg.asia || {};
+  const ldn = cfg.london || {};
+  const en = (cfg.enabled_sessions || []).join(", ") || "-";
+  const cfgEl = document.getElementById("btConfig");
+  if (cfgEl) {
+    cfgEl.textContent =
+      `Live stack: sessions [${en}] · London ${ldn.allowed_directions || "both"} · ` +
+      `Asia ${asia.enabled ? "on" : "off"} weekdays [${(asia.allowed_weekdays||[]).join(",")}] ` +
+      `@ ${asia.target_r ?? "-"}R · exits ${(cfg.exits||{}).target_r ?? "-"}R / scale ${(cfg.exits||{}).scale_fraction ?? "-"}` +
+      (j.aligns_with ? ` · ${j.aligns_with}` : "");
+  }
+}
+
+function renderDailyPnl(days) {
+  const el = document.getElementById("btDaily");
+  if (!el) return;
+  if (!days || !days.length) { el.innerHTML = ""; return; }
+  const rows = days.map(d => {
+    const s = d.by_session || {};
+    return `<tr>
+      <td>${d.day}</td>
+      <td class="${cls(d.pnl)}">${sign(d.pnl)}</td>
+      <td>${d.trades}</td>
+      <td>${d.wins}</td>
+      <td class="${cls(s.asia)}">${s.asia != null ? sign(s.asia) : "—"}</td>
+      <td class="${cls(s.london)}">${s.london != null ? sign(s.london) : "—"}</td>
+      <td class="${cls(s.new_york)}">${s.new_york != null ? sign(s.new_york) : "—"}</td>
+      <td class="${cls(d.cum_pnl)}">${sign(d.cum_pnl)}</td>
+    </tr>`;
+  }).join("");
+  el.innerHTML =
+    `<h2 style="margin-top:14px;font-size:13px">P/L per day <span class="hint">${days.length} days</span></h2>
+     <div style="overflow-x:auto"><table><thead><tr>
+       <th>Day</th><th>P/L</th><th>Trades</th><th>Wins</th><th>Asia</th><th>London</th><th>NY</th><th>Cum</th>
+     </tr></thead><tbody>${rows}</tbody></table></div>`;
 }
 
 function renderSimChart(curve) {
@@ -861,6 +974,7 @@ async function runBacktest() {
     const oos = wf && wf.out_of_sample ? ` · OOS trades ${wf.out_of_sample.trades ?? "-"}` : "";
     note.textContent = `source: ${j.data_source}${j.warning ? " (" + j.warning + ")" : ""}${oos}`;
     renderBacktestMetrics(j);
+    renderDailyPnl(j.by_day || []);
     renderSimChart(j.equity_curve || []);
     renderSimTrades(j.trades || []);
   } catch (e) { note.textContent = "error: " + e; }

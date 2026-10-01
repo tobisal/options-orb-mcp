@@ -19,6 +19,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 LIVE_CONFIRM_PHRASE = "I_UNDERSTAND_THE_RISK"
+LIVE_AUTOTRADE_CONFIRM_PHRASE = "I_ENABLE_LIVE_AUTOTRADE"
 
 
 class AccountMode(str, Enum):
@@ -43,6 +44,10 @@ class Settings(BaseSettings):
     # "auto" requests real-time and auto-falls back to free delayed data when the
     # account lacks a real-time subscription (ideal for paper accounts).
     ibkr_market_data_type: str = Field(default="auto", alias="IBKR_MARKET_DATA_TYPE")
+    # Paper/test only: treat "now" as this many minutes behind wall clock so
+    # session windows match IBKR delayed bars (~10 min for free CME data).
+    # Ignored when ACCOUNT_MODE=live with the confirm phrase.
+    market_data_lag_minutes: float = Field(default=10.0, alias="MARKET_DATA_LAG_MINUTES")
     # Suppress ib_async's own connection logging (set true to debug connections).
     ibkr_verbose: bool = Field(default=False, alias="IBKR_VERBOSE")
     # After a failed connect, skip real socket attempts for this many seconds.
@@ -51,6 +56,12 @@ class Settings(BaseSettings):
     # --- Safety gate -------------------------------------------------------
     account_mode: AccountMode = Field(default=AccountMode.PAPER, alias="ACCOUNT_MODE")
     live_trading_confirm: str = Field(default="", alias="LIVE_TRADING_CONFIRM")
+    # Second interlock required before the dashboard/Discord may *autotrade* live.
+    live_autotrade_confirm: str = Field(default="", alias="LIVE_AUTOTRADE_CONFIRM")
+    # Hard ceiling on futures contracts when ACCOUNT_MODE=live (independent of risk%).
+    live_max_contracts: int = Field(default=1, alias="LIVE_MAX_CONTRACTS")
+    # Seconds to wait for an IBKR entry fill before aborting / not journaling.
+    live_fill_timeout_seconds: float = Field(default=15.0, alias="LIVE_FILL_TIMEOUT_SECONDS")
 
     # --- Capital & risk ----------------------------------------------------
     account_currency: str = Field(default="GBP", alias="ACCOUNT_CURRENCY")
@@ -114,6 +125,14 @@ class Settings(BaseSettings):
         return (
             self.account_mode is AccountMode.LIVE
             and self.live_trading_confirm == LIVE_CONFIRM_PHRASE
+        )
+
+    @property
+    def live_autotrade_enabled(self) -> bool:
+        """True when live trading is confirmed *and* live autotrade is explicitly enabled."""
+        return (
+            self.is_live
+            and self.live_autotrade_confirm == LIVE_AUTOTRADE_CONFIRM_PHRASE
         )
 
     @property

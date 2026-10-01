@@ -94,6 +94,17 @@ def test_live_gate_allows_when_confirmed(tmp_path):
     assert s.is_live is True
 
 
+def test_live_autotrade_requires_second_interlock():
+    s = _settings()
+    s.account_mode = AccountMode.LIVE
+    s.live_trading_confirm = "I_UNDERSTAND_THE_RISK"
+    s.live_autotrade_confirm = ""
+    assert s.is_live is True
+    assert s.live_autotrade_enabled is False
+    s.live_autotrade_confirm = "I_ENABLE_LIVE_AUTOTRADE"
+    assert s.live_autotrade_enabled is True
+
+
 def test_per_window_cap_blocks_fourth_in_same_window(tmp_path):
     rm = _rm(tmp_path)
     _open_trade(rm.db, SessionWindow.NEW_YORK, 3)

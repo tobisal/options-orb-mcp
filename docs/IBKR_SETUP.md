@@ -130,6 +130,34 @@ watchdog restarts the dashboard, the loop starts again without a manual click.
 Set `AUTO_TRADE_AUTOSTART=1` in `.env` if you want it to start on every boot
 even after an explicit Stop.
 
+## Live trading (gated)
+
+Live is **off** by default. To place live orders you need both:
+
+```env
+ACCOUNT_MODE=live
+LIVE_TRADING_CONFIRM=I_UNDERSTAND_THE_RISK
+```
+
+Unattended autotrade (dashboard Start / Discord `/auto start`) needs a second
+interlock:
+
+```env
+LIVE_AUTOTRADE_CONFIRM=I_ENABLE_LIVE_AUTOTRADE
+LIVE_MAX_CONTRACTS=1
+LIVE_FILL_TIMEOUT_SECONDS=15
+```
+
+Live behaviour extras:
+
+- Size from IBKR **NetLiquidation** (not paper journal equity).
+- Hard cap via `LIVE_MAX_CONTRACTS` (start at 1).
+- Futures entry waits for fill, then attaches stop (+ optional full-TP) in an OCA.
+- Session-exit loop reconciles journal vs broker qty and logs mismatches (no
+  auto-flatten on mismatch).
+
+Leave `LIVE_AUTOTRADE_CONFIRM` blank to allow manual/preview live paths only.
+
 ## Troubleshooting
 
 - **`TimeoutError` on `127.0.0.1:4002` in Docker**: TCP connected but the IB

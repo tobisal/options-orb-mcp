@@ -21,6 +21,11 @@ from core.strategy.mes_5orb.exits import (
     primary_target,
 )
 from core.strategy.mes_5orb.opening_range import compute_opening_range, to_et
+from core.strategy.mes_5orb.regime import (
+    aligned_directions,
+    allows_regime,
+    build_regime_map,
+)
 from core.strategy.mes_5orb.sessions import (
     Mes5OrbConfig,
     apply_mes_opt_params,
@@ -30,6 +35,34 @@ from core.strategy.mes_5orb.sessions import (
 )
 from core.strategy.mes_5orb.signals import SetupState, detect_orb_setup
 from core.strategy.mes_5orb.trailing_stop import SwingTrailingStop
+from dataclasses import replace as _dc_replace
+
+# Avoid rebuilding daily regimes on every grid combo during optimisation.
+_REGIME_MAP_CACHE: dict[tuple[Any, ...], dict] = {}
+
+
+def _cached_regime_map(bars: list[Bar], regime_cfg) -> dict:
+    if not bars:
+        return {}
+    key = (
+        len(bars),
+        bars[0].ts,
+        bars[-1].ts,
+        regime_cfg.sma_period,
+        regime_cfg.efficiency_lookback,
+        regime_cfg.vol_lookback,
+        regime_cfg.trend_efficiency,
+        regime_cfg.range_efficiency,
+        regime_cfg.high_vol_pctile,
+        regime_cfg.low_vol_pctile,
+    )
+    hit = _REGIME_MAP_CACHE.get(key)
+    if hit is not None:
+        return hit
+    built = build_regime_map(bars, cfg=regime_cfg)
+    _REGIME_MAP_CACHE[key] = built
+    return built
+
 
 # Compact grid for dashboard / Discord (keeps runtime reasonable on 5m history).
 DEFAULT_MES_5ORB_GRID: dict[str, list[Any]] = {
@@ -132,8 +165,42 @@ class MesBacktestResult:
     def summary(self) -> dict[str, Any]:
         cfg = self.config or load_mes_5orb_config()
         by_session: dict[str, list[float]] = {}
+        by_day: dict[str, dict[str, Any]] = {}
         for t in self.trades:
             by_session.setdefault(t.session_name, []).append(t.pnl_usd)
+            slot = by_day.setdefault(
+                t.day,
+                {
+                    "day": t.day,
+                    "pnl": 0.0,
+                    "trades": 0,
+                    "wins": 0,
+                    "by_session": {},
+                },
+            )
+            slot["pnl"] += t.pnl_usd
+            slot["trades"] += 1
+            if t.pnl_usd > 0:
+                slot["wins"] += 1
+            sess_map = slot["by_session"]
+            sess_map[t.session_name] = round(
+                float(sess_map.get(t.session_name, 0.0)) + t.pnl_usd, 2
+            )
+        days_out = []
+        equity = 0.0
+        for d in sorted(by_day):
+            slot = by_day[d]
+            equity += slot["pnl"]
+            days_out.append(
+                {
+                    "day": d,
+                    "pnl": round(slot["pnl"], 2),
+                    "trades": slot["trades"],
+                    "wins": slot["wins"],
+                    "cum_pnl": round(equity, 2),
+                    "by_session": slot["by_session"],
+                }
+            )
         out: dict[str, Any] = {
             "symbol": cfg.symbol,
             "point_value": cfg.point_value,
@@ -143,8 +210,52 @@ class MesBacktestResult:
                 name: performance_metrics(pnls).as_dict()
                 for name, pnls in sorted(by_session.items())
             },
+            "by_day": days_out,
+            "config": mes_live_config_snapshot(cfg),
         }
         return out
+
+
+def mes_live_config_snapshot(cfg: Mes5OrbConfig) -> dict[str, Any]:
+    """Fingerprint of the live opens stack used for month PnL / dashboard BT."""
+    ldn = cfg.session("london")
+    ny = cfg.session("new_york")
+    return {
+        "symbol": cfg.symbol,
+        "sizing": "1_lot_historical",
+        "exits": {
+            "target_r": cfg.exits.target_r,
+            "scale_fraction": cfg.exits.scale_fraction,
+            "use_hod_lod_target": cfg.exits.use_hod_lod_target,
+            "runner_trail": cfg.exits.runner_trail,
+            "stop_buffer_ticks": cfg.exits.stop_buffer_ticks,
+        },
+        "risk": {
+            "max_entries_per_session": cfg.risk.max_entries_per_session,
+            "allow_reentry": cfg.risk.allow_reentry,
+            "max_concurrent": cfg.risk.max_concurrent,
+        },
+        "enabled_sessions": [s.name for s in cfg.sessions if s.enabled],
+        "london": {
+            "enabled": bool(ldn and ldn.enabled),
+            "allowed_directions": ldn.entry.allowed_directions if ldn else None,
+            "max_entries": (
+                ldn.max_entries
+                if ldn and ldn.max_entries is not None
+                else cfg.risk.max_entries_per_session
+            ),
+        },
+        "new_york": {
+            "enabled": bool(ny and ny.enabled),
+            "allowed_directions": ny.entry.allowed_directions if ny else None,
+        },
+        "asia": {
+            "enabled": cfg.asia_range.enabled,
+            "target_r": cfg.asia_range.target_r,
+            "scale_fraction": cfg.asia_range.scale_fraction,
+            "allowed_weekdays": list(cfg.asia_range.allowed_weekdays or []),
+        },
+    }
 
 
 def _trading_days(bars: list[Bar]) -> list[date]:
@@ -324,15 +435,27 @@ def _manage_scaled_exit(
     return exit_px, exit_ts, exit_reason, stop_final, exit_bar_i
 
 
+def _flip_direction(direction: Direction) -> Direction:
+    if direction is Direction.LONG:
+        return Direction.SHORT
+    if direction is Direction.SHORT:
+        return Direction.LONG
+    return direction
+
+
 def run_mes_5orb_backtest(
     bars: list[Bar],
     *,
     cfg: Mes5OrbConfig | None = None,
+    invert: bool = False,
 ) -> MesBacktestResult:
     """Day × session: OR → break → retest → OR stop / 2R|HOD scale → runner trail.
 
     Supports multiple OR windows per day and same-session re-entry after an exit.
     When ``cfg.asia_range.enabled``, also runs ICT Asian Range Judas sweep+reclaim.
+
+    If ``invert`` is True, take the opposite side of each signal at the same entry
+    (fade the ORB/Asia setup) with mirrored stop/target geometry.
     """
     cfg = cfg or load_mes_5orb_config()
     result = MesBacktestResult(config=cfg)
@@ -344,9 +467,17 @@ def run_mes_5orb_backtest(
     max_open = cfg.risk.max_concurrent
     allow_reentry = cfg.risk.allow_reentry
     asia_cfg = cfg.asia_range
+    regime_cfg = cfg.regime
+    regime_map = (
+        _cached_regime_map(bars, regime_cfg) if regime_cfg.enabled else {}
+    )
 
     for day in _trading_days(bars):
         open_count = 0
+        day_ctx = regime_map.get(day) if regime_cfg.enabled else None
+        if regime_cfg.enabled and not allows_regime(regime_cfg, day_ctx):
+            continue
+        align_dirs = aligned_directions(regime_cfg, day_ctx)
 
         # --- ICT Asian Range Judas (London/NY search) ---
         if asia_cfg.enabled and asia_cfg.allows_day(day):
@@ -368,6 +499,12 @@ def run_mes_5orb_backtest(
                     entry_px = float(setup.entry_price)
                     init_stop = float(setup.initial_stop)
                     target_px = float(setup.target_price)
+                    direction = setup.direction
+                    if invert:
+                        direction = _flip_direction(direction)
+                        # Mirror stop/target about entry.
+                        init_stop = entry_px - (init_stop - entry_px)
+                        target_px = entry_px - (target_px - entry_px)
                     risk_pts = abs(entry_px - init_stop)
                     if risk_pts > 0:
                         open_count += 1
@@ -390,7 +527,7 @@ def run_mes_5orb_backtest(
                             scale_fraction=asia_scale,
                         )
                         exit_px, exit_ts, exit_reason, stop_final, _ = _manage_scaled_exit(
-                            direction=setup.direction,
+                            direction=direction,
                             entry_px=entry_px,
                             init_stop=init_stop,
                             target_px=target_px,
@@ -404,7 +541,7 @@ def run_mes_5orb_backtest(
                             tick=tick,
                             scale_frac=asia_scale,
                         )
-                        if setup.direction is Direction.LONG:
+                        if direction is Direction.LONG:
                             points = exit_px - entry_px
                         else:
                             points = entry_px - exit_px
@@ -416,7 +553,7 @@ def run_mes_5orb_backtest(
                             MesTradeResult(
                                 session_name="asia",
                                 day=day.isoformat(),
-                                direction=setup.direction.value,
+                                direction=direction.value,
                                 entry_time=_iso(bars[entry_i].ts),
                                 entry_price=entry_px,
                                 exit_time=_iso(exit_ts),
@@ -435,11 +572,17 @@ def run_mes_5orb_backtest(
         for session in cfg.sessions:
             if not session.enabled:
                 continue
-            exits = resolve_session_exits(cfg, session)
+            sess = session
+            if align_dirs is not None:
+                sess = _dc_replace(
+                    sess,
+                    entry=_dc_replace(sess.entry, allowed_directions=align_dirs),
+                )
+            exits = resolve_session_exits(cfg, sess)
             buffer_ticks = exits.stop_buffer_ticks
             scale_frac = exits.scale_fraction
-            max_per_session = resolve_session_max_entries(cfg, session)
-            orb = compute_opening_range(bars, session, day)
+            max_per_session = resolve_session_max_entries(cfg, sess)
+            orb = compute_opening_range(bars, sess, day)
             if orb is None or orb.skipped:
                 continue
 
@@ -452,7 +595,7 @@ def run_mes_5orb_backtest(
 
                 setup = detect_orb_setup(
                     bars,
-                    session,
+                    sess,
                     orb,
                     tick_size=tick,
                     after_bar_index=after_i,
@@ -470,6 +613,8 @@ def run_mes_5orb_backtest(
                     session.entry.mode == "fib_macd"
                     and setup.initial_stop is not None
                 )
+                # Always size levels for the *signal* direction first; invert mirrors
+                # stop/target about entry so risk geometry stays honest.
                 levels = build_exit_levels(
                     setup.direction,
                     entry_px,
@@ -493,12 +638,10 @@ def run_mes_5orb_backtest(
                     if risk_pts <= 0:
                         after_i = entry_i
                         continue
-                    # Prefer day extreme beyond entry as target (author: HOD/LOD).
                     from core.strategy.mes_5orb.exits import day_extremes
 
                     hod, lod = day_extremes(bars, orb.day, through_index=entry_i)
                     if setup.direction is Direction.LONG:
-                        # Aim for at least 2R or prior HOD if beyond entry.
                         t2 = entry_px + 2.0 * risk_pts
                         if hod is not None and hod > entry_px:
                             target_px = max(hod, entry_px + risk_pts)
@@ -529,6 +672,13 @@ def run_mes_5orb_backtest(
                         target_label=tgt_label,
                     )
 
+                direction = setup.direction
+                if invert:
+                    direction = _flip_direction(direction)
+                    init_stop = entry_px - (init_stop - entry_px)
+                    target_px = entry_px - (target_px - entry_px)
+                    risk_pts = abs(entry_px - init_stop)
+
                 open_count += 1
                 entries_this_session += 1
 
@@ -540,7 +690,7 @@ def run_mes_5orb_backtest(
                 ]
 
                 exit_px, exit_ts, exit_reason, stop_final, exit_bar_i = _manage_scaled_exit(
-                    direction=setup.direction,
+                    direction=direction,
                     entry_px=entry_px,
                     init_stop=init_stop,
                     target_px=target_px,
@@ -555,7 +705,7 @@ def run_mes_5orb_backtest(
                     scale_frac=scale_frac,
                 )
 
-                if setup.direction is Direction.LONG:
+                if direction is Direction.LONG:
                     points = exit_px - entry_px
                 else:
                     points = entry_px - exit_px
@@ -569,7 +719,7 @@ def run_mes_5orb_backtest(
                     MesTradeResult(
                         session_name=session.name,
                         day=day.isoformat(),
-                        direction=setup.direction.value,
+                        direction=direction.value,
                         entry_time=_iso(bars[entry_i].ts),
                         entry_price=entry_px,
                         exit_time=_iso(exit_ts),
@@ -609,6 +759,22 @@ def evaluate_mes_signal_live(
     as_of = as_of or (bars[-1].ts if bars else datetime.utcnow())
     et = to_et(as_of)
     day = et.date()
+
+    if cfg.regime.enabled:
+        rmap = _cached_regime_map(bars, cfg.regime)
+        day_ctx = rmap.get(day)
+        if not allows_regime(cfg.regime, day_ctx):
+            return {
+                "ok": False,
+                "reason": "mes_5orb: regime filter blocked day",
+                "regime": None if day_ctx is None else {
+                    "bias": day_ctx.bias,
+                    "structure": day_ctx.structure,
+                    "vol": day_ctx.vol,
+                    "label": day_ctx.label,
+                },
+                "as_of": as_of.isoformat(),
+            }
 
     # Asia Judas takes priority when enabled and we're in its search window,
     # or when the caller explicitly asks for session "asia".

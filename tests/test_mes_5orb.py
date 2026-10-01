@@ -156,6 +156,56 @@ def test_break_and_retest_long():
     assert setup.initial_stop == orb.low - 0.25
 
 
+def test_break_retest_long_when_level_inside_bar_hl():
+    """No ticks: deep wick through OR high still counts if level is in H/L and close holds."""
+    sess = _ny_session(require_rejection_candle=False)
+    base = _et_to_naive_utc(2026, 1, 6, 9, 30)
+    bars = [_bar(base, 100.2, 101.0, 100.0, 100.5)]  # OR 100–101
+    t = base + timedelta(minutes=5)
+    bars.append(_bar(t, 101.0, 102.5, 101.0, 102.0))  # break
+    t += timedelta(minutes=5)
+    # Low well below break level (old logic missed this); level 101 still inside H/L.
+    bars.append(_bar(t, 101.8, 102.0, 100.2, 101.3))
+
+    from core.strategy.mes_5orb.opening_range import to_et
+
+    orb = compute_opening_range(bars, sess, to_et(bars[0].ts).date())
+    assert orb is not None
+    setup = detect_break_retest(bars, sess, orb, tick_size=0.25)
+    assert setup is not None
+    assert setup.state is SetupState.RETESTED
+    assert setup.direction is Direction.LONG
+    assert setup.entry_price == 101.3
+    assert "OHLC range" in setup.notes
+
+
+def test_break_retest_short_when_level_inside_bar_hl():
+    sess = _ny_session(require_rejection_candle=False)
+    # Force short-capable session
+    from dataclasses import replace
+    from core.strategy.mes_5orb.sessions import EntryConfig
+
+    sess = replace(sess, entry=EntryConfig(allowed_directions="both", mode="retest"))
+    base = _et_to_naive_utc(2026, 1, 6, 9, 30)
+    bars = [_bar(base, 100.2, 101.0, 100.0, 100.5)]  # OR 100–101
+    t = base + timedelta(minutes=5)
+    bars.append(_bar(t, 100.0, 100.0, 98.5, 98.8))  # break short
+    t += timedelta(minutes=5)
+    # High well above break level 100; level still inside candle range.
+    bars.append(_bar(t, 99.2, 101.5, 98.9, 99.5))
+
+    from core.strategy.mes_5orb.opening_range import to_et
+
+    orb = compute_opening_range(bars, sess, to_et(bars[0].ts).date())
+    assert orb is not None
+    setup = detect_break_retest(bars, sess, orb, tick_size=0.25)
+    assert setup is not None
+    assert setup.state is SetupState.RETESTED
+    assert setup.direction is Direction.SHORT
+    assert setup.entry_price == 99.5
+    assert "OHLC range" in setup.notes
+
+
 def test_primary_target_ignores_tiny_lod():
     from core.strategy.mes_5orb.exits import ExitLevels, primary_target
 
