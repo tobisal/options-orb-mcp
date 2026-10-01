@@ -537,6 +537,33 @@ def test_close_break_entry_and_max_stop():
     assert stop == pytest_approx(100.5)
 
 
+def test_candidate_mes_sessions_asia_and_london_overlap():
+    """During London OR hours on an Asia weekday, both sessions are live."""
+    from core.engine import candidate_mes_sessions_now
+
+    clear_mes_5orb_config_cache()
+    cfg = load_mes_5orb_config("MES")
+    # Thursday 03:30 ET — London OR live + Asia Judas search open.
+    now = pytz.timezone("America/New_York").localize(
+        datetime(2026, 10, 1, 3, 30)
+    ).astimezone(pytz.UTC)
+    sessions = candidate_mes_sessions_now(cfg=cfg, now=now)
+    assert "asia" in sessions
+    assert "london" in sessions
+
+    # 02:30 ET — Asia search only (London OR not started).
+    pre = pytz.timezone("America/New_York").localize(
+        datetime(2026, 10, 1, 2, 30)
+    ).astimezone(pytz.UTC)
+    assert candidate_mes_sessions_now(cfg=cfg, now=pre) == ["asia"]
+
+    # 06:30 ET — past London force_flat; Asia search still open.
+    late = pytz.timezone("America/New_York").localize(
+        datetime(2026, 10, 1, 6, 30)
+    ).astimezone(pytz.UTC)
+    assert candidate_mes_sessions_now(cfg=cfg, now=late) == ["asia"]
+
+
 def pytest_approx(val, rel=1e-9):
     """Tiny local approx to avoid importing pytest helpers in asserts."""
     class _A:

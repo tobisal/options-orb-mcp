@@ -49,9 +49,43 @@ def resolve_window(window: str) -> SessionWindow:
 
 def _mes_session_to_window(session_name: str) -> SessionWindow:
     name = (session_name or "").lower()
-    if name.startswith("london") or name in ("asia", "asian", "asia_range"):
+    if name in ("asia", "asian", "asia_range"):
+        return SessionWindow.ASIA
+    if name.startswith("london"):
         return SessionWindow.LONDON
     return SessionWindow.NEW_YORK
+
+
+def candidate_mes_sessions_now(
+    *,
+    cfg: Any | None = None,
+    now: datetime | None = None,
+) -> list[str]:
+    """MES sessions the live autotrader should evaluate this cycle.
+
+    Asia Judas and London (or NY) can overlap — both are returned so they run
+    in the same cycle rather than one blocking the other.
+    """
+    from core.timeutils import market_now
+
+    cfg = cfg or load_mes_5orb_config()
+    et = to_et(now or market_now())
+    t = et.time()
+    day = et.date()
+    out: list[str] = []
+
+    asia = cfg.asia_range
+    if (
+        asia.enabled
+        and asia.allows_day(day)
+        and asia.search_start <= t < asia.force_flat
+    ):
+        out.append("asia")
+
+    for sess in cfg.active_sessions_at(t):
+        if sess.name not in out:
+            out.append(sess.name)
+    return out
 
 
 async def build_mes_trade_plan(
@@ -93,6 +127,9 @@ async def build_mes_trade_plan(
     if window.lower() not in ("auto", "active", "current"):
         w = window.lower().replace(" ", "_").replace("-", "_")
         aliases = {
+            "asia": "asia",
+            "asian": "asia",
+            "asia_range": "asia",
             "london": "london",
             "london_mid": "london_mid",
             "londonmid": "london_mid",

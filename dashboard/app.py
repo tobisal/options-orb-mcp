@@ -45,6 +45,7 @@ from core.config import get_settings
 from core.db import Database, is_tradable_orb_params
 from core.engine import (
     build_trade_plan,
+    candidate_mes_sessions_now,
     place_trade_plan,
     reconcile_open_futures_vs_ibkr,
     resolve_window,
@@ -66,7 +67,7 @@ from core.strategy.mes_5orb.sessions import (
     resolve_session_exits,
     resolve_session_max_entries,
 )
-from core.sessions import active_window, describe_windows_gmt
+from core.sessions import describe_windows_gmt
 from core.strategy.orb import compute_orb_signal
 from core.timeutils import as_naive_utc, market_now, utcnow
 
@@ -1080,21 +1081,23 @@ class AutoTrader:
         except Exception as exc:
             self._add_log(f"Journal refresh error: {exc}", "error")
 
-        # Live "auto" mode: only trade a window that is actually open now.
-        # Falling back to New York outside its cash session would keep scoring
-        # yesterday's bars (and never fill).
+        # Live "auto": evaluate every MES session that is live right now.
+        # Asia Judas and London overlap on purpose — both are checked each cycle.
         if not self.demo and self.window.lower() in ("auto", "active", "current"):
-            live = active_window(market_now())
-            if live is None:
+            candidates = candidate_mes_sessions_now()
+            if not candidates:
                 self._add_log(
-                    f"No session window is open ({describe_windows_gmt(market_now())}). Waiting.",
+                    f"No MES session is open ({describe_windows_gmt(market_now())}). Waiting.",
                     "muted",
                 )
                 return
-            cycle_window = live.value
         else:
-            cycle_window = self.window
+            candidates = [self.window]
 
+        for cycle_window in candidates:
+            await self._try_session(cycle_window, seed=seed)
+
+    async def _try_session(self, cycle_window: str, *, seed: int) -> None:
         try:
             preview = await build_trade_plan(
                 self.symbol, cycle_window, use_synthetic=self.demo,
@@ -1102,17 +1105,23 @@ class AutoTrader:
                 risk_pct=self.risk_pct,
             )
         except Exception as exc:
-            self._add_log(f"Signal error: {exc}", "error")
+            self._add_log(f"Signal error ({cycle_window}): {exc}", "error")
             return
 
         if not preview.get("ok"):
             reason = preview.get("reason") or preview.get("error") or "no trade"
-            self._add_log(f"No entry: {reason}", "muted")
+            self._add_log(f"No entry ({cycle_window}): {reason}", "muted")
             return
 
-        win = resolve_window(cycle_window).value
+        plan_sess = str(
+            (preview.get("plan") or {}).get("session_name") or cycle_window
+        ).lower()
+        try:
+            win = resolve_window(plan_sess).value
+        except ValueError:
+            win = resolve_window(cycle_window).value
         # Count entries per window per real day (live) or per synthetic session
-        # (demo, so each cycle can act on its own simulated day). Cap is 3.
+        # (demo, so each cycle can act on its own simulated day).
         bucket = f"seed{seed}" if self.demo else (self.last_cycle_at or "")[:10]
         key = (bucket, win)
         placed_here = self._placed_counts.get(key, 0)
@@ -1149,7 +1158,7 @@ class AutoTrader:
                 "trade",
             )
         else:
-            self._add_log(f"Placement failed: {result.get('error','unknown')}", "error")
+            self._add_log(f"Placement failed ({win}): {result.get('error','unknown')}", "error")
 
 
 _autotrader = AutoTrader(_db)
