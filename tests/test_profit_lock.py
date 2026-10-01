@@ -1,10 +1,13 @@
 """Profit-lock tiers: arm at progress %, ratchet stop to BE+lock %."""
 
-from core.models import Direction
+from datetime import datetime
+
+from core.models import Bar, Direction
 from core.strategy.mes_5orb.exits import (
     active_profit_lock_fraction,
     apply_profit_lock_stop,
     normalize_profit_lock_tiers,
+    profit_lock_progress_mark,
     profit_lock_stop_price,
     target_progress,
     tighten_stop_to_be,
@@ -26,6 +29,18 @@ def test_target_progress_short():
 
 def test_target_progress_long():
     assert target_progress(Direction.LONG, 100.0, 120.0, 115.0) == 0.75
+
+
+def test_profit_lock_progress_mark_uses_favorable_wick():
+    bar = Bar(
+        ts=datetime(2026, 10, 1, 8, 0),
+        open=90.0,
+        high=95.0,
+        low=81.0,
+        close=92.0,
+    )
+    assert profit_lock_progress_mark(Direction.SHORT, bar) == 81.0
+    assert profit_lock_progress_mark(Direction.LONG, bar) == 95.0
 
 
 def test_profit_lock_stop_short_35pct():
@@ -82,6 +97,24 @@ def test_apply_profit_lock_steps_to_75pct_at_90():
         tiers=TIERS,
     )
     assert armed == 85.0  # 75% lock
+
+
+def test_wick_arms_even_when_close_pulls_back():
+    """Short: low reaches 95% arm, close only ~40% — still lock 85%."""
+    entry, target = 100.0, 80.0
+    span = 20.0
+    bar = Bar(
+        ts=datetime(2026, 10, 1, 8, 0),
+        open=92.0,
+        high=93.0,
+        low=entry - 0.95 * span,  # 81.0
+        close=entry - 0.40 * span,  # 92.0
+    )
+    mark = profit_lock_progress_mark(Direction.SHORT, bar)
+    stop = apply_profit_lock_stop(
+        Direction.SHORT, entry, target, mark, 110.0, tiers=TIERS
+    )
+    assert abs(stop - (entry - 0.85 * span)) < 1e-9
 
 
 def test_apply_profit_lock_not_before_arm():
@@ -141,3 +174,21 @@ def test_asia_example_levels():
         Direction.SHORT, entry, target, mark_80, 7782.75, tiers=TIERS
     )
     assert abs(stop80 - (entry - 0.50 * span)) < 1e-6
+
+
+def test_asia_mfe_wick_locks_85pct():
+    """Reproduce trade #69: MFE low 7707 (~95%) → Lock SL 85%."""
+    entry, target = 7737.25, 7705.5
+    span = entry - target
+    bar = Bar(
+        ts=datetime(2026, 10, 1, 7, 50),
+        open=7715.0,
+        high=7722.0,
+        low=7707.0,
+        close=7721.75,
+    )
+    mark = profit_lock_progress_mark(Direction.SHORT, bar)
+    stop = apply_profit_lock_stop(
+        Direction.SHORT, entry, target, mark, 7782.75, tiers=TIERS
+    )
+    assert abs(stop - (entry - 0.85 * span)) < 1e-6

@@ -20,6 +20,7 @@ from core.strategy.mes_5orb.exits import (
     hit_stop,
     hit_target,
     primary_target,
+    profit_lock_progress_mark,
     tighten_stop_to_be,
 )
 from core.strategy.mes_5orb.opening_range import compute_opening_range, to_et
@@ -367,12 +368,12 @@ def _manage_scaled_exit(
     stop_final = init_stop
 
     for bi, b in enumerate(manage):
-        # Soft profit lock tiers before stop/target checks.
+        # Soft profit lock tiers before stop/target checks (arm on wick).
         stop = apply_profit_lock_stop(
             direction,
             entry_px,
             target_px,
-            float(b.close),
+            profit_lock_progress_mark(direction, b),
             stop,
             arm_fraction=float(exits.profit_lock_arm),
             lock_fraction=float(exits.profit_lock_fraction),

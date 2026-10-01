@@ -28,6 +28,7 @@ from core.strategy.mes_5orb.exits import (
     apply_profit_lock_stop,
     hit_stop,
     hit_target,
+    profit_lock_progress_mark,
     tighten_stop_to_be,
 )
 from core.strategy.mes_5orb.markets import (
@@ -549,9 +550,11 @@ async def settle_session_exits(
             )
 
             # Soft profit lock tiers (e.g. 75%→35%, 80%→50%, …).
+            # Arm from the bar's favorable wick so an intrabar push still locks.
             exits_cfg = trade_cfg.exits
+            profit_lock_tightened = False
             if target_px_f is not None and last is not None:
-                lock_mark = float(last.close)
+                lock_mark = profit_lock_progress_mark(direction, last)
                 tiers = None
                 plan_tiers = plan.get("profit_lock_tiers")
                 if isinstance(plan_tiers, list) and plan_tiers:
@@ -596,8 +599,45 @@ async def settle_session_exits(
                     stop = new_stop
                     plan["stop_loss_price"] = stop
                     plan["profit_lock_armed"] = True
+                    profit_lock_tightened = True
                     if trade.id:
                         db.update_plan_json(trade.id, plan)
+
+            async def _sync_broker_stop_if_needed() -> None:
+                """Push journal stop to IBKR whenever it tightens (lock/BE/trail)."""
+                if (
+                    client is None
+                    or not is_ibkr_backed(trade)
+                    or not trade.order_ref
+                ):
+                    return
+                desired = float(plan.get("stop_loss_price") or stop)
+                sent_raw = plan.get("broker_stop_price")
+                if sent_raw is None:
+                    sent_raw = plan.get("original_stop_loss_price")
+                try:
+                    sent_f = float(sent_raw) if sent_raw is not None else None
+                except (TypeError, ValueError):
+                    sent_f = None
+                if sent_f is not None and abs(desired - sent_f) <= 1e-9:
+                    return
+                side = "BUY" if direction is Direction.LONG else "SELL"
+                try:
+                    await client.modify_future_stop(
+                        trade_symbol,
+                        trade.order_ref,
+                        stop_price=desired,
+                        contracts=trade.contracts,
+                        side=side,
+                    )
+                    plan["broker_stop_price"] = desired
+                    if trade.id:
+                        db.update_plan_json(trade.id, plan)
+                except Exception:
+                    pass
+
+            if profit_lock_tightened:
+                await _sync_broker_stop_if_needed()
 
             async def _close_full_target(exit_px: float, reason: str) -> bool:
                 """Close at target price. Returns True if journaled closed."""
@@ -708,28 +748,7 @@ async def settle_session_exits(
             )
 
             if not hit and not due_flat:
-                if (
-                    client is not None
-                    and is_ibkr_backed(trade)
-                    and trade.order_ref
-                    and plan.get("trail_active")
-                    and abs(
-                        float(plan.get("stop_loss_price") or 0)
-                        - float(plan.get("original_stop_loss_price") or stop)
-                    )
-                    > 1e-9
-                ):
-                    side = "BUY" if direction is Direction.LONG else "SELL"
-                    try:
-                        await client.modify_future_stop(
-                            trade_symbol,
-                            trade.order_ref,
-                            stop_price=float(plan["stop_loss_price"]),
-                            contracts=trade.contracts,
-                            side=side,
-                        )
-                    except Exception:
-                        pass
+                await _sync_broker_stop_if_needed()
                 continue
 
             if hit:

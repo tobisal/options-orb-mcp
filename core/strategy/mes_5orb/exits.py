@@ -172,6 +172,15 @@ def target_progress(
     return None
 
 
+def profit_lock_progress_mark(direction: Direction, bar: Bar) -> float:
+    """Favorable extreme for arming locks (high for long, low for short)."""
+    if direction is Direction.LONG:
+        return float(bar.high)
+    if direction is Direction.SHORT:
+        return float(bar.low)
+    return float(bar.close)
+
+
 def profit_lock_stop_price(
     direction: Direction,
     entry: float,

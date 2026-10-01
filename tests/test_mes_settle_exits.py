@@ -138,6 +138,78 @@ async def test_buggy_be_state_recovers_to_target_fill(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_profit_lock_syncs_ibkr_stop_without_trail(tmp_path):
+    """Profit-lock must push broker stop even when trail_active is False."""
+    from core.engine import settle_session_exits
+
+    db = Database(path=tmp_path / "mes_lock_ibkr.db")
+    entry, target = 7769.75, 7755.75
+    span = entry - target  # 14
+    # 95% arm → 85% lock
+    lock_px = entry - 0.85 * span
+    rec = _mes_short_trade(
+        db,
+        plan_extra={
+            "use_trailing_stop": False,
+            "trail_active": False,
+            "scale_fraction": 0.5,  # stay in manage path (not full TP)
+            "profit_lock_tiers": [
+                {"arm": 0.75, "lock": 0.35},
+                {"arm": 0.80, "lock": 0.50},
+                {"arm": 0.90, "lock": 0.75},
+                {"arm": 0.95, "lock": 0.85},
+                {"arm": 0.975, "lock": 0.90},
+            ],
+        },
+    )
+    with db._conn() as conn:
+        conn.execute(
+            "UPDATE trades SET order_ref=? WHERE id=?",
+            ("MES-20261001071000", rec.id),
+        )
+
+    calls: list[dict] = []
+
+    class _IB:
+        async def connect(self):
+            return None
+
+        async def disconnect(self):
+            return None
+
+        async def close_future_position(self, *args, **kwargs):
+            return {"ok": True}
+
+        async def modify_future_stop(self, *args, **kwargs):
+            calls.append(kwargs)
+            return {"ok": True, "stop_price": kwargs.get("stop_price")}
+
+    # Wick to 95% arm; high stays below the 85% lock so we don't stop out.
+    arm_95 = entry - 0.95 * span
+    bars = [
+        Bar(
+            ts=datetime(2026, 9, 28, 8, 40),
+            open=arm_95 + 0.5,
+            high=lock_px - 0.25,  # below Lock SL 85%
+            low=arm_95,
+            close=lock_px - 0.5,
+        )
+    ]
+    closed = await settle_session_exits(
+        db, "MES", bars, now_window=SessionWindow.LONDON, ib=_IB()
+    )
+    assert closed == []
+    still = db.get_trade(rec.id)
+    assert still.status is TradeStatus.OPEN
+    plan = json.loads(still.plan_json)
+    assert plan.get("profit_lock_armed") is True
+    assert abs(float(plan["stop_loss_price"]) - lock_px) < 1e-6
+    assert abs(float(plan.get("broker_stop_price")) - lock_px) < 1e-6
+    assert len(calls) == 1
+    assert abs(float(calls[0]["stop_price"]) - lock_px) < 1e-6
+
+
+@pytest.mark.asyncio
 async def test_ibkr_close_fail_does_not_be_exit_same_cycle(tmp_path):
     from core.engine import settle_session_exits
 
