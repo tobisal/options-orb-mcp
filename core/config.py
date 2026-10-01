@@ -96,6 +96,24 @@ class Settings(BaseSettings):
     auto_trade_interval: float | None = Field(default=None, alias="AUTO_TRADE_INTERVAL")
     auto_trade_demo: bool | None = Field(default=None, alias="AUTO_TRADE_DEMO")
 
+    # --- Prop / Tradovate execution (AWS multi-account) --------------------
+    # ibkr (default) | tradovate_prop
+    execution_backend: str = Field(default="ibkr", alias="EXECUTION_BACKEND")
+    # When true, AutoTrader only runs Asia Judas (no London/NY ORB entries).
+    prop_asia_only: bool = Field(default=False, alias="PROP_ASIA_ONLY")
+    # Default MES size for prop asia entries (challenge sim used 6).
+    prop_default_contracts: int = Field(default=6, alias="PROP_DEFAULT_CONTRACTS")
+    # JSON list: [{"id":"123","name":"eval1","enabled":true,"size_scale":1.0}, ...]
+    prop_accounts_json: str = Field(default="", alias="PROP_ACCOUNTS_JSON")
+    tradovate_user: str = Field(default="", alias="TRADOVATE_USER")
+    tradovate_password: str = Field(default="", alias="TRADOVATE_PASSWORD")
+    tradovate_env: str = Field(default="demo", alias="TRADOVATE_ENV")  # demo | live
+    tradovate_app_id: str = Field(default="options-orb-mcp", alias="TRADOVATE_APP_ID")
+    tradovate_app_version: str = Field(default="1.0", alias="TRADOVATE_APP_VERSION")
+    tradovate_device_id: str = Field(default="orb-aws", alias="TRADOVATE_DEVICE_ID")
+    tradovate_cid: str = Field(default="", alias="TRADOVATE_CID")
+    tradovate_sec: str = Field(default="", alias="TRADOVATE_SEC")
+
     # --- Dashboard bind ----------------------------------------------------
     # Local default is loopback. Docker sets DASHBOARD_HOST=0.0.0.0.
     dashboard_host: str = Field(default="127.0.0.1", alias="DASHBOARD_HOST")

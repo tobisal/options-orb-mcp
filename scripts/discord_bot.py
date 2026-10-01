@@ -31,10 +31,12 @@ from core.discord_format import (
     format_optimise,
     format_positions,
     format_preview,
+    format_signal_alert,
     format_signals,
     format_status,
     format_trade_alert,
     format_trades,
+    session_label,
     should_relay_log,
 )
 from core.nightly import run_nightly_optimise
@@ -127,9 +129,12 @@ class OrbDiscord(discord.Client):
         self._log_primed = False
         self._trade_state: dict[int, str] = {}
         self._trades_primed = False
+        self._signal_state: dict[str, bool] = {}
+        self._signals_primed = False
         self._owner_id: int | None = None
         self._pump_task: asyncio.Task | None = None
         self._trade_pump_task: asyncio.Task | None = None
+        self._signal_pump_task: asyncio.Task | None = None
 
     async def login(self, token: str) -> None:
         # TCPConnector needs a running loop, so this cannot live in __init__.
@@ -156,12 +161,15 @@ class OrbDiscord(discord.Client):
             log.info("Synced %s global commands (can take up to an hour)", len(synced))
         self._pump_task = asyncio.create_task(self._log_pump())
         self._trade_pump_task = asyncio.create_task(self._trade_pump())
+        self._signal_pump_task = asyncio.create_task(self._signal_pump())
 
     async def close(self) -> None:
         if self._pump_task is not None:
             self._pump_task.cancel()
         if self._trade_pump_task is not None:
             self._trade_pump_task.cancel()
+        if self._signal_pump_task is not None:
+            self._signal_pump_task.cancel()
         await self.api.close()
         await super().close()
 
@@ -275,6 +283,55 @@ class OrbDiscord(discord.Client):
                 log.warning("trade pump: %s", exc)
             await asyncio.sleep(10)
 
+    async def _signal_pump(self) -> None:
+        """Push Asia / London / NY setups as soon as they arm (labeled by session)."""
+        await self.wait_until_ready()
+        if not (self.settings.discord_log_channel_id or "").strip().isdigit():
+            return
+        symbol = (self.settings.default_symbol or "MES").upper()
+        while not self.is_closed():
+            try:
+                payload = await self.api.get("/api/signals", symbol=symbol)
+                if payload.get("error"):
+                    await asyncio.sleep(20)
+                    continue
+                channel = await self._trade_channel()
+                if channel is None:
+                    await asyncio.sleep(15)
+                    continue
+                signals = list(payload.get("signals") or [])
+                if not self._signals_primed:
+                    # Seed as "not armed" so currently live setups still alert once
+                    # after startup (don't swallow an already-true Asia/London signal).
+                    for s in signals:
+                        wid = str(s.get("window") or "")
+                        if wid:
+                            self._signal_state[wid] = False
+                    self._signals_primed = True
+                    # Fall through and post any currently armed signals this cycle.
+                for s in signals:
+                    wid = str(s.get("window") or "")
+                    if not wid:
+                        continue
+                    armed = bool(s.get("breakout"))
+                    was = self._signal_state.get(wid, False)
+                    self._signal_state[wid] = armed
+                    if armed and not was:
+                        await channel.send(
+                            format_signal_alert(s, symbol=str(payload.get("symbol") or symbol))
+                        )
+                        log.info(
+                            "signal alert [%s] %s %s",
+                            session_label(wid),
+                            payload.get("symbol") or symbol,
+                            s.get("direction"),
+                        )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("signal pump: %s", exc)
+            await asyncio.sleep(12)
+
 
 def register_commands(bot: OrbDiscord) -> None:
     tree = bot.tree
@@ -296,13 +353,14 @@ def register_commands(bot: OrbDiscord) -> None:
                 "**Futures 5ORB remote** (paper). Dashboard must be running.\n"
                 "Symbols: MES, MNQ, MYM, M2K, ES, NQ\n"
                 "`/status` account + auto-trade\n"
-                "`/signals [symbol]` London / New York break-retest state\n"
+                "`/signals [symbol]` Asia / London / New York live state\n"
                 "`/preview [window] [symbol]` size a futures plan (no order)\n"
                 "`/positions` open mark-to-market\n"
                 "`/trades` journal\n"
                 "`/auto start|stop|status` paper auto-trader\n"
                 "`/optimise` / `/nightly` legacy hooks (options params unused)\n"
-                "Live auto-trade events stream to DISCORD_LOG_CHANNEL_ID."
+                "Signals + fills stream to DISCORD_LOG_CHANNEL_ID labeled "
+                "[ASIA] / [LONDON] / [NEW YORK]."
             ),
             ephemeral=True,
         )
@@ -321,7 +379,7 @@ def register_commands(bot: OrbDiscord) -> None:
             return
         await interaction.followup.send(format_status(summary, auto if not auto.get("error") else None))
 
-    @tree.command(name="signals", description="Futures 5ORB London / New York state")
+    @tree.command(name="signals", description="Asia / London / New York MES signal state")
     @app_commands.describe(symbol="MES, MNQ, MYM, M2K, ES, or NQ")
     async def signals_cmd(interaction: discord.Interaction, symbol: str = "MES") -> None:
         if not await guard(interaction):
@@ -331,7 +389,7 @@ def register_commands(bot: OrbDiscord) -> None:
         await interaction.followup.send(format_signals(data))
 
     @tree.command(name="preview", description="Preview futures 5ORB plan (no order)")
-    @app_commands.describe(window="auto, london, or new_york", symbol="MES, MNQ, MYM, M2K, ES, or NQ")
+    @app_commands.describe(window="auto, asia, london, or new_york", symbol="MES, MNQ, MYM, M2K, ES, or NQ")
     async def preview_cmd(
         interaction: discord.Interaction,
         window: str = "auto",

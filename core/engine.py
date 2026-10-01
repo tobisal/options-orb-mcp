@@ -13,10 +13,13 @@ from core.backtest_mes import evaluate_mes_signal_live
 from core.config import get_settings
 from core.db import Database
 from core.ibkr_client import IBKRClient, IBKRUnavailable
+from core.brokers import BrokerUnavailable, get_broker, resolve_execution_backend
 from core.journal import (
     _journal_close,
     _parse_plan,
+    is_broker_backed,
     is_ibkr_backed,
+    is_prop_backed,
     paper_account_snapshot,
 )
 from core.marketdata import fetch_bars_with_fallback
@@ -87,6 +90,11 @@ def candidate_mes_sessions_now(
         and asia.search_start <= t < asia.force_flat
     ):
         out.append("asia")
+
+    settings = get_settings()
+    if bool(getattr(settings, "prop_asia_only", False)):
+        # Prop AWS mode: Asia Judas only — skip London/NY ORB entries.
+        return out
 
     for sess in cfg.active_sessions_at(t):
         if sess.name not in out:
@@ -231,6 +239,10 @@ async def build_mes_trade_plan(
         equity = float(paper.get("paper_equity") or settings.starting_capital)
 
     requested = int(cfg.risk.contracts)
+    if resolve_execution_backend().startswith("tradovate") or bool(
+        getattr(settings, "prop_asia_only", False)
+    ):
+        requested = max(int(getattr(settings, "prop_default_contracts", 6) or 6), 1)
     if settings.is_live:
         requested = min(requested, max(int(settings.live_max_contracts), 1))
 
@@ -350,22 +362,27 @@ async def place_trade_plan(
     # in software so the runner can be managed after the scale.
     scale_frac = float(plan_dict.get("scale_fraction") or 0.5)
     broker_tp = target_price if (target_price is not None and scale_frac >= 0.999) else None
+    notes_extra = ""
+    placement: dict[str, Any]
 
     if simulate:
         if settings.is_live:
             return {"ok": False, "error": "Refusing simulated fills while ACCOUNT_MODE=live."}
         order_ref = f"SIM-{symbol}-{utcnow():%Y%m%d%H%M%S}"
         environment = f"{settings.trading_environment()}(sim)"
-        placement: dict[str, Any] = {
+        placement = {
             "simulated": True,
             "order_ref": order_ref,
             "avg_fill_price": entry_price,
             "filled_qty": float(contracts),
         }
+        plan_dict["execution_backend"] = "sim"
     else:
+        backend = resolve_execution_backend()
         try:
-            async with IBKRClient(readonly=False) as ib:
-                placement = await ib.place_future_bracket(
+            broker = get_broker(readonly=False)
+            async with broker:  # type: ignore[union-attr]
+                placement = await broker.place_future_bracket(
                     symbol,
                     side=side,
                     contracts=contracts,
@@ -391,8 +408,20 @@ async def place_trade_plan(
                 plan_dict["contracts"] = contracts
                 stop_points = abs(entry_price - stop_price)
                 max_loss = stop_points * point_value * contracts
-        except IBKRUnavailable as exc:
-            if settings.is_live or settings.trading_environment() != "PAPER":
+            plan_dict["execution_backend"] = placement.get("backend") or backend
+            if placement.get("prop_copies"):
+                plan_dict["prop_copies"] = placement["prop_copies"]
+                plan_dict["signal_id"] = placement.get("signal_id")
+                if placement.get("copy_failures"):
+                    notes_extra = (
+                        f" | prop copy failures={placement['copy_failures']}"
+                    )
+        except (IBKRUnavailable, BrokerUnavailable) as exc:
+            if (
+                settings.is_live
+                or settings.trading_environment() != "PAPER"
+                or backend.startswith("tradovate")
+            ):
                 return {"ok": False, "error": f"Order placement failed: {exc}"}
             order_ref = f"SIM-{symbol}-{utcnow():%Y%m%d%H%M%S}"
             environment = "PAPER(sim)"
@@ -403,6 +432,7 @@ async def place_trade_plan(
                 "avg_fill_price": entry_price,
                 "filled_qty": float(contracts),
             }
+            plan_dict["execution_backend"] = "sim"
 
     plan_payload = dict(plan_dict)
     plan_payload["entry_model"] = "mes_5orb"
@@ -427,6 +457,7 @@ async def place_trade_plan(
     notes = str(plan_dict.get("notes") or f"{symbol} mes_5orb")
     if placement.get("ibkr_error"):
         notes += f" | IBKR unavailable, simulated paper fill: {placement['ibkr_error']}"
+    notes += notes_extra
 
     target_r = float(plan_dict.get("target_r") or 2.0)
     max_profit = (
@@ -516,19 +547,21 @@ async def settle_session_exits(
     owned_client = False
     client = ib
     try:
-        need_ib = any(is_ibkr_backed(t) for t in opens)
-        if need_ib and client is None:
+        need_broker = any(is_broker_backed(t) for t in opens)
+        if need_broker and client is None:
             try:
-                client = IBKRClient(readonly=False)
+                client = get_broker(readonly=False)
                 await client.connect()
                 owned_client = True
-            except IBKRUnavailable:
+            except (IBKRUnavailable, BrokerUnavailable):
                 client = None
 
         for trade in opens:
             plan = _parse_plan(trade.plan_json)
             trade_symbol = coerce_futures_symbol(trade.symbol)
             trade_cfg, _ = resolve_mes_5orb_config(trade_symbol, db)
+            prop_copies = plan.get("prop_copies") if isinstance(plan.get("prop_copies"), list) else None
+            broker_backed = is_broker_backed(trade)
 
             direction = trade.direction
             stop = float(plan.get("stop_loss_price") or trade.entry_price)
@@ -604,12 +637,8 @@ async def settle_session_exits(
                         db.update_plan_json(trade.id, plan)
 
             async def _sync_broker_stop_if_needed() -> None:
-                """Push journal stop to IBKR whenever it tightens (lock/BE/trail)."""
-                if (
-                    client is None
-                    or not is_ibkr_backed(trade)
-                    or not trade.order_ref
-                ):
+                """Push journal stop to broker whenever it tightens (lock/BE/trail)."""
+                if client is None or not broker_backed or not trade.order_ref:
                     return
                 desired = float(plan.get("stop_loss_price") or stop)
                 sent_raw = plan.get("broker_stop_price")
@@ -623,13 +652,32 @@ async def settle_session_exits(
                     return
                 side = "BUY" if direction is Direction.LONG else "SELL"
                 try:
-                    await client.modify_future_stop(
-                        trade_symbol,
-                        trade.order_ref,
-                        stop_price=desired,
-                        contracts=trade.contracts,
-                        side=side,
-                    )
+                    kwargs: dict[str, Any] = {
+                        "stop_price": desired,
+                        "contracts": trade.contracts,
+                        "side": side,
+                    }
+                    if prop_copies is not None and hasattr(client, "modify_future_stop"):
+                        # MultiAccountBroker accepts prop_copies kw; IBKR ignores extras via adapter.
+                        try:
+                            await client.modify_future_stop(  # type: ignore[misc]
+                                trade_symbol,
+                                trade.order_ref,
+                                prop_copies=prop_copies,
+                                **kwargs,
+                            )
+                        except TypeError:
+                            await client.modify_future_stop(
+                                trade_symbol,
+                                trade.order_ref,
+                                **kwargs,
+                            )
+                    else:
+                        await client.modify_future_stop(
+                            trade_symbol,
+                            trade.order_ref,
+                            **kwargs,
+                        )
                     plan["broker_stop_price"] = desired
                     if trade.id:
                         db.update_plan_json(trade.id, plan)
@@ -639,32 +687,45 @@ async def settle_session_exits(
             if profit_lock_tightened:
                 await _sync_broker_stop_if_needed()
 
-            async def _close_full_target(exit_px: float, reason: str) -> bool:
-                """Close at target price. Returns True if journaled closed."""
-                if is_ibkr_backed(trade) and client is not None and trade.order_ref:
-                    side = "BUY" if direction is Direction.LONG else "SELL"
+            async def _broker_close(exit_px: float, reason: str) -> bool:
+                """Flatten at broker (all copies) then journal. Returns True if closed."""
+                if not broker_backed:
+                    closed.append(_journal_close(db, trade, exit_px, reason))
+                    return True
+                if client is None or not trade.order_ref:
+                    return False
+                side = "BUY" if direction is Direction.LONG else "SELL"
+                try:
                     try:
+                        result = await client.close_future_position(  # type: ignore[misc]
+                            trade_symbol,
+                            contracts=trade.contracts,
+                            side=side,
+                            order_ref=trade.order_ref,
+                            prop_copies=prop_copies,
+                        )
+                    except TypeError:
                         result = await client.close_future_position(
                             trade_symbol,
                             contracts=trade.contracts,
                             side=side,
                             order_ref=trade.order_ref,
                         )
-                    except IBKRUnavailable:
-                        return False
-                    if not result.get("ok"):
-                        return False
-                    rec = _journal_close(db, trade, exit_px, reason)
-                    rec["ibkr"] = True
-                    rec["ibkr_status"] = result.get("status")
-                    closed.append(rec)
-                    return True
-                if not is_ibkr_backed(trade):
-                    closed.append(
-                        _journal_close(db, trade, exit_px, reason)
-                    )
-                    return True
-                return False
+                except (IBKRUnavailable, BrokerUnavailable):
+                    return False
+                if not result.get("ok"):
+                    return False
+                rec = _journal_close(db, trade, exit_px, reason)
+                rec["broker"] = True
+                rec["broker_status"] = result.get("status")
+                if result.get("results"):
+                    rec["prop_close_results"] = result["results"]
+                closed.append(rec)
+                return True
+
+            async def _close_full_target(exit_px: float, reason: str) -> bool:
+                """Close at target price. Returns True if journaled closed."""
+                return await _broker_close(exit_px, reason)
 
             def _mark_pending_target(fill: float) -> None:
                 plan["pending_full_target"] = True
@@ -763,26 +824,9 @@ async def settle_session_exits(
                 reason = "force_flat"
                 exit_px = mark
 
-            if is_ibkr_backed(trade) and client is not None and trade.order_ref:
-                side = "BUY" if direction is Direction.LONG else "SELL"
-                try:
-                    result = await client.close_future_position(
-                        trade_symbol,
-                        contracts=trade.contracts,
-                        side=side,
-                        order_ref=trade.order_ref,
-                    )
-                except IBKRUnavailable:
-                    continue
-                if not result.get("ok"):
-                    continue
-                rec = _journal_close(db, trade, exit_px, reason)
-                rec["ibkr"] = True
-                rec["ibkr_status"] = result.get("status")
-                closed.append(rec)
-            elif not is_ibkr_backed(trade):
-                rec = _journal_close(db, trade, exit_px, reason)
-                closed.append(rec)
+            ok_close = await _broker_close(exit_px, reason)
+            if not ok_close:
+                continue
     finally:
         if owned_client and client is not None:
             await client.disconnect()

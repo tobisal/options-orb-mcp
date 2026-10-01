@@ -89,12 +89,56 @@ services:
     env_file:
       - .env
     environment:
-      # Reach dashboard via the gateway service name (shared published port).
+      # Dashboard shares ib-gateway's network namespace; reach it by service name.
       DISCORD_DASHBOARD_URL: http://ib-gateway:8787
-    command: ["discord"]
+      # Ensure channel id from .env is not wiped; compose still loads env_file.
+      DISCORD_LOG_CHANNEL_ID: ${DISCORD_LOG_CHANNEL_ID:-}
+      DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN:-}
+      DISCORD_GUILD_ID: ${DISCORD_GUILD_ID:-}
+      DISCORD_ALLOWED_USER_IDS: ${DISCORD_ALLOWED_USER_IDS:-}    command: ["discord"]
     depends_on:
       dashboard:
         condition: service_healthy
+
+  # Prop Asia AWS stack — Tradovate multi-account, no IB Gateway required.
+  #   docker compose --profile prop-asia up -d --build
+  # Requires .env: EXECUTION_BACKEND=tradovate_prop PROP_ASIA_ONLY=1
+  #   TRADOVATE_* and PROP_ACCOUNTS_JSON
+  prop-asia:
+    build: .
+    image: options-orb-mcp:latest
+    container_name: orb-prop-asia
+    restart: unless-stopped
+    profiles: ["prop-asia"]
+    env_file:
+      - .env
+    environment:
+      EXECUTION_BACKEND: ${EXECUTION_BACKEND:-tradovate_prop}
+      PROP_ASIA_ONLY: ${PROP_ASIA_ONLY:-1}
+      PROP_DEFAULT_CONTRACTS: ${PROP_DEFAULT_CONTRACTS:-6}
+      DASHBOARD_HOST: 0.0.0.0
+      DASHBOARD_PORT: "8787"
+      DB_PATH: data/trades.db
+      AUTO_TRADE_AUTOSTART: ${AUTO_TRADE_AUTOSTART:-1}
+      AUTO_TRADE_SYMBOL: MES
+      AUTO_TRADE_WINDOW: asia
+      AUTO_TRADE_INTERVAL: ${AUTO_TRADE_INTERVAL:-10}
+    ports:
+      - "127.0.0.1:8788:8787"
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/', timeout=4)",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
 
 volumes:
   ib-settings:

@@ -4,9 +4,11 @@ from core.discord_format import (
     format_log_line,
     format_nightly,
     format_preview,
+    format_signal_alert,
     format_signals,
     format_status,
     format_trade_alert,
+    session_label,
     should_relay_log,
 )
 
@@ -23,6 +25,14 @@ def test_empty_allowlist():
 
 def test_clip_truncates():
     assert "truncated" in clip("x" * 50, limit=30)
+
+
+def test_session_label_asia_london_ny():
+    assert session_label("asia") == "ASIA"
+    assert session_label("asia_judas") == "ASIA"
+    assert session_label("london") == "LONDON"
+    assert session_label("new_york") == "NEW YORK"
+    assert session_label("ny") == "NEW YORK"
 
 
 def test_format_status_account_and_auto():
@@ -54,9 +64,19 @@ def test_format_status_auto_only():
 def test_format_signals_and_preview():
     sig = format_signals(
         {
-            "symbol": "SPY",
+            "symbol": "MES",
             "data_source": "ibkr",
             "signals": [
+                {
+                    "window": "asia",
+                    "breakout": True,
+                    "direction": "long",
+                    "regime": "trend",
+                    "last_price": 7740.0,
+                    "range_low": 7710.0,
+                    "range_high": 7750.0,
+                    "strength": 1.0,
+                },
                 {
                     "window": "new_york",
                     "breakout": True,
@@ -66,11 +86,14 @@ def test_format_signals_and_preview():
                     "range_low": 775.0,
                     "range_high": 776.8,
                     "strength": 1.3,
-                }
+                },
             ],
         }
     )
-    assert "BREAKOUT SHORT" in sig
+    assert "[ASIA]" in sig
+    assert "SIGNAL LONG" in sig
+    assert "[NEW YORK]" in sig
+    assert "SIGNAL SHORT" in sig
     preview = format_preview(
         {
             "ok": True,
@@ -92,6 +115,33 @@ def test_format_signals_and_preview():
     )
     assert "bear_call_credit" in preview
     assert "tradeable" in preview
+    assert "[NEW YORK]" in preview
+
+
+def test_format_signal_alert_labels_asia():
+    text = format_signal_alert(
+        {
+            "window": "asia",
+            "name": "Asia Judas",
+            "direction": "long",
+            "entry_price": 7740.25,
+            "stop_price": 7711.75,
+            "target_price": 7767.75,
+            "target_label": "pd_high",
+            "range_low": 7711.75,
+            "range_high": 7755.0,
+            "strategy": {"entry_model": "asia_judas"},
+            "blocked": True,
+            "block_reason": "Stop risk exceeds budget",
+        },
+        symbol="MES",
+    )
+    assert "SIGNAL [ASIA]" in text
+    assert "MES LONG" in text
+    assert "entry 7740.25" in text
+    assert "SL 7711.75" in text
+    assert "pd_high 7767.75" in text
+    assert "Not auto-placed" in text
 
 
 def test_format_nightly_and_log_filter():
@@ -116,11 +166,22 @@ def test_format_nightly_and_log_filter():
     assert not should_relay_log({"level": "trade", "msg": "CLOSED journal #1"}, verbose=False)
     assert should_relay_log({"level": "trade", "msg": "scaled out"}, verbose=False)
     assert should_relay_log({"level": "error", "msg": "fail"}, verbose=False)
+    assert should_relay_log(
+        {"level": "signal", "msg": "SIGNAL [ASIA] MES LONG entry 1 SL 2 TP 3"},
+        verbose=False,
+    )
     assert not should_relay_log({"level": "muted", "msg": "No entry"}, verbose=False)
     assert should_relay_log({"level": "muted", "msg": "No entry"}, verbose=True)
     assert "TRADE PLACED" in format_log_line(
         {"t": "2026-08-17T19:00:00", "level": "trade", "msg": "PLACED trade #1"}
     )
+    assert format_log_line(
+        {
+            "t": "2026-08-17T19:00:00",
+            "level": "signal",
+            "msg": "SIGNAL [ASIA] MES LONG entry 7740.25 SL 7711.75 pd_high 7767.75",
+        }
+    ) == "SIGNAL [ASIA] MES LONG entry 7740.25 SL 7711.75 pd_high 7767.75"
 
 
 def test_format_trade_alert_placed_and_closed():
@@ -142,6 +203,7 @@ def test_format_trade_alert_placed_and_closed():
         },
     }
     placed = format_trade_alert(open_row, event="placed")
+    assert "[ASIA]" in placed
     assert "FILLED / PLACED" in placed
     assert "7740.25" in placed
     assert "pd_high" in placed
@@ -154,6 +216,7 @@ def test_format_trade_alert_placed_and_closed():
         "notes": "asia Judas long | exit=scale_pd_high+force_flat",
     }
     closed = format_trade_alert(closed_row, event="closed")
+    assert "[ASIA]" in closed
     assert "CLOSED" in closed
     assert "+154.38" in closed
     assert "exit=scale_pd_high+force_flat" in closed

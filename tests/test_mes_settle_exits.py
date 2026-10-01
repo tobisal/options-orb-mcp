@@ -138,9 +138,15 @@ async def test_buggy_be_state_recovers_to_target_fill(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_profit_lock_syncs_ibkr_stop_without_trail(tmp_path):
+async def test_profit_lock_syncs_ibkr_stop_without_trail(tmp_path, monkeypatch):
     """Profit-lock must push broker stop even when trail_active is False."""
+    from datetime import timezone
+
     from core.engine import settle_session_exits
+
+    # Freeze clock inside London manage window (before force_flat 05:55 ET).
+    frozen = datetime(2026, 9, 28, 8, 40, tzinfo=timezone.utc)  # 04:40 ET
+    monkeypatch.setattr("core.engine.market_now", lambda: frozen)
 
     db = Database(path=tmp_path / "mes_lock_ibkr.db")
     entry, target = 7769.75, 7755.75

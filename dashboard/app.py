@@ -42,6 +42,7 @@ from core.backtest_mes import (
     walk_forward_mes_7030,
 )
 from core.config import get_settings
+from core.brokers import resolve_execution_backend
 from core.db import Database, is_tradable_orb_params
 from core.engine import (
     build_trade_plan,
@@ -83,9 +84,26 @@ _EASTERN = pytz.timezone("America/New_York")
 _STATIC = Path(__file__).resolve().parent / "static"
 _db = Database()
 _log = logging.getLogger("orb.dashboard")
-_SESSION_EXIT_INTERVAL = 30.0
+_SESSION_EXIT_INTERVAL = 10.0
 # Dashboard is MES-only — hide legacy SPY / other symbols from every journal view.
 _DASHBOARD_SYMBOL = "MES"
+
+
+def _prop_account_count() -> int:
+    raw = getattr(get_settings(), "prop_accounts_json", "") or ""
+    if not str(raw).strip():
+        return 0
+    try:
+        data = json.loads(raw)
+        if isinstance(data, list):
+            return sum(
+                1
+                for item in data
+                if not isinstance(item, dict) or item.get("enabled", True)
+            )
+    except json.JSONDecodeError:
+        return len([p for p in str(raw).split(",") if p.strip()])
+    return 0
 
 
 def _is_dashboard_symbol(symbol: str | None) -> bool:
@@ -139,7 +157,7 @@ def _mes_paper_snapshot(
         "paper_equity": round(starting_capital + lifetime + unreal, 2),
     }
 
-# Short-lived cache for IBKR calls so the ~8s UI poll doesn't reconnect every
+# Short-lived cache for IBKR calls so the ~10s UI poll doesn't reconnect every
 # time (and, when offline, doesn't retry the socket on every request).
 _IBKR_CACHE_TTL = 20.0
 _ibkr_cache: dict[str, tuple[float, tuple[bool, Any, str | None]]] = {}
@@ -1100,7 +1118,7 @@ class AutoTrader:
         self.symbol = "MES"
         self.window = "auto"
         self.demo = False
-        self.interval = 60.0
+        self.interval = 10.0
         self.target_r: float | None = None
         self.risk_pct: float | None = None
         self.per_window_limit = 3
@@ -1110,12 +1128,15 @@ class AutoTrader:
         self.last_cycle_at: str | None = None
         self.log: list[dict] = []
         self._placed_counts: dict[tuple[str, str], int] = {}
+        self._signaled_keys: set[tuple[str, str]] = set()
 
     def _add_log(self, msg: str, level: str = "info") -> None:
         self.log.append({"t": utcnow().isoformat(), "level": level, "msg": msg})
         self.log = self.log[-120:]
 
     def status(self) -> dict:
+        settings = get_settings()
+        backend = resolve_execution_backend()
         return {
             "running": self.running,
             "symbol": self.symbol,
@@ -1129,6 +1150,12 @@ class AutoTrader:
             "trades_placed": self.trades_placed,
             "log": list(reversed(self.log[-40:])),
             "strategy_by_window": strategy_by_window(self.symbol, self._db),
+            "execution_backend": backend,
+            "prop_asia_only": bool(getattr(settings, "prop_asia_only", False)),
+            "prop_default_contracts": int(
+                getattr(settings, "prop_default_contracts", 6) or 6
+            ),
+            "prop_account_count": _prop_account_count(),
         }
 
     def set_risk_pct(self, risk_pct: float | None) -> dict:
@@ -1175,6 +1202,17 @@ class AutoTrader:
         from core.risk import _as_risk_fraction
 
         self.symbol = coerce_futures_symbol(self.symbol)
+        # Prop AWS mode: force Asia-only evaluation.
+        if bool(getattr(settings, "prop_asia_only", False)) or resolve_execution_backend().startswith(
+            "tradovate"
+        ):
+            window = "asia"
+            self._add_log(
+                f"Prop asia mode: backend={resolve_execution_backend()} "
+                f"accounts={_prop_account_count()} "
+                f"size={int(getattr(settings, 'prop_default_contracts', 6) or 6)} MES",
+                "info",
+            )
         self.window = window or "auto"
         self.demo = demo
         self.interval = max(float(interval), self.MIN_INTERVAL)
@@ -1192,6 +1230,7 @@ class AutoTrader:
         mes_cfg = load_mes_5orb_config(self.symbol)
         self.per_window_limit = max(int(mes_cfg.risk.max_entries_per_session), 1)
         self._placed_counts.clear()
+        self._signaled_keys.clear()
         env_label = settings.trading_environment()
         data_label = (
             "demo data"
@@ -1335,6 +1374,24 @@ class AutoTrader:
         # (demo, so each cycle can act on its own simulated day).
         bucket = f"seed{seed}" if self.demo else (self.last_cycle_at or "")[:10]
         key = (bucket, win)
+        plan = preview.get("plan") or {}
+        from core.discord_format import session_label
+
+        tag = session_label(plan.get("session_name") or win)
+        entry = plan.get("entry_price")
+        stop = plan.get("stop_loss_price") or plan.get("stop_price")
+        target = plan.get("target_price")
+        tlabel = plan.get("target_label") or "TP"
+        direction = str(plan.get("direction") or "").upper()
+        # Always Discord the setup levels once per session/day — even if risk blocks placement.
+        if key not in self._signaled_keys:
+            self._signaled_keys.add(key)
+            self._add_log(
+                f"SIGNAL [{tag}] {self.symbol} {direction} "
+                f"entry {entry} SL {stop} {tlabel} {target}",
+                "signal",
+            )
+
         placed_here = self._placed_counts.get(key, 0)
         if placed_here >= self.per_window_limit:
             self._add_log(
@@ -1345,7 +1402,13 @@ class AutoTrader:
 
         if not preview.get("tradeable"):
             reasons = "; ".join(preview.get("risk", {}).get("reasons", [])) or "risk checks failed"
-            self._add_log(f"Signal found ({win}) but blocked: {reasons}", "warn")
+            # Same one-liner style so Discord always shows entry/SL/TP even when blocked.
+            self._add_log(
+                f"SIGNAL [{tag}] {self.symbol} {direction} "
+                f"entry {entry} SL {stop} {tlabel} {target} "
+                f"(blocked: {reasons})",
+                "signal",
+            )
             return
 
         result = await place_trade_plan(
@@ -1361,8 +1424,10 @@ class AutoTrader:
             target = plan.get("target_price")
             tlabel = plan.get("target_label") or "TP"
             session = plan.get("session_name") or win
+            tag = session_label(session)
             self._add_log(
-                f"PLACED trade #{result['trade_id']} {plan.get('symbol') or self.symbol} "
+                f"PLACED trade #{result['trade_id']} [{tag}] "
+                f"{plan.get('symbol') or self.symbol} "
                 f"{plan.get('direction','').upper()} x{plan.get('contracts','')} "
                 f"{session} entry {entry} stop {stop} {tlabel} {target} "
                 f"({result.get('environment','')}).",
@@ -1440,7 +1505,7 @@ async def _run_session_exits() -> None:
 
 
 async def _session_exit_loop() -> None:
-    await asyncio.sleep(8)
+    await asyncio.sleep(10)
     while True:
         try:
             await _run_session_exits()
@@ -1767,6 +1832,11 @@ async def api_signals(request: Request) -> JSONResponse:
                 "range_low": plan.get("or_low") or plan.get("asia_low"),
                 "range_high": plan.get("or_high") or plan.get("asia_high"),
                 "last_price": plan.get("entry_price"),
+                "entry_price": plan.get("entry_price"),
+                "stop_price": plan.get("stop_loss_price") or plan.get("stop_price"),
+                "stop_loss_price": plan.get("stop_loss_price") or plan.get("stop_price"),
+                "target_price": plan.get("target_price"),
+                "target_label": plan.get("target_label") or "TP",
                 "as_of": plan.get("as_of") or overlay.get("now_et"),
                 "status": strat.get("status"),
                 "reason": live.get("reason") or strat.get("reason"),
@@ -2249,7 +2319,7 @@ async def api_autotrade_start(request: Request) -> JSONResponse:
         symbol=q.get("symbol", settings.default_symbol),
         window=q.get("window", "auto"),
         demo=q.get("demo", "false").lower() == "true",
-        interval=float(q.get("interval", "60") or 60),
+        interval=float(q.get("interval", "10") or 10),
         target_r=float(tr) if tr not in (None, "") else None,
         risk_pct=float(rp) if rp not in (None, "") else None,
     )

@@ -108,7 +108,22 @@ def evaluate_exit(
 def is_ibkr_backed(trade: TradeRecord) -> bool:
     """True when this journal row was routed to IBKR (not a SIM- fill)."""
     ref = (trade.order_ref or "").strip()
-    return bool(ref) and not ref.upper().startswith("SIM-")
+    return bool(ref) and not ref.upper().startswith("SIM-") and not is_prop_backed(trade)
+
+
+def is_prop_backed(trade: TradeRecord) -> bool:
+    """True when routed via Tradovate prop multi-account (TV-/PROP- refs)."""
+    ref = (trade.order_ref or "").strip().upper()
+    if ref.startswith("TV-") or ref.startswith("PROP-"):
+        return True
+    plan = _parse_plan(trade.plan_json)
+    backend = str(plan.get("execution_backend") or "").lower()
+    return backend in {"tradovate", "tradovate_prop", "prop"}
+
+
+def is_broker_backed(trade: TradeRecord) -> bool:
+    """True when a live broker (IBKR or prop) owns the fill — not SIM."""
+    return is_ibkr_backed(trade) or is_prop_backed(trade)
 
 
 def legs_from_plan(plan: dict[str, Any]) -> tuple[OptionLeg, OptionLeg] | None:

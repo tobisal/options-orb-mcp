@@ -13,6 +13,34 @@ def clip(text: str, limit: int = 1900) -> str:
     return text[: limit - 20] + "\n…(truncated)"
 
 
+def session_label(raw: str | None) -> str:
+    """Normalize session/window ids to a Discord tag, e.g. ASIA / LONDON."""
+    key = str(raw or "").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "asia": "ASIA",
+        "asia_judas": "ASIA",
+        "judas": "ASIA",
+        "london": "LONDON",
+        "london_mid": "LONDON MID",
+        "londonmid": "LONDON MID",
+        "new_york": "NEW YORK",
+        "newyork": "NEW YORK",
+        "ny": "NEW YORK",
+        "ny_mid": "NY MID",
+        "ny_pm": "NY PM",
+        "auto": "AUTO",
+    }
+    if key in aliases:
+        return aliases[key]
+    if "asia" in key:
+        return "ASIA"
+    if "london" in key:
+        return "LONDON"
+    if key in {"ny", "newyork"} or key.startswith("new_york") or key.startswith("ny_"):
+        return "NEW YORK"
+    return (raw or "?").strip().upper().replace("_", " ") or "?"
+
+
 def _sign(n: float | None) -> str:
     if n is None:
         return "-"
@@ -72,13 +100,62 @@ def format_signals(payload: dict[str, Any]) -> str:
     if payload.get("warning"):
         lines.append(str(payload["warning"]))
     for s in payload.get("signals") or []:
-        brk = "BREAKOUT " + str(s.get("direction", "")).upper() if s.get("breakout") else "no breakout"
+        label = session_label(s.get("window") or s.get("session") or s.get("name"))
+        brk = (
+            "SIGNAL " + str(s.get("direction", "")).upper()
+            if s.get("breakout")
+            else "no signal"
+        )
         lines.append(
-            f"• **{str(s.get('window', '')).replace('_', ' ')}**  {brk}  "
+            f"• **[{label}]**  {brk}  "
             f"regime {s.get('regime')}  last {s.get('last_price')}  "
             f"OR {s.get('range_low')}–{s.get('range_high')}  "
             f"str {s.get('strength')}"
         )
+        if s.get("breakout") and (
+            s.get("entry_price") is not None
+            or s.get("stop_price") is not None
+            or s.get("target_price") is not None
+        ):
+            tlabel = s.get("target_label") or "TP"
+            lines.append(
+                f"  Entry `{s.get('entry_price') or s.get('last_price')}`  ·  "
+                f"SL `{s.get('stop_price') or s.get('stop_loss_price')}`  ·  "
+                f"{tlabel} `{s.get('target_price')}`"
+            )
+        reason = s.get("reason")
+        if reason and not s.get("breakout"):
+            lines.append(f"  _{reason}_")
+    return clip("\n".join(lines))
+
+
+def format_signal_alert(signal: dict[str, Any], *, symbol: str = "MES") -> str:
+    """Push alert when a live session setup fires (Asia / London / NY).
+
+    Canonical one-liner:
+    SIGNAL [ASIA] MES LONG entry 7740.25 SL 7711.75 pd_high 7767.75
+    """
+    label = session_label(
+        signal.get("window") or signal.get("session_name") or signal.get("session")
+    )
+    direction = str(signal.get("direction") or "").upper() or "?"
+    entry = (
+        signal.get("entry_price")
+        or signal.get("last_price")
+        or signal.get("entry")
+    )
+    stop = signal.get("stop_price") or signal.get("stop_loss_price") or signal.get("sl")
+    target = signal.get("target_price") or signal.get("tp")
+    tlabel = signal.get("target_label") or "TP"
+    line = (
+        f"**SIGNAL [{label}]** {symbol} {direction} "
+        f"entry {entry} SL {stop} {tlabel} {target}"
+    )
+    lines = [line]
+    blocked = signal.get("blocked") or signal.get("risk_blocked")
+    if blocked:
+        reason = signal.get("block_reason") or signal.get("reason") or "risk blocked"
+        lines.append(f"⚠️ Not auto-placed: {str(reason)[:200]}")
     return clip("\n".join(lines))
 
 
@@ -88,18 +165,37 @@ def format_preview(plan: dict[str, Any]) -> str:
     sig = plan.get("signal") or {}
     p = plan.get("plan") or {}
     risk = plan.get("risk") or {}
+    label = session_label(
+        p.get("session_name") or sig.get("window") or sig.get("session") or p.get("window")
+    )
+    direction = sig.get("direction") or p.get("direction") or ""
+    symbol = p.get("symbol", sig.get("symbol", ""))
     lines = [
-        f"**Preview** {p.get('symbol', sig.get('symbol', ''))}  "
-        f"{sig.get('window')}  {sig.get('direction')}  "
+        f"**Preview [{label}]** {symbol}  {direction}  "
         f"{'tradeable' if plan.get('tradeable') else 'blocked'}",
-        f"{p.get('spread_type')}  x{p.get('contracts')}  "
-        f"debit {p.get('net_debit')}  max loss {p.get('max_loss')}  "
-        f"max profit {p.get('max_profit')}",
-        f"Long {((p.get('long_leg') or {}).get('strike'))} "
-        f"{((p.get('long_leg') or {}).get('right'))} / "
-        f"short {((p.get('short_leg') or {}).get('strike'))}  "
-        f"expiry {p.get('expiry')}",
     ]
+    # Futures MES plan
+    if p.get("instrument") == "future" or p.get("entry_model") in {
+        "mes_5orb",
+        "asia_judas",
+    } or p.get("stop_loss_price") is not None and p.get("target_price") is not None:
+        lines.append(
+            f"x{p.get('contracts')}  entry `{p.get('entry_price')}`  "
+            f"stop `{p.get('stop_loss_price') or p.get('stop_price')}`  "
+            f"{p.get('target_label') or 'TP'} `{p.get('target_price')}`"
+        )
+    else:
+        lines.extend(
+            [
+                f"{p.get('spread_type')}  x{p.get('contracts')}  "
+                f"debit {p.get('net_debit')}  max loss {p.get('max_loss')}  "
+                f"max profit {p.get('max_profit')}",
+                f"Long {((p.get('long_leg') or {}).get('strike'))} "
+                f"{((p.get('long_leg') or {}).get('right'))} / "
+                f"short {((p.get('short_leg') or {}).get('strike'))}  "
+                f"expiry {p.get('expiry')}",
+            ]
+        )
     reasons = risk.get("reasons") or []
     if reasons:
         lines.append("Risk: " + "; ".join(reasons[:4]))
@@ -195,6 +291,9 @@ def format_log_line(entry: dict[str, Any]) -> str:
     level = str(entry.get("level") or "info")
     msg = str(entry.get("msg") or "")
     t = str(entry.get("t") or "")[-8:]
+    if level == "signal" or msg.upper().startswith("SIGNAL "):
+        # AutoTrader already emits the canonical one-liner — post it as-is.
+        return clip(msg if msg.upper().startswith("SIGNAL") else f"**SIGNAL** {msg}")
     if level == "trade":
         upper = msg.upper()
         if upper.startswith("PLACED") or " PLACED " in f" {upper}":
@@ -209,7 +308,7 @@ def format_trade_alert(trade: dict[str, Any], *, event: str) -> str:
     """Discord alert for a journal row (open = entry fill, closed = exit fill)."""
     tid = trade.get("id") or trade.get("trade_id") or "?"
     symbol = trade.get("symbol") or "?"
-    window = str(trade.get("window") or "").replace("_", " ")
+    window = str(trade.get("window") or "")
     direction = str(trade.get("direction") or "").upper()
     contracts = trade.get("contracts") or 1
     entry = trade.get("entry_price")
@@ -228,7 +327,7 @@ def format_trade_alert(trade: dict[str, Any], *, event: str) -> str:
                 plan = loaded
         except (TypeError, ValueError, json.JSONDecodeError):
             plan = {}
-    session = plan.get("session_name") or window
+    label = session_label(plan.get("session_name") or window)
     stop = plan.get("stop_loss_price")
     if stop is None:
         stop = plan.get("stop_price")
@@ -238,8 +337,8 @@ def format_trade_alert(trade: dict[str, Any], *, event: str) -> str:
 
     if event == "placed" or status == "open":
         lines = [
-            f"🟢 **FILLED / PLACED** #{tid}  {symbol}  {direction}  x{contracts}",
-            f"Session **{session}**  ·  {env}",
+            f"🟢 **[{label}] FILLED / PLACED** #{tid}  {symbol}  {direction}  x{contracts}",
+            f"Session **{label}**  ·  {env}",
             f"Entry `{entry}`  ·  Stop `{stop}`  ·  {target_label} `{target}`",
         ]
         if notes:
@@ -247,8 +346,8 @@ def format_trade_alert(trade: dict[str, Any], *, event: str) -> str:
         return clip("\n".join(lines))
 
     lines = [
-        f"🔴 **CLOSED** #{tid}  {symbol}  {direction}  x{contracts}",
-        f"Session **{session}**  ·  pnl {_sign(pnl if isinstance(pnl, (int, float)) else None)}",
+        f"🔴 **[{label}] CLOSED** #{tid}  {symbol}  {direction}  x{contracts}",
+        f"Session **{label}**  ·  pnl {_sign(pnl if isinstance(pnl, (int, float)) else None)}",
         f"Entry `{entry}` → exit `{exit_px}`",
     ]
     if notes:
@@ -271,4 +370,4 @@ def should_relay_log(entry: dict[str, Any], *, verbose: bool) -> bool:
     # Place / fill alerts are owned by the journal trade pump (richer format).
     if level == "trade" and (msg.startswith("PLACED") or msg.startswith("CLOSED")):
         return False
-    return level in {"trade", "error", "warn", "start", "stop"}
+    return level in {"trade", "error", "warn", "start", "stop", "signal"}

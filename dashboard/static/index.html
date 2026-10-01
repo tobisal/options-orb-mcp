@@ -149,8 +149,9 @@
       </select>
       <label class="check">Every
         <select id="autoInterval">
+          <option value="10" selected>10s</option>
           <option value="30">30s</option>
-          <option value="60" selected>60s</option>
+          <option value="60">60s</option>
           <option value="120">2 min</option>
           <option value="300">5 min</option>
         </select>
@@ -302,7 +303,7 @@
     <div id="trades"></div>
   </div>
 
-  <div class="foot">Read-only view. Auto-refreshes every 8s. Trades are placed by the execution agent, not here.</div>
+  <div class="foot">Read-only view. Auto-refreshes every 10s. Trades are placed by the execution agent, not here.</div>
 </main>
 
 <script>
@@ -1207,7 +1208,7 @@ document.getElementById("tickerHours").addEventListener("change", loadTicker);
 document.getElementById("tickerDemo").addEventListener("change", loadTicker);
 refreshAll();
 loadOptimisations();
-setInterval(refreshAll, 8000);
+setInterval(refreshAll, 10000);
 </script>
 </body>
 </html>
