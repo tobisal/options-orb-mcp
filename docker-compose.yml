@@ -95,7 +95,8 @@ services:
       DISCORD_LOG_CHANNEL_ID: ${DISCORD_LOG_CHANNEL_ID:-}
       DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN:-}
       DISCORD_GUILD_ID: ${DISCORD_GUILD_ID:-}
-      DISCORD_ALLOWED_USER_IDS: ${DISCORD_ALLOWED_USER_IDS:-}    command: ["discord"]
+      DISCORD_ALLOWED_USER_IDS: ${DISCORD_ALLOWED_USER_IDS:-}
+    command: ["discord"]
     depends_on:
       dashboard:
         condition: service_healthy
